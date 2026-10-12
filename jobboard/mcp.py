@@ -1,0 +1,174 @@
+"""Minimal MCP server (JSON-RPC over HTTP, "streamable HTTP" transport, POST only)
+exposing the jobboard API as tools. Bound to the WireGuard address only in
+production, and protected by the same bearer tokens as the API.
+
+Register in Claude Code:
+  claude mcp add --transport http jobboard http://10.88.0.1:8090/mcp \
+      --header "Authorization: Bearer <token>"
+"""
+import json
+import os
+import sys
+import traceback
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+PROTOCOL = "2025-03-26"
+
+TOOLS = [
+    {"name": "stats", "description": "Counts of jobs, verdicts, embeddings; available boards; active run.",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "list_jobs", "description": "List jobs with latest verdict and action. Filters are ANDed.",
+     "inputSchema": {"type": "object", "properties": {
+         "verdict": {"type": "string", "description": "comma list of yes,maybe,no,none"},
+         "action": {"type": "string", "description": "comma list of applied,drafted,none"},
+         "open_only": {"type": "boolean"}, "source": {"type": "string"}, "days": {"type": "integer"},
+         "pending_only": {"type": "boolean"}, "q": {"type": "string", "description": "substring over title/location/series/reason"},
+         "limit": {"type": "integer", "default": 100}}}},
+    {"name": "get_job", "description": "One job: fields, verdict/action history, and its primary document split into sections.",
+     "inputSchema": {"type": "object", "properties": {"id": {"type": "integer"}, "full_text": {"type": "boolean", "default": False}}, "required": ["id"]}},
+    {"name": "get_section", "description": "One named section of a job's primary document (default: the board's key section, e.g. Qualifications).",
+     "inputSchema": {"type": "object", "properties": {"id": {"type": "integer"}, "name": {"type": "string"}}, "required": ["id"]}},
+    {"name": "search", "description": "Search stored postings. mode=keyword (AND terms, quotes for phrases, snippets) or mode=semantic (embedding similarity).",
+     "inputSchema": {"type": "object", "properties": {"q": {"type": "string"}, "mode": {"type": "string", "enum": ["keyword", "semantic"], "default": "keyword"}, "limit": {"type": "integer", "default": 20}}, "required": ["q"]}},
+    {"name": "sources", "description": "Scan workflows (board adapters) available, with last scan info.",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "scan", "description": "Start a background scan of a board. Returns a run id to poll with run_status.",
+     "inputSchema": {"type": "object", "properties": {"source": {"type": "string"}, "days": {"type": "integer", "default": 7}, "all": {"type": "boolean", "default": False}, "refetch": {"type": "boolean", "default": False}}, "required": ["source"]}},
+    {"name": "run_status", "description": "Status, log and summary of a background run (scan/refresh/embed).",
+     "inputSchema": {"type": "object", "properties": {"run_id": {"type": "string"}}, "required": ["run_id"]}},
+    {"name": "refresh", "description": "Re-fetch postings now (synchronous, up to 20 ids).",
+     "inputSchema": {"type": "object", "properties": {"ids": {"type": "array", "items": {"type": "integer"}}}, "required": ["ids"]}},
+    {"name": "set_verdict", "description": "Record a qualification verdict for a job.",
+     "inputSchema": {"type": "object", "properties": {"id": {"type": "integer"}, "verdict": {"type": "string", "enum": ["yes", "maybe", "no"]}, "grades": {"type": "string"}, "reason": {"type": "string"}, "profile_hash": {"type": "string"}, "author": {"type": "string", "enum": ["claude", "user"], "default": "claude"}}, "required": ["id", "verdict", "reason"]}},
+    {"name": "set_action", "description": "Record that a resume was drafted or an application submitted.",
+     "inputSchema": {"type": "object", "properties": {"id": {"type": "integer"}, "action": {"type": "string", "enum": ["applied", "drafted"]}, "date": {"type": "string"}, "resume_dir": {"type": "string"}, "note": {"type": "string"}}, "required": ["id", "action"]}},
+    {"name": "add_job", "description": "Add a posting found outside any board, fetching the page verbatim.",
+     "inputSchema": {"type": "object", "properties": {"title": {"type": "string"}, "url": {"type": "string"}, "location": {"type": "string"}, "open_date": {"type": "string"}, "close_date": {"type": "string"}, "text": {"type": "string"}}, "required": ["title"]}},
+    {"name": "embed", "description": "Compute embeddings for jobs missing them (background run).",
+     "inputSchema": {"type": "object", "properties": {"force": {"type": "boolean", "default": False}}}},
+    {"name": "profile_hash", "description": "Hash of EXPERIENCE.md, to stamp on verdicts.",
+     "inputSchema": {"type": "object", "properties": {}}},
+]
+
+
+def make_handler(J, api):
+    """api: object with start_scan/start_refresh/start_embed/get_run/active_run/sources/stats/experience."""
+
+    def call(name, args):
+        conn = J.db()
+        try:
+            if name == "stats":
+                return api.stats()
+            if name == "list_jobs":
+                rows = J.list_jobs(conn, verdict=args.get("verdict"), action=args.get("action"),
+                                   open_only=bool(args.get("open_only")), source=args.get("source"),
+                                   days=args.get("days"), pending_only=bool(args.get("pending_only")),
+                                   q=args.get("q"))
+                keep = ("id", "title", "location", "series", "pay_plan", "grade_low", "grade_high", "salary",
+                        "open_date", "close_date", "external_url", "board_url", "announcement_no", "source",
+                        "verdict", "eligible_grades", "verdict_reason", "verdict_author", "claude_verdict",
+                        "action", "action_date", "resume_dir", "last_fetched", "embedded")
+                return {"count": len(rows), "jobs": [{k: r.get(k) for k in keep} for r in rows[: int(args.get("limit") or 100)]]}
+            if name == "get_job":
+                d = J.job_detail(conn, int(args["id"]), with_text=bool(args.get("full_text")))
+                return d
+            if name == "get_section":
+                doc, text = J.get_section(conn, int(args["id"]), args.get("name"))
+                return {"job_id": args["id"], "kind": doc["kind"] if doc else None, "text": text}
+            if name == "search":
+                if args.get("mode") == "semantic":
+                    return {"mode": "semantic", "hits": J.semantic_search(conn, args["q"], int(args.get("limit") or 20))}
+                return {"mode": "keyword", "hits": J.search_documents(conn, args["q"], None, int(args.get("limit") or 20))}
+            if name == "sources":
+                return {"sources": api.sources()}
+            if name == "scan":
+                return api.start_scan(args["source"], int(args.get("days") or 7), bool(args.get("all")), bool(args.get("refetch")))
+            if name == "run_status":
+                return api.get_run(str(args["run_id"])) or {"error": "not found"}
+            if name == "refresh":
+                out = []
+                for i in [int(x) for x in args["ids"]][:20]:
+                    out.append(J.refresh_job(conn, i, log=lambda m: None))
+                return {"refreshed": out}
+            if name == "set_verdict":
+                vid = J.record_verdict(conn, int(args["id"]), args["verdict"], args.get("grades"), args.get("reason"),
+                                       args.get("profile_hash"), args.get("author", "claude"))
+                return {"verdict_id": vid, "job": J.job_detail(conn, int(args["id"]), with_text=False)["job"]}
+            if name == "set_action":
+                aid = J.record_action(conn, int(args["id"]), args["action"], args.get("date"), args.get("resume_dir"), args.get("note"))
+                return {"action_id": aid, "job": J.job_detail(conn, int(args["id"]), with_text=False)["job"]}
+            if name == "add_job":
+                jid = J.add_job(conn, args["title"], "manual", None, args.get("location"), None, args.get("url"),
+                                None, None, None, None, None, args.get("open_date"), args.get("close_date"),
+                                None, args.get("text"), "posting", fetch_url=bool(args.get("url")) and not args.get("text"))
+                return {"job": J.job_detail(conn, jid, with_text=False)["job"]}
+            if name == "embed":
+                return api.start_embed(None, bool(args.get("force")))
+            if name == "profile_hash":
+                return {"profile_hash": J.profile_hash(api.experience)}
+            raise KeyError(f"unknown tool {name}")
+        finally:
+            conn.close()
+
+    class MCPHandler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *a):
+            sys.stderr.write("mcp %s %s\n" % (self.address_string(), fmt % a))
+
+        def _send(self, status, obj=None):
+            body = json.dumps(obj, default=str).encode() if obj is not None else b""
+            self.send_response(status)
+            if obj is not None:
+                self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if body:
+                self.wfile.write(body)
+
+        def do_GET(self):
+            self._send(405, {"error": "POST JSON-RPC to /mcp"})
+
+        def do_DELETE(self):
+            self._send(204)
+
+        def do_POST(self):
+            if self.path.rstrip("/") != "/mcp":
+                return self._send(404, {"error": "not found"})
+            if not api.authorized_bearer(self.headers.get("Authorization")):
+                return self._send(401, {"error": "bearer token required"})
+            n = int(self.headers.get("Content-Length") or 0)
+            try:
+                req = json.loads(self.rfile.read(n) or b"{}")
+            except json.JSONDecodeError:
+                return self._send(400, {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}})
+            method, rid, params = req.get("method"), req.get("id"), req.get("params") or {}
+            if rid is None:  # notification
+                return self._send(202)
+            try:
+                if method == "initialize":
+                    result = {"protocolVersion": PROTOCOL, "capabilities": {"tools": {}},
+                              "serverInfo": {"name": "jobboard", "version": "1.0"}}
+                elif method == "ping":
+                    result = {}
+                elif method == "tools/list":
+                    result = {"tools": TOOLS}
+                elif method == "tools/call":
+                    try:
+                        out = call(params.get("name"), params.get("arguments") or {})
+                        result = {"content": [{"type": "text", "text": json.dumps(out, default=str, indent=1)}], "isError": False}
+                    except Exception as e:  # noqa: BLE001
+                        result = {"content": [{"type": "text", "text": f"error: {e}"}], "isError": True}
+                else:
+                    return self._send(200, {"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": f"unknown method {method}"}})
+                self._send(200, {"jsonrpc": "2.0", "id": rid, "result": result})
+            except Exception as e:  # noqa: BLE001
+                traceback.print_exc()
+                self._send(200, {"jsonrpc": "2.0", "id": rid, "error": {"code": -32000, "message": str(e)}})
+
+    return MCPHandler
+
+
+def serve(J, api, bind, port):
+    srv = ThreadingHTTPServer((bind, port), make_handler(J, api))
+    print(f"mcp: http://{bind}:{port}/mcp", flush=True)
+    srv.serve_forever()

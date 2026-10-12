@@ -1,0 +1,53 @@
+# Production stack on the VPS. Run from /opt/jobboard:
+#   docker compose -f jobboard/compose.prod.yaml --env-file .env up -d --build
+# .env (deploy-owned, 0600) holds: POSTGRES_PASSWORD, JOBBOARD_PASSWORD_HASH, JOBBOARD_SECRET, OPENAI_API_KEY
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: jobboard-db
+    environment:
+      POSTGRES_USER: jobscan
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: jobscan
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jobscan -d jobscan"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+    # no ports: reachable only from the app container
+
+  jobboard:
+    build: .
+    container_name: jobboard
+    working_dir: /app
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PORT: "8080"
+      JOBSCAN_DIR: /app/jobscan
+      JOBSCAN_DSN: postgresql://jobscan:${POSTGRES_PASSWORD}@db:5432/jobscan
+      EXPERIENCE_MD: /app/EXPERIENCE.md
+      APPLICATIONS_DIR: /app/applications
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      JOBBOARD_AUTH: "1"
+      JOBBOARD_PASSWORD_HASH: ${JOBBOARD_PASSWORD_HASH}
+      JOBBOARD_SECRET: ${JOBBOARD_SECRET}
+      JOBBOARD_MCP_PORT: "8090"
+      JOBBOARD_MCP_BIND: "0.0.0.0"          # inside the container; the host maps it to the WireGuard IP only
+    volumes:
+      - ./:/app:ro
+      - ../jobscan:/app/jobscan:ro
+      - ../EXPERIENCE.md:/app/EXPERIENCE.md:ro
+      - ../applications:/app/applications:ro
+    ports:
+      - "127.0.0.1:8080:8080"              # web + API: only via nginx
+      - "10.88.0.1:8090:8090"              # MCP: only via WireGuard
+    restart: unless-stopped
+    mem_limit: 512m
+
+volumes:
+  pgdata:

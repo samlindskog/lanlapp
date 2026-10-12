@@ -25,10 +25,18 @@ Agent API  : JSON over HTTP, documented at GET /api  (also in .claude/skills/job
   POST /api/refresh               {ids?:[..]} or {filter:"open-qualifying"}       -> {run_id}
   GET  /api/runs  /api/runs/<id>  background run status + log (scans persist; refresh runs are transient, ids like t3)
 
-Standard library only. Env: JOBSCAN_DIR (default ../jobscan), PORT (8080),
-JOBBOARD_TOKEN (optional; if set, writes need header X-Token),
-JOBBOARD_RELOAD=1 (dev: restart automatically when any .py under jobboard/ or
-jobscan/ changes; static files are always served fresh from disk).
+Auth (JOBBOARD_AUTH=1, see auth.py): password login -> session cookie for the
+browser; bearer tokens for the API and MCP.
+  POST /api/auth/login            {password} -> session cookie
+  POST /api/auth/logout
+  POST /api/auth/token            {name, password?} -> {token} (shown once; needs session or password)
+  GET  /api/auth/tokens           list; POST /api/auth/tokens/<id>/revoke
+  GET  /api/auth/me               who am I (session | token name)
+MCP (JOBBOARD_MCP_PORT, JOBBOARD_MCP_BIND): JSON-RPC at /mcp, bearer token required; see mcp.py.
+
+Env: JOBSCAN_DIR (default ../jobscan), PORT (8080), JOBBOARD_RELOAD=1 (dev
+auto-restart on .py changes; static files always fresh), OPENAI_API_KEY.
+CLI: python3 server.py hash-password   (prints a JOBBOARD_PASSWORD_HASH value)
 """
 import json
 import os
@@ -43,10 +51,14 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 JOBSCAN_DIR = os.path.abspath(os.environ.get("JOBSCAN_DIR", os.path.join(HERE, "..", "jobscan")))
 sys.path.insert(0, JOBSCAN_DIR)
 import jobscan as J  # noqa: E402
+sys.path.insert(0, HERE)
+import auth  # noqa: E402
+import mcp as mcp_mod  # noqa: E402
 
 STATIC = os.path.join(HERE, "static")
 PORT = int(os.environ.get("PORT", "8080"))
-TOKEN = os.environ.get("JOBBOARD_TOKEN")
+MCP_PORT = int(os.environ.get("JOBBOARD_MCP_PORT", "0") or 0)
+MCP_BIND = os.environ.get("JOBBOARD_MCP_BIND", "127.0.0.1")
 EXPERIENCE = os.environ.get("EXPERIENCE_MD", os.path.join(JOBSCAN_DIR, "..", "EXPERIENCE.md"))
 APPLICATIONS = os.path.abspath(os.environ.get("APPLICATIONS_DIR", os.path.join(JOBSCAN_DIR, "..", "applications")))
 
@@ -151,6 +163,87 @@ def _resume_files(resume_dir):
     return out
 
 
+def sources_info():
+    conn = J.db()
+    last = {r["args_source"]: r for r in conn.execute("""
+        SELECT DISTINCT ON (args::json->>'source') args::json->>'source' AS args_source,
+               started_at, status, summary FROM runs WHERE kind='scan'
+        ORDER BY args::json->>'source', id DESC""")}
+    out = []
+    for name in J.list_sources():
+        mod = J.load_source(name)
+        r = last.get(name)
+        out.append({"name": name, "display_name": getattr(mod, "DISPLAY_NAME", name),
+                    "board_url": getattr(mod, "BOARD_URL", None),
+                    "last_scan": {"started_at": r["started_at"], "status": r["status"],
+                                  "summary": json.loads(r["summary"]) if r["summary"] else None} if r else None})
+    conn.close()
+    return out
+
+
+def stats_info():
+    conn = J.db()
+    tot = conn.execute("SELECT COUNT(*) AS n FROM jobs").fetchone()["n"]
+    v = J.latest_verdicts(conn)
+    by = {}
+    for r in v.values():
+        by[r["verdict"]] = by.get(r["verdict"], 0) + 1
+    acts = J.latest_actions(conn)
+    docs = conn.execute("SELECT COUNT(*) AS n FROM documents").fetchone()["n"]
+    emb = conn.execute("SELECT COUNT(*) AS n FROM embeddings").fetchone()["n"]
+    srcs = [dict(r) for r in conn.execute("SELECT * FROM sources")]
+    conn.close()
+    return {"jobs": tot, "pending": tot - len(v), "verdicts": by, "actioned": len(acts),
+            "documents": docs, "embedded": emb, "embeddings_enabled": bool(os.environ.get("OPENAI_API_KEY")),
+            "dsn": J.DSN.split("@")[-1], "sources": srcs, "adapters": J.list_sources(),
+            "active_run": _active_run(), "auth": auth.AUTH_ON,
+            "profile_hash": J.profile_hash(EXPERIENCE) if os.path.exists(EXPERIENCE) else None}
+
+
+def start_scan(source, days=7, all_=False, refetch=False):
+    if source not in J.list_sources():
+        return {"error": f"unknown source; available: {J.list_sources()}"}
+    active = _active_run()
+    if active:
+        return {"error": "a run is already active", "run": active}
+    rid = _start_run("scan", {"source": source, "days": days, "all": all_, "refetch": refetch},
+                     lambda conn, log: J.scan_source(conn, source, days=days, all_=all_, refetch=refetch, log=log))
+    return {"run_id": rid, "status": "running"}
+
+
+def start_embed(ids=None, force=False):
+    if _active_run():
+        return {"error": "a run is already active", "run": _active_run()}
+    if not os.environ.get("OPENAI_API_KEY"):
+        return {"error": "OPENAI_API_KEY is not set in the server environment"}
+    rid = _start_run("embed", {"ids": ids, "force": force},
+                     lambda conn, log: J.embed_jobs(conn, ids=ids, force=force, log=log), persist=False)
+    return {"run_id": rid, "status": "running"}
+
+
+def bearer_ok(header):
+    """True when auth is off, or the Authorization header carries a valid token."""
+    if not auth.AUTH_ON:
+        return True
+    conn = J.db()
+    try:
+        return auth.token_valid(conn, header, J.now()) is not None
+    finally:
+        conn.close()
+
+
+class _Api:
+    """Facade handed to the MCP server."""
+    experience = EXPERIENCE
+    stats = staticmethod(stats_info)
+    sources = staticmethod(sources_info)
+    start_scan = staticmethod(start_scan)
+    start_embed = staticmethod(start_embed)
+    get_run = staticmethod(lambda rid: _get_run(rid))
+    active_run = staticmethod(_active_run)
+    authorized_bearer = staticmethod(bearer_ok)
+
+
 # ------------------------------------------------------------ handler
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *a, **kw):
@@ -185,14 +278,55 @@ class Handler(SimpleHTTPRequestHandler):
         except json.JSONDecodeError:
             return None
 
-    def _authorized(self):
-        return not TOKEN or self.headers.get("X-Token") == TOKEN
+    # --- auth
+    def _who(self):
+        """None when unauthenticated; {'via': 'session'|'token'|'off', 'name': ...} otherwise."""
+        if not auth.AUTH_ON:
+            return {"via": "off"}
+        if auth.session_valid(self.headers.get("Cookie")):
+            return {"via": "session"}
+        conn = J.db()
+        try:
+            row = auth.token_valid(conn, self.headers.get("Authorization"), J.now())
+        finally:
+            conn.close()
+        return {"via": "token", "name": row["name"], "token_id": row["id"]} if row else None
+
+    def _secure(self):
+        return self.headers.get("X-Forwarded-Proto", "").lower() == "https"
+
+    def _gate(self, path):
+        """Enforce auth. Returns True when the request may proceed."""
+        if not auth.AUTH_ON or path in ("/login", "/login.html", "/api/auth/login"):
+            return True
+        if self._who():
+            return True
+        if path.startswith("/api") or path.startswith("/mcp"):
+            self._json({"error": "authentication required (session cookie or Bearer token)"}, 401)
+        else:
+            from urllib.parse import quote
+            self.send_response(302)
+            self.send_header("Location", f"/login.html?next={quote(self.path)}")
+            self.end_headers()
+        return False
 
     # GET
     def do_GET(self):
         u = urlparse(self.path)
         path, qs = u.path, {k: v[0] for k, v in parse_qs(u.query).items()}
+        if path == "/login":
+            self.path = "/login.html"
+            return super().do_GET()
+        if not self._gate(path):
+            return
         try:
+            if path == "/api/auth/me":
+                return self._json(self._who() or {"via": None})
+            if path == "/api/auth/tokens":
+                conn = J.db()
+                out = auth.list_tokens(conn)
+                conn.close()
+                return self._json({"tokens": out})
             if path == "/api":
                 self.send_response(200)
                 self.send_header("Content-Type", "text/plain; charset=utf-8")
@@ -200,9 +334,9 @@ class Handler(SimpleHTTPRequestHandler):
                 self.wfile.write(API_DOC.encode())
                 return
             if path == "/api/stats":
-                return self._json(self._stats())
+                return self._json(stats_info())
             if path == "/api/sources":
-                return self._json({"sources": self._sources()})
+                return self._json({"sources": sources_info()})
             if path == "/api/profile-hash":
                 return self._json({"profile_hash": J.profile_hash(EXPERIENCE)})
             if path == "/api/jobs":
@@ -280,24 +414,49 @@ class Handler(SimpleHTTPRequestHandler):
     # POST
     def do_POST(self):
         path = urlparse(self.path).path
-        if not self._authorized():
-            return self._json({"error": "missing or wrong X-Token"}, 401)
         body = self._body()
         if body is None:
             return self._json({"error": "body must be JSON"}, 400)
+        if path == "/api/auth/login":
+            if not auth.AUTH_ON:
+                return self._json({"ok": True, "auth": "off"})
+            if not auth.check_password(body.get("password", "")):
+                time.sleep(0.5)
+                return self._json({"error": "wrong password"}, 401)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Set-Cookie", auth.new_session_cookie(self._secure()))
+            self.end_headers()
+            self.wfile.write(b'{"ok": true}')
+            return
+        if not self._gate(path):
+            return
         try:
+            if path == "/api/auth/logout":
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Set-Cookie", auth.clear_session_cookie())
+                self.end_headers()
+                self.wfile.write(b'{"ok": true}')
+                return
+            if path == "/api/auth/token":
+                who = self._who() or {}
+                if auth.AUTH_ON and who.get("via") != "session" and not auth.check_password(body.get("password", "")):
+                    return self._json({"error": "a session or the password is required to issue tokens"}, 403)
+                conn = J.db()
+                tid, token = auth.issue_token(conn, body.get("name") or "unnamed", J.now())
+                conn.close()
+                return self._json({"id": tid, "name": body.get("name") or "unnamed", "token": token,
+                                   "note": "shown once; send as Authorization: Bearer <token>"}, 201)
+            if path.startswith("/api/auth/tokens/") and path.endswith("/revoke"):
+                conn = J.db()
+                n = auth.revoke_token(conn, int(path.split("/")[4]), J.now())
+                conn.close()
+                return self._json({"revoked": n})
             if path == "/api/scan":
-                source = body.get("source") or "usace_yellogov"
-                if source not in J.list_sources():
-                    return self._json({"error": f"unknown source; available: {J.list_sources()}"}, 400)
-                active = _active_run()
-                if active:
-                    return self._json({"error": "a run is already active", "run": active}, 409)
-                days, all_, refetch = int(body.get("days", 7)), bool(body.get("all")), bool(body.get("refetch"))
-                rid = _start_run("scan", {"source": source, "days": days, "all": all_, "refetch": refetch},
-                                 lambda conn, log: J.scan_source(conn, source, days=days, all_=all_,
-                                                                 refetch=refetch, log=log))
-                return self._json({"run_id": rid, "status": "running"}, 202)
+                r = start_scan(body.get("source") or "usace_yellogov", int(body.get("days", 7)),
+                               bool(body.get("all")), bool(body.get("refetch")))
+                return self._json(r, 202 if "run_id" in r else (409 if "run" in r else 400))
             if path == "/api/refresh":
                 conn = J.db()
                 if body.get("ids"):
@@ -321,15 +480,8 @@ class Handler(SimpleHTTPRequestHandler):
                 rid = _start_run("refresh", {"ids": ids}, work, persist=False)
                 return self._json({"run_id": rid, "status": "running", "count": len(ids)}, 202)
             if path == "/api/embed":
-                active = _active_run()
-                if active:
-                    return self._json({"error": "a run is already active", "run": active}, 409)
-                if not os.environ.get("OPENAI_API_KEY"):
-                    return self._json({"error": "OPENAI_API_KEY is not set in the server environment"}, 503)
-                ids, force = body.get("ids"), bool(body.get("force"))
-                rid = _start_run("embed", {"ids": ids, "force": force},
-                                 lambda conn, log: J.embed_jobs(conn, ids=ids, force=force, log=log), persist=False)
-                return self._json({"run_id": rid, "status": "running"}, 202)
+                r = start_embed(body.get("ids"), bool(body.get("force")))
+                return self._json(r, 202 if "run_id" in r else (409 if "run" in r else 503))
             if path == "/api/jobs":
                 conn = J.db()
                 jid = J.add_job(conn, body["title"], body.get("source", "manual"), body.get("source_id"),
@@ -394,41 +546,6 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _sources(self):
-        conn = J.db()
-        last = {r["args_source"]: r for r in conn.execute("""
-            SELECT DISTINCT ON (args::json->>'source') args::json->>'source' AS args_source,
-                   started_at, status, summary FROM runs WHERE kind='scan'
-            ORDER BY args::json->>'source', id DESC""")}
-        out = []
-        for name in J.list_sources():
-            mod = J.load_source(name)
-            r = last.get(name)
-            out.append({"name": name, "display_name": getattr(mod, "DISPLAY_NAME", name),
-                        "board_url": getattr(mod, "BOARD_URL", None),
-                        "last_scan": {"started_at": r["started_at"], "status": r["status"],
-                                      "summary": json.loads(r["summary"]) if r["summary"] else None} if r else None})
-        conn.close()
-        return out
-
-    def _stats(self):
-        conn = J.db()
-        tot = conn.execute("SELECT COUNT(*) AS n FROM jobs").fetchone()["n"]
-        v = J.latest_verdicts(conn)
-        by = {}
-        for r in v.values():
-            by[r["verdict"]] = by.get(r["verdict"], 0) + 1
-        acts = J.latest_actions(conn)
-        docs = conn.execute("SELECT COUNT(*) AS n FROM documents").fetchone()["n"]
-        emb = conn.execute("SELECT COUNT(*) AS n FROM embeddings").fetchone()["n"]
-        srcs = [dict(r) for r in conn.execute("SELECT * FROM sources")]
-        conn.close()
-        return {"jobs": tot, "pending": tot - len(v), "verdicts": by, "actioned": len(acts),
-                "documents": docs, "embedded": emb, "embeddings_enabled": bool(os.environ.get("OPENAI_API_KEY")),
-                "dsn": J.DSN.split("@")[-1], "sources": srcs,
-                "adapters": J.list_sources(), "active_run": _active_run(),
-                "profile_hash": J.profile_hash(EXPERIENCE) if os.path.exists(EXPERIENCE) else None}
-
 
 def _watch_and_reexec(paths, interval=1.0):
     """Dev reloader: poll .py files; on any change, re-exec this process."""
@@ -464,12 +581,25 @@ def _watch_and_reexec(paths, interval=1.0):
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "hash-password":
+        import getpass
+        pw = getpass.getpass("password: ")
+        if pw != getpass.getpass("again: "):
+            sys.exit("passwords differ")
+        print(auth.hash_password(pw))
+        sys.exit(0)
+    if auth.AUTH_ON and (not auth.PASSWORD_HASH or not auth.SECRET):
+        sys.exit("JOBBOARD_AUTH=1 needs JOBBOARD_PASSWORD_HASH and JOBBOARD_SECRET")
     if os.environ.get("JOBBOARD_RELOAD") == "1":
         _watch_and_reexec([HERE, JOBSCAN_DIR])
-    # Mark any run left 'running' by a previous process as failed.
+    # Mark any run left 'running' by a previous process as failed; create auth tables.
     c = J.db()
+    c.execute(auth.SCHEMA)
     c.execute("UPDATE runs SET status='failed', finished_at=%s WHERE status='running'", (J.now(),))
     c.commit()
     c.close()
     print(f"jobboard: http://0.0.0.0:{PORT}  db={J.DSN.split('@')[-1]}  api=/api  embeddings={'on' if os.environ.get('OPENAI_API_KEY') else 'off (no OPENAI_API_KEY)'}")
+    if MCP_PORT:
+        threading.Thread(target=mcp_mod.serve, args=(J, _Api, MCP_BIND, MCP_PORT), name="mcp", daemon=True).start()
+    print(f"auth: {'on' if auth.AUTH_ON else 'off'}", flush=True)
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()

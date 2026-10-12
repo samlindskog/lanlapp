@@ -136,7 +136,7 @@
 </aside>
 <div id="content">
 <header>
-  <h1>Job Board <span class="count" id="count"></span></h1>
+  <h1>Job Board <span class="count" id="count"></span> <a href="#" id="logout" class="muted" style="font-weight:400;font-size:12px;margin-left:10px" hidden>sign out</a></h1>
   <div class="controls">
     <div class="group"><span class="label" title="None checked = all verdicts">Verdict</span>
       <label class="chk"><input type="checkbox" data-f="verdict" value="yes" checked> yes</label>
@@ -441,7 +441,9 @@
     return d;
   }
   async function reload() {
-    const d = await (await fetch("/api/jobs")).json();
+    const r = await fetch("/api/jobs");
+    if (r.status === 401) { location.href = "/login.html?next=" + encodeURIComponent(location.pathname); return {jobs: []}; }
+    const d = await r.json();
     state.jobs = d.jobs;
     const sources = [...new Set(d.jobs.map((j) => j.source))].sort();
     const cur = $("#source").value;
@@ -605,6 +607,8 @@
     } catch (err) { setRun("failed", `status [${id}] failed: ${err.message}`); render(); }
   });
 
+  fetch("/api/auth/me").then((r) => r.json()).then((m) => { if (m.via === "session") $("#logout").hidden = false; }).catch(() => {});
+  $("#logout").addEventListener("click", async (e) => { e.preventDefault(); await fetch("/api/auth/logout", { method: "POST" }); location.href = "/login.html"; });
   reload().then((d) => {
     if (d.active_run) pollRun(d.active_run.id);
   }).catch((e) => { $("#rows").innerHTML = `<tr><td colspan="9">failed to load /api/jobs: ${esc(e)}</td></tr>`; });

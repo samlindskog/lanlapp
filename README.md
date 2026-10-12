@@ -49,3 +49,14 @@ Backup / restore the database:
 docker compose -f jobboard/compose.yaml exec db pg_dump -U jobscan jobscan | gzip > jobscan-backup.sql.gz
 gunzip -c jobscan-backup.sql.gz | docker compose -f jobboard/compose.yaml exec -T db psql -U jobscan jobscan
 ```
+
+## Production (uscentral1)
+
+- https://jobs.slindskog.net behind nginx (Cloudflare origin cert + authenticated origin pulls), password login.
+- Stack: `jobboard/compose.prod.yaml` under `/opt/jobboard`, Postgres data in the `pgdata` volume.
+- Deploy: push to master -> GitHub Actions tests, then `ssh deploy@vps /opt/jobboard/deploy/deploy.sh`.
+  Manual: `ssh -i ~/.ssh/jobboard_deploy deploy@72.14.178.40 /opt/jobboard/deploy/deploy.sh [ref]`.
+- Tokens: `POST /api/auth/token {name, password}` once; then `Authorization: Bearer <token>` for API and MCP.
+- MCP for Claude Code, reachable only over WireGuard:
+  `claude mcp add --transport http jobboard http://10.88.0.1:8090/mcp --header "Authorization: Bearer <token>"`
+- One-time server setup: `deploy/bootstrap.sh` (see its header). Firewall input policy: ssh, WireGuard, 443, MCP on wg0.
