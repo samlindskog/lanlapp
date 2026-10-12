@@ -32,6 +32,7 @@
   button { font: inherit; padding: 4px 10px; border: 1px solid var(--line); border-radius: 6px;
            background: var(--card); color: var(--fg); cursor: pointer; }
   .count { color: var(--muted); margin-left: auto; }
+  button.on { background: var(--accent); color: #fff; border-color: var(--accent); }
   .runstat { color: var(--muted); font-size: 13px; }
   .runstat.running { color: var(--maybe); }
   .runstat.failed { color: var(--no); }
@@ -77,15 +78,17 @@
   th.sel, td.sel { width: 28px; padding-right: 0; }
   td.sel input, th.sel input { cursor: pointer; }
   tr.row.selected td { background: color-mix(in srgb, var(--applied) 12%, transparent); }
-  #bulk { position: fixed; left: 0; top: 0; bottom: 0; width: 250px; padding: 16px; background: var(--card);
-          border-right: 1px solid var(--line); z-index: 3; display: flex; flex-direction: column; gap: 10px; overflow: auto; }
+  #layout { display: flex; align-items: flex-start; min-height: 100vh; }
+  #content { flex: 1 1 auto; min-width: 0; }
+  #bulk { flex: 0 0 250px; position: sticky; top: 0; max-height: 100vh; padding: 16px; background: var(--card);
+          border-right: 1px solid var(--line); display: flex; flex-direction: column; gap: 10px; overflow: auto; box-sizing: border-box; }
+  #bulk[hidden] { display: none; }
+  #bulk .close { align-self: flex-end; margin-top: -6px; }
   #bulk h3 { margin: 0 0 4px; font-size: 15px; }
   #bulk select, #bulk input { width: 100%; font: inherit; padding: 4px 8px; border: 1px solid var(--line);
       border-radius: 6px; background: var(--bg); color: var(--fg); margin-top: 4px; }
   #bulkApply { background: var(--accent); color: #fff; border-color: var(--accent); }
-  body.has-bulk header, body.has-bulk main { margin-left: 250px; }
-  @media (max-width: 800px) { #bulk { width: 100%; bottom: auto; border-right: 0; border-bottom: 1px solid var(--line); position: sticky; }
-    body.has-bulk header, body.has-bulk main { margin-left: 0; } }
+  @media (max-width: 800px) { #layout { flex-direction: column; } #bulk { flex-basis: auto; width: 100%; position: static; max-height: none; border-right: 0; border-bottom: 1px solid var(--line); } }
   .soon { color: var(--maybe); font-weight: 600; }
   a { color: var(--accent); }
   tr.detail td { background: var(--card); padding: 12px 14px; }
@@ -102,6 +105,20 @@
 </style>
 </head>
 <body>
+<div id="layout">
+<aside id="bulk" hidden>
+  <button class="close" id="bulkClose" title="Hide panel">✕</button>
+  <h3><span id="selCount">0</span> selected</h3>
+  <label>Set status to<br><select id="bulkAction">
+    <option value="applied">applied</option><option value="drafted">drafted</option>
+    <option value="skipped">skipped</option><option value="withdrawn">withdrawn</option></select></label>
+  <label>Date<br><input type="date" id="bulkDate"></label>
+  <label>Note (optional)<br><input type="text" id="bulkNote" placeholder="e.g. applied via USAJOBS"></label>
+  <button id="bulkApply">Apply to selected</button>
+  <button id="bulkClear">Clear selection</button>
+  <p class="muted">Tip: click a checkbox, then shift-click another to select the range between them. The header checkbox selects everything listed.</p>
+</aside>
+<div id="content">
 <header>
   <h1>Job Board <span class="count" id="count"></span></h1>
   <div class="controls">
@@ -150,6 +167,7 @@
     <div class="group"><span class="label">Actions</span>
       <button id="scan" title="Fetch new postings from a job board">Scan…</button>
       <button id="refreshAll" title="Re-fetch every posting currently listed (current filters) so dates and text are current">Refresh</button>
+      <button id="bulkToggle" title="Show or hide the bulk status panel">Bulk edit</button>
     </div>
     <span id="run" class="runstat"></span>
   </div>
@@ -165,17 +183,6 @@
     <div class="dlg-actions"><button value="cancel" type="button" id="scanCancel">Cancel</button><button value="start" id="scanStart">Start scan</button></div>
   </form>
 </dialog>
-<aside id="bulk" hidden>
-  <h3><span id="selCount">0</span> selected</h3>
-  <label>Set status to<br><select id="bulkAction">
-    <option value="applied">applied</option><option value="drafted">drafted</option>
-    <option value="skipped">skipped</option><option value="withdrawn">withdrawn</option></select></label>
-  <label>Date<br><input type="date" id="bulkDate"></label>
-  <label>Note (optional)<br><input type="text" id="bulkNote" placeholder="e.g. applied via USAJOBS"></label>
-  <button id="bulkApply">Apply to selected</button>
-  <button id="bulkClear">Clear selection</button>
-  <p class="muted">Tip: click a checkbox, then shift-click another to select the range between them. The header checkbox selects everything listed.</p>
-</aside>
 <main>
   <table>
     <thead><tr>
@@ -192,10 +199,12 @@
     <tbody id="rows"></tbody>
   </table>
 </main>
+</div>
+</div>
 <script>
 (() => {
   const $ = (s) => document.querySelector(s);
-  const state = { jobs: [], sort: "close_date", dir: "asc", open: null, selected: new Set(), lastClicked: null, lastRows: [] };
+  const state = { jobs: [], sort: "close_date", dir: "asc", open: null, selected: new Set(), lastClicked: null, lastRows: [], bulkOpen: false, bulkDismissed: false };
   const VRANK = { yes: 0, maybe: 1, none: 2, no: 3 };
   const ARANK = { applied: 0, drafted: 1, withdrawn: 2, skipped: 3, none: 4 };
   const today = new Date().toISOString().slice(0, 10);
@@ -453,11 +462,14 @@
   });
   function renderSidebar() {
     const n = state.selected.size;
-    $("#bulk").hidden = n === 0;
-    document.body.classList.toggle("has-bulk", n > 0);
+    $("#bulk").hidden = !state.bulkOpen;
+    $("#bulkToggle").classList.toggle("on", state.bulkOpen);
     $("#selCount").textContent = n;
+    $("#bulkApply").disabled = n === 0;
     if (!$("#bulkDate").value) $("#bulkDate").value = today;
   }
+  $("#bulkToggle").addEventListener("click", () => { state.bulkOpen = !state.bulkOpen; renderSidebar(); });
+  $("#bulkClose").addEventListener("click", () => { state.bulkOpen = false; state.bulkDismissed = true; renderSidebar(); });
   $("#rows").addEventListener("click", (e) => {
     const cb = e.target.closest("input[data-sel]"); if (!cb) return;
     e.stopPropagation();
@@ -469,6 +481,7 @@
     }
     ids.forEach((x) => want ? state.selected.add(x) : state.selected.delete(x));
     state.lastClicked = id;
+    if (want && state.selected.size > 0 && !state.bulkDismissed) state.bulkOpen = true;
     render();
   });
   $("#selAll").addEventListener("change", (e) => {
