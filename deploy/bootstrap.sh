@@ -21,6 +21,14 @@ WG_IP=10.88.0.1
 MCP_PORT=8090
 log() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 
+# --- maintenance mode: `touch ~/jobboard-bootstrap/remove-sudo-rule` then run; deletes the sudoers
+# rule that allows this script to run without a password. After this, root needs a password again.
+if [ -f "$HERE/remove-sudo-rule" ]; then
+  rm -f "$HERE/remove-sudo-rule" /etc/sudoers.d/jobboard-bootstrap
+  visudo -c >/dev/null && echo "sudoers rule removed; remaining sudoers.d: $(ls /etc/sudoers.d | tr '\n' ' ')"
+  exit 0
+fi
+
 # --- maintenance mode: `touch ~/jobboard-bootstrap/show-firewall` then run; prints the live nftables
 # ruleset and listening sockets, changes nothing.
 if [ -f "$HERE/show-firewall" ]; then
