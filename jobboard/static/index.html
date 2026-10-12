@@ -38,12 +38,6 @@
   .runstat.done { color: var(--yes); }
   .runstat { transition: opacity .6s; }
   .runstat.fade { opacity: 0; }
-  form.inline { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 8px; }
-  form.inline input, form.inline select { font: inherit; padding: 3px 6px; border: 1px solid var(--line);
-      border-radius: 6px; background: var(--bg); color: var(--fg); }
-  form.inline input[type=text] { min-width: 200px; }
-  .forms { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 8px 24px; margin: 6px 0 10px; }
-  .forms h4 { margin: 6px 0 2px; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
   .flash { font-size: 12px; color: var(--yes); margin-left: 6px; }
   dialog { border: 1px solid var(--line); border-radius: 10px; background: var(--card); color: var(--fg);
            padding: 18px 20px; min-width: 320px; max-width: 90vw; }
@@ -289,19 +283,6 @@
         <div>Last fetched: <b>${esc(fmtLocal(j.last_fetched) || "—")}</b>
              <button data-act="refresh" data-id="${j.id}" style="margin-left:6px">Refresh posting</button><span class="flash" id="flash-${j.id}"></span></div>
       </div>
-      <div class="forms">
-        <form class="inline" data-form="action" data-id="${j.id}"><h4 style="flex-basis:100%">Record status</h4>
-          <select name="action"><option value="applied">applied</option><option value="drafted">drafted</option><option value="skipped">skipped</option><option value="withdrawn">withdrawn</option></select>
-          <input type="date" name="date" value="${today}">
-          <input type="text" name="resume_dir" placeholder="applications/resumeX_mond" value="${esc(j.resume_dir || "")}">
-          <input type="text" name="note" placeholder="note">
-          <button type="submit">Save</button></form>
-        <form class="inline" data-form="verdict" data-id="${j.id}"><h4 style="flex-basis:100%">Override verdict</h4>
-          <select name="verdict"><option value="yes">yes</option><option value="maybe">maybe</option><option value="no">no</option></select>
-          <input type="text" name="grades" placeholder="eligible grades, e.g. GS-5/7" value="${esc(j.eligible_grades || "")}" style="min-width:150px">
-          <input type="text" name="reason" placeholder="reason" required>
-          <button type="submit">Save</button></form>
-      </div>
       <div id="docs-${j.id}"><em style="color:var(--muted)">loading stored text…</em></div>
     </td></tr>`;
   }
@@ -425,19 +406,7 @@
     } catch (err) { setRun("failed", `refresh [${id}] failed: ${err.message}`); }
     b.disabled = false;
   });
-  $("#rows").addEventListener("submit", async (e) => {
-    const f = e.target.closest("form[data-form]"); if (!f) return;
-    e.preventDefault(); e.stopPropagation();
-    const body = Object.fromEntries(new FormData(f).entries());
-    Object.keys(body).forEach((k) => { if (body[k] === "") delete body[k]; });
-    const flash = document.getElementById(`flash-${f.dataset.id}`);
-    try {
-      if (f.dataset.form === "verdict") { const h = await (await fetch("/api/profile-hash")).json(); body.profile_hash = h.profile_hash; }
-      await post(`/api/jobs/${f.dataset.id}/${f.dataset.form}`, body);
-      flash.textContent = `${f.dataset.form} saved`; await reload();
-    } catch (err) { flash.textContent = err.message; }
-  });
-  $("#rows").addEventListener("click", (e) => { if (e.target.closest("form, details, a")) e.stopPropagation(); }, true);
+  $("#rows").addEventListener("click", (e) => { if (e.target.closest("details, a")) e.stopPropagation(); }, true);
 
   reload().then((d) => {
     if (d.active_run) pollRun(d.active_run.id);
