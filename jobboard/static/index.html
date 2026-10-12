@@ -124,7 +124,7 @@
 <header>
   <h1>Job Board <span class="count" id="count"></span></h1>
   <div class="controls">
-    <div class="group"><span class="label">Verdict</span>
+    <div class="group"><span class="label" title="None checked = all verdicts">Verdict</span>
       <label class="chk"><input type="checkbox" data-f="verdict" value="yes" checked> yes</label>
       <label class="chk"><input type="checkbox" data-f="verdict" value="maybe" checked> maybe</label>
       <label class="chk"><input type="checkbox" data-f="verdict" value="no"> no</label>
@@ -243,8 +243,9 @@
     const verdicts = new Set([...document.querySelectorAll('input[data-f="verdict"]:checked')].map((i) => i.value));
     const applied = $("#applied").value, openness = $("#openness").value, source = $("#source").value;
     const q = $("#q").value.trim().toLowerCase();
+    // Every control only narrows: an empty verdict set, "any", or blank search means no restriction.
     return state.jobs.filter((j) => {
-      if (!verdicts.has(verdictOf(j))) return false;
+      if (verdicts.size && !verdicts.has(verdictOf(j))) return false;
       const a = actionOf(j);
       if (applied === "applied" && a !== "applied") return false;
       if (applied === "not" && a === "applied") return false;
