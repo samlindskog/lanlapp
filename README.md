@@ -15,7 +15,6 @@ jobboard/            shared research service over the database
   skills/new-resume        how to draft a resume from EXPERIENCE.md
   skills/job-search        board-agnostic scan → judge → report → record workflow
   skills/job-source-usace  USACE (yellogov → USAJOBS) board mechanics
-  hooks/experience-sync.sh keeps EXPERIENCE.md in sync with new resumes
 ```
 
 API in one minute (full list at http://localhost:8080/api):
