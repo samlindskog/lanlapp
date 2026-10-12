@@ -3,12 +3,14 @@
 ```
 EXPERIENCE.md        master record of education, work, projects, skills (facts only)
 applications/        one directory per tailored resume or cover letter (LaTeX + build output)
-jobscan/             job posting tracker
-  jobscan.py           CLI: scan boards, judge, report, record applications
+jobscan/             job posting tracker (PostgreSQL + pgvector, runs in the compose stack)
+  jobscan.py           CLI + library: scan boards, judge, report, record applications, embed, search
   sources/             one adapter per job board (usace_yellogov.py, ...)
-  jobs.sqlite          the database: postings stored verbatim, verdicts, actions
+  migrate_sqlite.py    one-time import of the old jobs.sqlite (already done)
 jobboard/            shared research service over the database
   compose.yaml         `cd jobboard && docker compose up -d` → http://localhost:8080
+                       services: db (pgvector/pg16, data in the `pgdata` volume, port 5432) + jobboard
+                       OPENAI_API_KEY is read from your shell (or jobboard/.env) for embeddings
   server.py            web page for the human, JSON API for Claude (GET /api lists it)
   static/index.html    the page: filters, sorting, scan/refresh buttons, status + verdict forms
 .claude/
@@ -28,11 +30,22 @@ curl -s -X POST localhost:8080/api/jobs/ID/verdict -H 'Content-Type: application
 curl -s -X POST localhost:8080/api/jobs/ID/action  -H 'Content-Type: application/json' -d '{"action":"applied","resume_dir":"applications/..."}'
 ```
 
-CLI equivalents (from the repo root, no server needed):
+Semantic search: type in the search box and press Enter (needs OPENAI_API_KEY; `POST /api/embed`
+or `python3 jobscan/jobscan.py embed` computes embeddings; scans embed new postings automatically).
+
+CLI equivalents (from the repo root; needs `pip install "psycopg[binary]"` and the db container up):
 
 ```
 python3 jobscan/jobscan.py scan --source usace_yellogov --days 7
 python3 jobscan/jobscan.py report --open-only
 python3 jobscan/jobscan.py mark <id> applied --date YYYY-MM-DD --resume-dir applications/<dir>
 python3 jobscan/jobscan.py apps
+python3 jobscan/jobscan.py search --semantic "entry level analyst job for a math graduate"
+```
+
+Backup / restore the database:
+
+```
+docker compose -f jobboard/compose.yaml exec db pg_dump -U jobscan jobscan | gzip > jobscan-backup.sql.gz
+gunzip -c jobscan-backup.sql.gz | docker compose -f jobboard/compose.yaml exec -T db psql -U jobscan jobscan
 ```

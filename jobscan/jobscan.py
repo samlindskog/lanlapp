@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
-"""jobscan: board-agnostic job posting tracker.
+"""jobscan: board-agnostic job posting tracker (PostgreSQL + pgvector).
 
-Stores every fetched page verbatim (raw HTML + extracted text) in SQLite, plus
-parsed convenience fields, qualification verdicts, and application actions.
-Board-specific logic lives in jobscan/sources/<name>.py adapters.
+Stores every fetched page verbatim (raw HTML + extracted text), parsed
+convenience fields, qualification verdicts, application actions, and OpenAI
+embeddings for semantic search. Board-specific logic lives in
+jobscan/sources/<name>.py adapters.
+
+Env:
+  JOBSCAN_DSN     postgresql://jobscan:jobscan@localhost:5432/jobscan  (compose exposes 5432)
+  OPENAI_API_KEY  for `embed` and semantic search (text-embedding-3-small)
 
 Usage: jobscan.py <command> [options]   (run with -h for details)
+Requires: pip install "psycopg[binary]"
 """
 import argparse
 import datetime as dt
@@ -14,25 +20,29 @@ import html
 import json
 import os
 import re
-import sqlite3
+import ssl
 import sys
 import time
-import ssl
 import urllib.request
 import urllib.error
 import zlib
 from html.parser import HTMLParser
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.environ.get("JOBSCAN_DB", os.path.join(HERE, "jobs.sqlite"))
-sys.path.insert(0, HERE)
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+except ImportError:  # pragma: no cover
+    sys.exit('jobscan needs the Postgres driver: pip install "psycopg[binary]"')
 
-USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) jobscan/1.0"
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+DSN = os.environ.get("JOBSCAN_DSN", "postgresql://jobscan:jobscan@localhost:5432/jobscan")
+USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) jobscan/2.0"
+EMBED_MODEL = "text-embedding-3-small"
+EMBED_DIMS = 1536
 
 
 def _ssl_context():
-    """Default context, falling back to certifi or the macOS bundle when the
-    Python build ships without root certificates (python.org installers)."""
     for cafile in (None, "/etc/ssl/cert.pem"):
         try:
             if cafile is None:
@@ -51,13 +61,14 @@ def _ssl_context():
 SSL_CTX = _ssl_context()
 
 SCHEMA = """
+CREATE EXTENSION IF NOT EXISTS vector;
 CREATE TABLE IF NOT EXISTS sources (
     name TEXT PRIMARY KEY,
     display_name TEXT,
     board_url TEXT
 );
 CREATE TABLE IF NOT EXISTS jobs (
-    id INTEGER PRIMARY KEY,
+    id SERIAL PRIMARY KEY,
     source TEXT NOT NULL,
     source_id TEXT NOT NULL,
     title TEXT,
@@ -78,52 +89,61 @@ CREATE TABLE IF NOT EXISTS jobs (
     UNIQUE(source, source_id)
 );
 CREATE TABLE IF NOT EXISTS documents (
-    id INTEGER PRIMARY KEY,
-    job_id INTEGER NOT NULL REFERENCES jobs(id),
+    id SERIAL PRIMARY KEY,
+    job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
     kind TEXT NOT NULL,
     url TEXT,
     fetched_at TEXT,
-    raw_html TEXT,
+    raw_html BYTEA,
     text TEXT
 );
 CREATE INDEX IF NOT EXISTS documents_job ON documents(job_id);
 CREATE TABLE IF NOT EXISTS verdicts (
-    id INTEGER PRIMARY KEY,
-    job_id INTEGER NOT NULL REFERENCES jobs(id),
+    id SERIAL PRIMARY KEY,
+    job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
     verdict TEXT NOT NULL CHECK (verdict IN ('yes','no','maybe')),
     eligible_grades TEXT,
     reason TEXT,
     assessed_at TEXT,
     profile_hash TEXT,
-    author TEXT NOT NULL DEFAULT 'claude'   -- 'claude' (judged) or 'user' (override)
+    author TEXT NOT NULL DEFAULT 'claude'
 );
 CREATE INDEX IF NOT EXISTS verdicts_job ON verdicts(job_id);
 CREATE TABLE IF NOT EXISTS actions (
-    id INTEGER PRIMARY KEY,
-    job_id INTEGER NOT NULL REFERENCES jobs(id),
-    action TEXT NOT NULL CHECK (action IN ('applied','skipped','drafted','withdrawn')),
+    id SERIAL PRIMARY KEY,
+    job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    action TEXT NOT NULL,
     action_date TEXT,
     resume_dir TEXT,
     note TEXT
 );
 CREATE INDEX IF NOT EXISTS actions_job ON actions(job_id);
 CREATE TABLE IF NOT EXISTS runs (
-    id INTEGER PRIMARY KEY,
-    kind TEXT NOT NULL,            -- scan | refresh
-    args TEXT,                     -- json
-    status TEXT NOT NULL,          -- running | done | failed
+    id SERIAL PRIMARY KEY,
+    kind TEXT NOT NULL,
+    args TEXT,
+    status TEXT NOT NULL,
     started_at TEXT,
     finished_at TEXT,
     log TEXT,
-    summary TEXT                   -- json
+    summary TEXT
 );
-"""
+CREATE TABLE IF NOT EXISTS embeddings (
+    job_id INTEGER PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+    model TEXT NOT NULL,
+    text_hash TEXT NOT NULL,
+    content TEXT,
+    embedding vector(%d),
+    created_at TEXT
+);
+""" % EMBED_DIMS
+
+_schema_done = False
 
 
 # ----------------------------------------------------------------- utilities
 def now():
-    """Zone-aware UTC timestamp, e.g. 2026-10-12T18:04:11+00:00. Clients convert
-    to local time. (Rows written before 2026-10-12 may be naive local time.)"""
+    """Zone-aware UTC timestamp, e.g. 2026-10-12T18:04:11+00:00."""
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
 
 
@@ -131,21 +151,17 @@ def today():
     return dt.date.today().isoformat()
 
 
-def db(path=None):
-    conn = sqlite3.connect(path or DB_PATH, timeout=30, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=30000")
-    conn.executescript(SCHEMA)
-    cols = {r[1] for r in conn.execute("PRAGMA table_info(verdicts)")}
-    if "author" not in cols:
-        conn.execute("ALTER TABLE verdicts ADD COLUMN author TEXT NOT NULL DEFAULT 'claude'")
-        conn.commit()
+def db(dsn=None):
+    global _schema_done
+    conn = psycopg.connect(dsn or DSN, row_factory=dict_row)
+    if not _schema_done:
+        with conn.transaction():
+            conn.execute(SCHEMA)
+        _schema_done = True
     return conn
 
 
 def fetch(url, retries=2, delay=0.4, accept=None):
-    """GET url, return (status, body_text). Retries on transient failure."""
     headers = {"User-Agent": USER_AGENT}
     if accept:
         headers["Accept"] = accept
@@ -166,6 +182,21 @@ def fetch(url, retries=2, delay=0.4, accept=None):
         time.sleep(1.5 * (attempt + 1))
     print(f"  ! fetch failed {url}: {last}", file=sys.stderr)
     return 0, ""
+
+
+def pack_html(raw):
+    return None if raw is None else zlib.compress(raw.encode("utf-8"), 9)
+
+
+def unpack_html(blob):
+    if blob is None:
+        return None
+    if isinstance(blob, (bytes, memoryview)):
+        try:
+            return zlib.decompress(bytes(blob)).decode("utf-8", errors="replace")
+        except zlib.error:
+            return bytes(blob).decode("utf-8", errors="replace")
+    return blob
 
 
 class _TextExtractor(HTMLParser):
@@ -196,27 +227,7 @@ class _TextExtractor(HTMLParser):
             self.parts.append(data)
 
 
-def pack_html(raw):
-    """Raw HTML is stored verbatim but zlib-compressed (USAJOBS pages are ~120 KB
-    each; the repo-committed database must stay well under GitHub's 100 MB cap)."""
-    if raw is None:
-        return None
-    return zlib.compress(raw.encode("utf-8"), 9)
-
-
-def unpack_html(blob):
-    if blob is None:
-        return None
-    if isinstance(blob, (bytes, memoryview)):
-        try:
-            return zlib.decompress(bytes(blob)).decode("utf-8", errors="replace")
-        except zlib.error:
-            return bytes(blob).decode("utf-8", errors="replace")
-    return blob
-
-
 def html_to_text(raw):
-    """Verbatim text of an HTML page: all visible text, block structure kept."""
     p = _TextExtractor()
     try:
         p.feed(raw)
@@ -245,16 +256,14 @@ def list_sources():
 def latest_verdicts(conn):
     rows = conn.execute("""
         SELECT v.* FROM verdicts v
-        JOIN (SELECT job_id, MAX(id) AS mid FROM verdicts GROUP BY job_id) m
-          ON v.id = m.mid""").fetchall()
+        JOIN (SELECT job_id, MAX(id) AS mid FROM verdicts GROUP BY job_id) m ON v.id = m.mid""").fetchall()
     return {r["job_id"]: r for r in rows}
 
 
 def latest_actions(conn):
     rows = conn.execute("""
         SELECT a.* FROM actions a
-        JOIN (SELECT job_id, MAX(id) AS mid FROM actions GROUP BY job_id) m
-          ON a.id = m.mid""").fetchall()
+        JOIN (SELECT job_id, MAX(id) AS mid FROM actions GROUP BY job_id) m ON a.id = m.mid""").fetchall()
     return {r["job_id"]: r for r in rows}
 
 
@@ -271,24 +280,21 @@ def grade_str(j):
 
 # ----------------------------------------------------------------- library
 def _store_documents(conn, job_id, docs, replace=False):
-    """Insert documents. With replace=True (refresh / re-fetch) the previous
-    document of the same kind is removed first, so a job keeps exactly one
-    current copy per kind."""
+    """Insert documents. With replace=True the previous document of the same
+    kind is removed first, so a job keeps exactly one current copy per kind."""
     if replace:
-        kinds = {d["kind"] for d in docs}
-        for k in kinds:
-            conn.execute("DELETE FROM documents WHERE job_id=? AND kind=?", (job_id, k))
+        for k in {d["kind"] for d in docs}:
+            conn.execute("DELETE FROM documents WHERE job_id=%s AND kind=%s", (job_id, k))
     for d in docs:
         conn.execute("""INSERT INTO documents (job_id, kind, url, fetched_at, raw_html, text)
-            VALUES (?,?,?,?,?,?)""",
-                     (job_id, d["kind"], d.get("url"), now(),
-                      pack_html(d.get("raw_html")), d.get("text")))
+            VALUES (%s,%s,%s,%s,%s,%s)""",
+                     (job_id, d["kind"], d.get("url"), now(), pack_html(d.get("raw_html")), d.get("text")))
 
 
 def _update_fields(conn, job_id, fields, age_days=None):
-    conn.execute("""UPDATE jobs SET title=?, location=?, announcement_no=?, external_url=?,
-        board_url=?, series=?, pay_plan=?, grade_low=?, grade_high=?, salary=?, open_date=?,
-        close_date=?, posted_age_days=COALESCE(?, posted_age_days), last_seen=? WHERE id=?""",
+    conn.execute("""UPDATE jobs SET title=%s, location=%s, announcement_no=%s, external_url=%s,
+        board_url=%s, series=%s, pay_plan=%s, grade_low=%s, grade_high=%s, salary=%s, open_date=%s,
+        close_date=%s, posted_age_days=COALESCE(%s, posted_age_days), last_seen=%s WHERE id=%s""",
                  (fields.get("title"), fields.get("location"), fields.get("announcement_no"),
                   fields.get("external_url"), fields.get("board_url"), fields.get("series"),
                   fields.get("pay_plan"), fields.get("grade_low"), fields.get("grade_high"),
@@ -297,27 +303,27 @@ def _update_fields(conn, job_id, fields, age_days=None):
 
 
 def scan_source(conn, source_name, days=7, all_=False, limit=None, refetch=False,
-                max_pages=100, log=print):
-    """Fetch new postings from a board into the database. Returns a summary dict.
-
-    Incremental: known (source, source_id) pairs are not re-fetched unless
-    refetch=True. A new job whose announcement number was already judged under
-    another board id inherits that verdict."""
+                max_pages=100, log=print, embed=True):
+    """Fetch new postings from a board. Incremental: known (source, source_id)
+    pairs are not re-fetched unless refetch=True. A new job whose announcement
+    number was already judged under another board id inherits that verdict.
+    New/changed jobs are embedded afterwards when an API key is available."""
     src = load_source(source_name)
-    conn.execute("INSERT OR REPLACE INTO sources VALUES (?,?,?)",
+    conn.execute("""INSERT INTO sources VALUES (%s,%s,%s)
+        ON CONFLICT (name) DO UPDATE SET display_name=EXCLUDED.display_name, board_url=EXCLUDED.board_url""",
                  (source_name, src.DISPLAY_NAME, src.BOARD_URL))
     conn.commit()
     cards = src.list_jobs(fetch, since_days=None if all_ else days, max_pages=max_pages)
     log(f"{len(cards)} cards from {src.DISPLAY_NAME}")
     new = updated = carried = 0
-    need_judgment = []
+    need_judgment, touched = [], []
     for i, card in enumerate(cards):
         if limit and new >= limit:
             break
-        row = conn.execute("SELECT id FROM jobs WHERE source=? AND source_id=?",
+        row = conn.execute("SELECT id FROM jobs WHERE source=%s AND source_id=%s",
                            (source_name, card["source_id"])).fetchone()
         if row and not refetch:
-            conn.execute("UPDATE jobs SET last_seen=?, posted_age_days=? WHERE id=?",
+            conn.execute("UPDATE jobs SET last_seen=%s, posted_age_days=%s WHERE id=%s",
                          (now(), card.get("age_days"), row["id"]))
             updated += 1
             continue
@@ -328,37 +334,36 @@ def scan_source(conn, source_name, days=7, all_=False, limit=None, refetch=False
             job_id = row["id"]
             _update_fields(conn, job_id, fields, card.get("age_days"))
         else:
-            cur = conn.execute("""INSERT INTO jobs (source, source_id, title, location,
+            job_id = conn.execute("""INSERT INTO jobs (source, source_id, title, location,
                 announcement_no, external_url, board_url, series, pay_plan, grade_low,
                 grade_high, salary, open_date, close_date, posted_age_days, first_seen,
-                last_seen) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                               (source_name, card["source_id"], fields.get("title"),
-                                fields.get("location"), fields.get("announcement_no"),
-                                fields.get("external_url"), fields.get("board_url"),
-                                fields.get("series"), fields.get("pay_plan"),
-                                fields.get("grade_low"), fields.get("grade_high"),
-                                fields.get("salary"), fields.get("open_date"),
-                                fields.get("close_date"), card.get("age_days"),
-                                now(), now()))
-            job_id = cur.lastrowid
+                last_seen) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                                  (source_name, card["source_id"], fields.get("title"),
+                                   fields.get("location"), fields.get("announcement_no"),
+                                   fields.get("external_url"), fields.get("board_url"),
+                                   fields.get("series"), fields.get("pay_plan"),
+                                   fields.get("grade_low"), fields.get("grade_high"),
+                                   fields.get("salary"), fields.get("open_date"),
+                                   fields.get("close_date"), card.get("age_days"),
+                                   now(), now())).fetchone()["id"]
             new += 1
             prior = None
             if fields.get("announcement_no"):
                 prior = conn.execute("""
                     SELECT v.*, j.id AS other_id FROM verdicts v JOIN jobs j ON j.id = v.job_id
-                    WHERE j.announcement_no = ? AND j.id != ?
-                    ORDER BY v.id DESC LIMIT 1""",
+                    WHERE j.announcement_no = %s AND j.id != %s ORDER BY v.id DESC LIMIT 1""",
                                      (fields["announcement_no"], job_id)).fetchone()
             if prior:
                 conn.execute("""INSERT INTO verdicts (job_id, verdict, eligible_grades, reason,
-                    assessed_at, profile_hash) VALUES (?,?,?,?,?,?)""",
+                    assessed_at, profile_hash, author) VALUES (%s,%s,%s,%s,%s,%s,%s)""",
                              (job_id, prior["verdict"], prior["eligible_grades"],
                               f"same announcement as job {prior['other_id']}: {prior['reason']}",
-                              now(), prior["profile_hash"]))
+                              now(), prior["profile_hash"], prior["author"]))
                 carried += 1
             else:
                 need_judgment.append({"id": job_id, "title": fields.get("title")})
         _store_documents(conn, job_id, docs, replace=bool(row))
+        touched.append(job_id)
         conn.commit()
     log(f"done: {new} new, {updated} already known, {carried} verdicts carried over "
         f"from the same announcement")
@@ -366,26 +371,29 @@ def scan_source(conn, source_name, days=7, all_=False, limit=None, refetch=False
         log(f"{len(need_judgment)} new jobs need judgment (run: pending):")
         for j in need_judgment:
             log(f"  [{j['id']}] {j['title']}")
+    embedded = 0
+    if embed and touched and os.environ.get("OPENAI_API_KEY"):
+        try:
+            embedded = embed_jobs(conn, ids=touched, log=log)["embedded"]
+        except Exception as e:  # noqa: BLE001
+            log(f"embedding skipped: {e}")
     return {"cards": len(cards), "new": new, "known": updated, "carried": carried,
-            "need_judgment": need_judgment}
+            "need_judgment": need_judgment, "embedded": embedded}
 
 
 def refresh_job(conn, job_id, log=print):
-    """Re-fetch a stored job's pages so dates, text and status are current.
-    Replaces the stored document of each kind with the fresh copy."""
-    j = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+    """Re-fetch a stored job's pages; replaces the stored document of each kind."""
+    j = conn.execute("SELECT * FROM jobs WHERE id=%s", (job_id,)).fetchone()
     if not j:
         raise KeyError(job_id)
     if j["source"] == "manual" or not j["board_url"]:
-        # Manual jobs: refetch the external url only, if any.
         if not j["external_url"]:
             return {"id": job_id, "refetched": 0}
         st, body = fetch(j["external_url"])
         if body:
             _store_documents(conn, job_id, [{"kind": "posting", "url": j["external_url"],
-                                             "raw_html": body, "text": html_to_text(body)}],
-                             replace=True)
-            conn.execute("UPDATE jobs SET last_seen=? WHERE id=?", (now(), job_id))
+                                             "raw_html": body, "text": html_to_text(body)}], replace=True)
+            conn.execute("UPDATE jobs SET last_seen=%s WHERE id=%s", (now(), job_id))
             conn.commit()
         return {"id": job_id, "refetched": 1 if body else 0}
     src = load_source(j["source"])
@@ -401,19 +409,18 @@ def refresh_job(conn, job_id, log=print):
 
 
 def search_documents(conn, query, kinds=None, limit=50, context=160):
-    """Case-insensitive AND search over stored document text (and job titles).
-    Returns one hit per job with snippets around the first match of each term."""
-    terms = [t.lower() for t in re.findall(r'"([^"]+)"|(\S+)', query) for t in t if t]
+    """Case-insensitive AND keyword search over stored text and titles."""
+    terms = [t for t in (m[0] or m[1] for m in re.findall(r'"([^"]+)"|(\S+)', query)) if t]
     if not terms:
         return []
-    sql = "SELECT d.id AS doc_id, d.job_id, d.kind, d.url, d.text, j.title FROM documents d " \
-          "JOIN jobs j ON j.id = d.job_id WHERE d.text IS NOT NULL"
+    sql = ("SELECT d.id AS doc_id, d.job_id, d.kind, d.url, d.text, j.title FROM documents d "
+           "JOIN jobs j ON j.id = d.job_id WHERE d.text IS NOT NULL")
     params = []
     if kinds:
-        sql += " AND d.kind IN (%s)" % ",".join("?" * len(kinds))
-        params += list(kinds)
+        sql += " AND d.kind = ANY(%s)"
+        params.append(list(kinds))
     for t in terms:
-        sql += " AND (LOWER(d.text) LIKE ? OR LOWER(j.title) LIKE ?)"
+        sql += " AND (d.text ILIKE %s OR j.title ILIKE %s)"
         params += [f"%{t}%", f"%{t}%"]
     sql += " ORDER BY d.id DESC"
     hits, seen = [], set()
@@ -424,7 +431,7 @@ def search_documents(conn, query, kinds=None, limit=50, context=160):
         low = r["text"].lower()
         snippets = []
         for t in terms:
-            i = low.find(t)
+            i = low.find(t.lower())
             if i >= 0:
                 a, b = max(0, i - context), min(len(r["text"]), i + len(t) + context)
                 snippets.append(re.sub(r"\s+", " ", r["text"][a:b]).strip())
@@ -435,46 +442,134 @@ def search_documents(conn, query, kinds=None, limit=50, context=160):
     return hits
 
 
-def record_verdict(conn, job_id, verdict, grades=None, reason=None, profile_hash=None,
-                   author="claude"):
+# ----------------------------------------------------------------- embeddings
+def embed_texts(texts, model=EMBED_MODEL):
+    """OpenAI embeddings via plain HTTPS (no SDK). Returns list of vectors."""
+    key = os.environ.get("OPENAI_API_KEY")
+    if not key:
+        raise RuntimeError("OPENAI_API_KEY is not set")
+    body = json.dumps({"model": model, "input": texts}).encode()
+    req = urllib.request.Request("https://api.openai.com/v1/embeddings", data=body, method="POST",
+                                 headers={"Authorization": f"Bearer {key}",
+                                          "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=120, context=SSL_CTX) as r:
+            data = json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        try:
+            msg = json.loads(e.read().decode()).get("error", {}).get("message", "")
+        except Exception:  # noqa: BLE001
+            msg = ""
+        raise RuntimeError(f"OpenAI embeddings request failed ({e.code}): {msg or e.reason}") from None
+    out = [None] * len(texts)
+    for item in data["data"]:
+        out[item["index"]] = item["embedding"]
+    return out
+
+
+def embedding_text(conn, job):
+    """What gets embedded for a job: title, location, series, grade, and the
+    adapter's key sections (or the primary document's text)."""
+    d, source, key = primary_document(conn, job["id"])
+    parts = [job.get("title") or "", job.get("location") or "", job.get("series") or "",
+             grade_str(job) if job.get("pay_plan") or job.get("grade_low") else ""]
+    if d:
+        secs = document_sections(source, d["text"], d["kind"])
+        picked = []
+        for name in ("Summary", "Duties", key or "", "Education", "Position Overview/Duties"):
+            if name and name in secs:
+                picked.append(f"{name}\n{secs[name]}")
+        body = "\n\n".join(picked) if picked else (d["text"] or "")
+        parts.append(body)
+    text = "\n".join(p for p in parts if p).strip()
+    return text[:24000]  # ~6k tokens, under the model's 8k limit
+
+
+def _vec(v):
+    return "[" + ",".join(f"{x:.7f}" for x in v) + "]"
+
+
+def embed_jobs(conn, ids=None, force=False, log=print, batch=32):
+    """Embed jobs lacking an embedding or whose embedded text changed."""
+    if ids:
+        jobs = conn.execute("SELECT * FROM jobs WHERE id = ANY(%s) ORDER BY id", (list(ids),)).fetchall()
+    else:
+        jobs = conn.execute("SELECT * FROM jobs ORDER BY id").fetchall()
+    existing = {r["job_id"]: r["text_hash"] for r in conn.execute("SELECT job_id, text_hash FROM embeddings")}
+    todo = []
+    for j in jobs:
+        text = embedding_text(conn, j)
+        if not text:
+            continue
+        h = hashlib.sha1(text.encode()).hexdigest()
+        if force or existing.get(j["id"]) != h:
+            todo.append((j["id"], h, text))
+    log(f"embedding {len(todo)} of {len(jobs)} jobs ({EMBED_MODEL})")
+    done = 0
+    for i in range(0, len(todo), batch):
+        chunk = todo[i:i + batch]
+        vecs = embed_texts([t for _, _, t in chunk])
+        for (jid, h, text), v in zip(chunk, vecs):
+            conn.execute("""INSERT INTO embeddings (job_id, model, text_hash, content, embedding, created_at)
+                VALUES (%s,%s,%s,%s,%s::vector,%s)
+                ON CONFLICT (job_id) DO UPDATE SET model=EXCLUDED.model, text_hash=EXCLUDED.text_hash,
+                    content=EXCLUDED.content, embedding=EXCLUDED.embedding, created_at=EXCLUDED.created_at""",
+                         (jid, EMBED_MODEL, h, text, _vec(v), now()))
+        conn.commit()
+        done += len(chunk)
+        log(f"  embedded {done}/{len(todo)}")
+    return {"embedded": done, "skipped": len(jobs) - len(todo)}
+
+
+def semantic_search(conn, query, limit=50):
+    """Rank jobs by cosine similarity of their embedding to the query."""
+    qv = _vec(embed_texts([query])[0])
+    rows = conn.execute("""
+        SELECT j.id, j.title, j.location, j.close_date, 1 - (e.embedding <=> %s::vector) AS score
+        FROM embeddings e JOIN jobs j ON j.id = e.job_id
+        ORDER BY e.embedding <=> %s::vector LIMIT %s""", (qv, qv, limit)).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ----------------------------------------------------------------- records
+def record_verdict(conn, job_id, verdict, grades=None, reason=None, profile_hash=None, author="claude"):
     if verdict not in ("yes", "no", "maybe"):
         raise ValueError("verdict must be yes, no or maybe")
     if author not in ("claude", "user"):
         raise ValueError("author must be claude or user")
-    if not conn.execute("SELECT 1 FROM jobs WHERE id=?", (job_id,)).fetchone():
+    if not conn.execute("SELECT 1 FROM jobs WHERE id=%s", (job_id,)).fetchone():
         raise KeyError(job_id)
-    cur = conn.execute("""INSERT INTO verdicts (job_id, verdict, eligible_grades, reason,
-        assessed_at, profile_hash, author) VALUES (?,?,?,?,?,?,?)""",
-                       (job_id, verdict, grades, reason, now(), profile_hash, author))
+    vid = conn.execute("""INSERT INTO verdicts (job_id, verdict, eligible_grades, reason,
+        assessed_at, profile_hash, author) VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                       (job_id, verdict, grades, reason, now(), profile_hash, author)).fetchone()["id"]
     conn.commit()
-    return cur.lastrowid
+    return vid
 
 
 def record_action(conn, job_id, action, date=None, resume_dir=None, note=None):
     if action not in ("applied", "drafted"):
         raise ValueError("action must be applied or drafted")
-    if not conn.execute("SELECT 1 FROM jobs WHERE id=?", (job_id,)).fetchone():
+    if not conn.execute("SELECT 1 FROM jobs WHERE id=%s", (job_id,)).fetchone():
         raise KeyError(job_id)
-    cur = conn.execute("""INSERT INTO actions (job_id, action, action_date, resume_dir, note)
-        VALUES (?,?,?,?,?)""", (job_id, action, date or today(), resume_dir, note))
+    aid = conn.execute("""INSERT INTO actions (job_id, action, action_date, resume_dir, note)
+        VALUES (%s,%s,%s,%s,%s) RETURNING id""", (job_id, action, date or today(), resume_dir, note)).fetchone()["id"]
     conn.commit()
-    return cur.lastrowid
+    return aid
 
 
 def add_job(conn, title, source="manual", source_id=None, location=None, announcement=None,
             url=None, series=None, pay_plan=None, grade_low=None, grade_high=None,
             salary=None, open_date=None, close_date=None, first_seen=None, text=None,
             kind="posting", fetch_url=False):
-    conn.execute("INSERT OR IGNORE INTO sources VALUES (?,?,?)", (source, source, None))
+    conn.execute("INSERT INTO sources VALUES (%s,%s,%s) ON CONFLICT (name) DO NOTHING", (source, source, None))
     sid = source_id or hashlib.sha1((title + (url or "")).encode()).hexdigest()[:16]
-    cur = conn.execute("""INSERT INTO jobs (source, source_id, title, location,
+    job_id = conn.execute("""INSERT INTO jobs (source, source_id, title, location,
         announcement_no, external_url, board_url, series, pay_plan, grade_low, grade_high,
         salary, open_date, close_date, first_seen, last_seen)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                       (source, sid, title, location, announcement, url, None, series,
-                        pay_plan, grade_low, grade_high, salary, open_date, close_date,
-                        first_seen or now(), now()))
-    job_id = cur.lastrowid
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                          (source, sid, title, location, announcement, url, None, series,
+                           pay_plan, grade_low, grade_high, salary, open_date, close_date,
+                           first_seen or now(), now())).fetchone()["id"]
     if text:
         _store_documents(conn, job_id, [{"kind": kind, "url": url, "raw_html": None, "text": text}])
     elif fetch_url and url:
@@ -492,29 +587,29 @@ SELECT j.*, v.verdict, v.eligible_grades, v.reason AS verdict_reason, v.assessed
        c.verdict AS claude_verdict, c.eligible_grades AS claude_grades, c.reason AS claude_reason,
        c.assessed_at AS claude_assessed_at,
        a.action, a.action_date, a.resume_dir, a.note AS action_note,
-       (SELECT MAX(fetched_at) FROM documents WHERE job_id = j.id) AS last_fetched
+       (SELECT MAX(fetched_at) FROM documents WHERE job_id = j.id) AS last_fetched,
+       (e.job_id IS NOT NULL) AS embedded
 FROM jobs j
 LEFT JOIN verdicts v ON v.id = (SELECT MAX(id) FROM verdicts WHERE job_id = j.id)
 LEFT JOIN verdicts c ON c.id = (SELECT MAX(id) FROM verdicts WHERE job_id = j.id AND author = 'claude')
 LEFT JOIN actions  a ON a.id = (SELECT MAX(id) FROM actions  WHERE job_id = j.id)
+LEFT JOIN embeddings e ON e.job_id = j.id
 """
 
 
 def list_jobs(conn, verdict=None, action=None, open_only=False, source=None, days=None,
               pending_only=False, q=None):
-    """Joined job rows with latest verdict/action. Filters are ANDed.
-    verdict/action accept comma lists; 'none' matches rows without one."""
-    where, params = ["1=1"], []
+    where, params = ["TRUE"], []
     if source:
-        where.append("j.source=?"); params.append(source)
+        where.append("j.source=%s"); params.append(source)
     if open_only:
-        where.append("(j.close_date IS NULL OR j.close_date >= ?)"); params.append(today())
+        where.append("(j.close_date IS NULL OR j.close_date >= %s)"); params.append(today())
     if days:
         cutoff = (dt.date.today() - dt.timedelta(days=days)).isoformat()
-        where.append("(j.open_date >= ? OR j.first_seen >= ? OR j.posted_age_days <= ?)")
+        where.append("(j.open_date >= %s OR j.first_seen >= %s OR j.posted_age_days <= %s)")
         params += [cutoff, cutoff, days]
     sql = JOBS_VIEW_SQL + " WHERE " + " AND ".join(where) + \
-          " ORDER BY j.close_date IS NULL, j.close_date, j.id"
+          " ORDER BY (j.close_date IS NULL), j.close_date, j.id"
     rows = [dict(r) for r in conn.execute(sql, params)]
     if verdict:
         want = set(verdict.split(","))
@@ -533,21 +628,19 @@ def list_jobs(conn, verdict=None, action=None, open_only=False, source=None, day
 
 
 def job_detail(conn, job_id, with_text=True):
-    j = conn.execute(JOBS_VIEW_SQL + " WHERE j.id=?", (job_id,)).fetchone()
+    j = conn.execute(JOBS_VIEW_SQL + " WHERE j.id=%s", (job_id,)).fetchone()
     if not j:
         raise KeyError(job_id)
     cols = "id, kind, url, fetched_at, text" if with_text else "id, kind, url, fetched_at, LENGTH(text) AS chars"
-    docs = [dict(r) for r in conn.execute(
-        f"SELECT {cols} FROM documents WHERE job_id=? ORDER BY id", (job_id,))]
-    verdicts = [dict(r) for r in conn.execute("SELECT * FROM verdicts WHERE job_id=? ORDER BY id", (job_id,))]
-    actions = [dict(r) for r in conn.execute("SELECT * FROM actions WHERE job_id=? ORDER BY id", (job_id,))]
+    docs = [dict(r) for r in conn.execute(f"SELECT {cols} FROM documents WHERE job_id=%s ORDER BY id", (job_id,))]
+    verdicts = [dict(r) for r in conn.execute("SELECT * FROM verdicts WHERE job_id=%s ORDER BY id", (job_id,))]
+    actions = [dict(r) for r in conn.execute("SELECT * FROM actions WHERE job_id=%s ORDER BY id", (job_id,))]
     pd, source, key = primary_document(conn, job_id)
     primary = None
     if pd:
         primary = {"doc_id": pd["id"], "kind": pd["kind"], "key_section": key,
                    "sections": document_sections(source, pd["text"], pd["kind"])}
-    return {"job": dict(j), "documents": docs, "verdicts": verdicts, "actions": actions,
-            "primary": primary}
+    return {"job": dict(j), "documents": docs, "verdicts": verdicts, "actions": actions, "primary": primary}
 
 
 def profile_hash(path=None):
@@ -555,76 +648,8 @@ def profile_hash(path=None):
     return hashlib.sha1(open(path, "rb").read()).hexdigest()[:12]
 
 
-# ----------------------------------------------------------------- commands
-def cmd_scan(a):
-    scan_source(db(), a.source, days=a.days, all_=a.all, limit=a.limit, refetch=a.refetch,
-                max_pages=a.max_pages)
-
-
-def _job_filter_sql(a, alias="j"):
-    clauses, params = [], []
-    if getattr(a, "source", None):
-        clauses.append(f"{alias}.source=?"); params.append(a.source)
-    if getattr(a, "days", None):
-        cutoff = (dt.date.today() - dt.timedelta(days=a.days)).isoformat()
-        clauses.append(f"({alias}.open_date >= ? OR {alias}.first_seen >= ? OR "
-                       f"{alias}.posted_age_days <= ?)")
-        params += [cutoff, cutoff, a.days]
-    if getattr(a, "open_only", False):
-        clauses.append(f"({alias}.close_date IS NULL OR {alias}.close_date >= ?)")
-        params.append(today())
-    return (" AND ".join(clauses) or "1=1"), params
-
-
-def cmd_pending(a):
-    conn = db()
-    where, params = _job_filter_sql(a)
-    jobs = conn.execute(f"SELECT * FROM jobs j WHERE {where} ORDER BY close_date, id",
-                        params).fetchall()
-    v, acts = latest_verdicts(conn), latest_actions(conn)
-    rows = [j for j in jobs if j["id"] not in v and j["id"] not in acts]
-    print(f"{len(rows)} pending (no verdict, no action)")
-    print("id | grade | series | title | location | closes | announcement")
-    for j in rows:
-        print(f"{j['id']} | {grade_str(j)} | {j['series'] or '?'} | {j['title']} | "
-              f"{j['location'] or ''} | {j['close_date'] or '?'} | {j['announcement_no'] or ''}")
-
-
-def cmd_show(a):
-    conn = db()
-    j = conn.execute("SELECT * FROM jobs WHERE id=?", (a.id,)).fetchone()
-    if not j:
-        sys.exit("no such job")
-    print(f"# [{j['id']}] {j['title']}")
-    for k in ("source", "source_id", "location", "announcement_no", "series", "pay_plan",
-              "grade_low", "grade_high", "salary", "open_date", "close_date",
-              "external_url", "board_url", "first_seen", "last_seen"):
-        print(f"{k}: {j[k]}")
-    v = latest_verdicts(conn).get(j["id"])
-    if v:
-        print(f"verdict: {v['verdict']} ({v['eligible_grades'] or ''}) — {v['reason']}")
-    act = latest_actions(conn).get(j["id"])
-    if act:
-        print(f"action: {act['action']} {act['action_date']} {act['resume_dir'] or ''}")
-    docs = conn.execute("SELECT * FROM documents WHERE job_id=? ORDER BY id", (j["id"],))
-    for d in docs:
-        if a.kind and d["kind"] != a.kind:
-            continue
-        print(f"\n===== document {d['id']}: {d['kind']} ({d['fetched_at']}) {d['url']}")
-        text = d["text"] or ""
-        if a.section:
-            src = j["source"]
-            secs = document_sections(src, text, d["kind"])
-            text = secs.get(a.section) or next((v for k, v in secs.items()
-                                                if k.lower().startswith(a.section.lower())),
-                                               f"(section '{a.section}' not found; have: {', '.join(secs) or 'none'})")
-        print(text if not a.max_chars else text[:a.max_chars])
-
-
+# ----------------------------------------------------------------- sections
 def generic_sections(text):
-    """Fallback splitter for boards without an adapter (manual entries): a
-    heading is a short line without sentence punctuation, Title Case or ALL
-    CAPS, followed by body text."""
     lines = (text or "").split("\n")
     heads = []
     for i, ln in enumerate(lines):
@@ -643,7 +668,6 @@ def generic_sections(text):
 
 
 def source_meta(source_name):
-    """(adapter module or None, primary_kind, key_section) for a source."""
     try:
         mod = load_source(source_name) if source_name in list_sources() else None
     except SystemExit:
@@ -652,8 +676,6 @@ def source_meta(source_name):
 
 
 def document_sections(source_name, text, kind):
-    """Ordered {heading: text} for one stored document, via the board's adapter
-    when it defines sections(), else the generic splitter."""
     mod, _, _ = source_meta(source_name)
     if mod and hasattr(mod, "sections"):
         try:
@@ -664,26 +686,22 @@ def document_sections(source_name, text, kind):
 
 
 def primary_document(conn, job_id):
-    """Latest document of the job's primary kind (adapter-declared), else the
-    latest document of any kind. Returns (row, source_name, key_section)."""
-    j = conn.execute("SELECT source FROM jobs WHERE id=?", (job_id,)).fetchone()
+    j = conn.execute("SELECT source FROM jobs WHERE id=%s", (job_id,)).fetchone()
     if not j:
         raise KeyError(job_id)
     mod, pk, key = source_meta(j["source"])
-    d = conn.execute("SELECT * FROM documents WHERE job_id=? AND kind=? ORDER BY id DESC LIMIT 1",
+    d = conn.execute("SELECT * FROM documents WHERE job_id=%s AND kind=%s ORDER BY id DESC LIMIT 1",
                      (job_id, pk)).fetchone()
     if not d:
-        d = conn.execute("SELECT * FROM documents WHERE job_id=? AND kind!='board_card' ORDER BY id DESC LIMIT 1",
+        d = conn.execute("SELECT * FROM documents WHERE job_id=%s AND kind!='board_card' ORDER BY id DESC LIMIT 1",
                          (job_id,)).fetchone()
     return d, j["source"], key
 
 
 def get_section(conn, job_id, name=None, kind=None):
-    """Text of one named section (default: the board's key section) from the
-    job's primary document, or the newest document of `kind`."""
     d, source, key = primary_document(conn, job_id)
     if kind:
-        d = conn.execute("SELECT * FROM documents WHERE job_id=? AND kind=? ORDER BY id DESC LIMIT 1",
+        d = conn.execute("SELECT * FROM documents WHERE job_id=%s AND kind=%s ORDER BY id DESC LIMIT 1",
                          (job_id, kind)).fetchone()
     if not d:
         return None, None
@@ -691,27 +709,71 @@ def get_section(conn, job_id, name=None, kind=None):
     name = name or key
     if name in secs:
         return d, secs[name]
-    # case-insensitive / prefix match as a courtesy
     for k, v in secs.items():
         if name and k.lower().startswith(name.lower()):
             return d, v
     return d, None
 
 
-def cmd_raw(a):
+# ----------------------------------------------------------------- commands
+def cmd_scan(a):
+    scan_source(db(), a.source, days=a.days, all_=a.all, limit=a.limit, refetch=a.refetch,
+                max_pages=a.max_pages, embed=not a.no_embed)
+
+
+def _filter_args(a):
+    return dict(source=getattr(a, "source", None), days=getattr(a, "days", None),
+                open_only=getattr(a, "open_only", False))
+
+
+def cmd_pending(a):
+    rows = [r for r in list_jobs(db(), **_filter_args(a)) if not r["verdict"] and not r["action"]]
+    print(f"{len(rows)} pending (no verdict, no action)")
+    print("id | grade | series | title | location | closes | announcement")
+    for j in rows:
+        print(f"{j['id']} | {grade_str(j)} | {j['series'] or '?'} | {j['title']} | "
+              f"{j['location'] or ''} | {j['close_date'] or '?'} | {j['announcement_no'] or ''}")
+
+
+def cmd_show(a):
     conn = db()
-    d = conn.execute("SELECT raw_html FROM documents WHERE id=?", (a.doc_id,)).fetchone()
+    j = conn.execute("SELECT * FROM jobs WHERE id=%s", (a.id,)).fetchone()
+    if not j:
+        sys.exit("no such job")
+    print(f"# [{j['id']}] {j['title']}")
+    for k in ("source", "source_id", "location", "announcement_no", "series", "pay_plan",
+              "grade_low", "grade_high", "salary", "open_date", "close_date",
+              "external_url", "board_url", "first_seen", "last_seen"):
+        print(f"{k}: {j[k]}")
+    v = latest_verdicts(conn).get(j["id"])
+    if v:
+        print(f"verdict: {v['verdict']} ({v['eligible_grades'] or ''}) [{v['author']}] — {v['reason']}")
+    act = latest_actions(conn).get(j["id"])
+    if act:
+        print(f"action: {act['action']} {act['action_date']} {act['resume_dir'] or ''}")
+    for d in conn.execute("SELECT * FROM documents WHERE job_id=%s ORDER BY id", (j["id"],)):
+        if a.kind and d["kind"] != a.kind:
+            continue
+        print(f"\n===== document {d['id']}: {d['kind']} ({d['fetched_at']}) {d['url']}")
+        text = d["text"] or ""
+        if a.section:
+            secs = document_sections(j["source"], text, d["kind"])
+            text = secs.get(a.section) or next((v for k, v in secs.items() if k.lower().startswith(a.section.lower())),
+                                               f"(section '{a.section}' not found; have: {', '.join(secs) or 'none'})")
+        print(text if not a.max_chars else text[:a.max_chars])
+
+
+def cmd_raw(a):
+    d = db().execute("SELECT raw_html FROM documents WHERE id=%s", (a.doc_id,)).fetchone()
     if not d:
         sys.exit("no such document")
     sys.stdout.write(unpack_html(d["raw_html"]) or "")
 
 
 def cmd_autoreject(a):
-    """Apply session-derived hard exclusions to pending jobs as 'no' verdicts."""
     conn = db()
     v = latest_verdicts(conn)
-    where, params = _job_filter_sql(a)
-    jobs = conn.execute(f"SELECT * FROM jobs j WHERE {where}", params).fetchall()
+    jobs = list_jobs(conn, **_filter_args(a))
     n = 0
     for j in jobs:
         if j["id"] in v:
@@ -730,11 +792,8 @@ def cmd_autoreject(a):
             if a.dry_run:
                 print(f"would reject [{j['id']}] {j['title']} — {reason}")
             else:
-                conn.execute("""INSERT INTO verdicts (job_id, verdict, eligible_grades,
-                    reason, assessed_at, profile_hash) VALUES (?,?,?,?,?,?)""",
-                             (j["id"], "no", None, reason, now(), a.profile_hash))
+                record_verdict(conn, j["id"], "no", None, reason, a.profile_hash)
             n += 1
-    conn.commit()
     print(f"{'would reject' if a.dry_run else 'rejected'} {n}")
 
 
@@ -744,23 +803,15 @@ def cmd_verdict(a):
 
 
 def cmd_report(a):
-    conn = db()
-    where, params = _job_filter_sql(a)
-    jobs = conn.execute(f"SELECT * FROM jobs j WHERE {where} ORDER BY close_date, id",
-                        params).fetchall()
-    v, acts = latest_verdicts(conn), latest_actions(conn)
-    want = set(a.verdicts.split(","))
-    rows = [j for j in jobs if j["id"] in v and v[j["id"]]["verdict"] in want]
+    rows = list_jobs(db(), verdict=a.verdicts, **_filter_args(a))
     if not a.include_actioned:
-        rows = [j for j in rows if j["id"] not in acts]
-    print(f"| id | verdict | grades | title | location | closes | reason | link |")
+        rows = [r for r in rows if not r["action"]]
+    print("| id | verdict | grades | title | location | closes | reason | link |")
     print("|---|---|---|---|---|---|---|---|")
     for j in rows:
-        vv = v[j["id"]]
         link = j["external_url"] or j["board_url"] or ""
-        print(f"| {j['id']} | {vv['verdict']} | {vv['eligible_grades'] or grade_str(j)} | "
-              f"{j['title']} | {j['location'] or ''} | {j['close_date'] or '?'} | "
-              f"{(vv['reason'] or '').replace('|', '/')} | {link} |")
+        print(f"| {j['id']} | {j['verdict']} | {j['eligible_grades'] or grade_str(j)} | {j['title']} | "
+              f"{j['location'] or ''} | {j['close_date'] or '?'} | {(j['verdict_reason'] or '').replace('|', '/')} | {link} |")
     print(f"\n{len(rows)} jobs")
 
 
@@ -784,142 +835,123 @@ def cmd_refresh(a):
 
 
 def cmd_search(a):
-    for h in search_documents(db(), a.query, a.kind, a.limit):
+    conn = db()
+    if a.semantic:
+        for h in semantic_search(conn, a.query, a.limit):
+            print(f"{h['score']:.3f}  [{h['id']}] {h['title']}  {h['location'] or ''}  closes {h['close_date'] or '?'}")
+        return
+    for h in search_documents(conn, a.query, a.kind, a.limit):
         print(f"[{h['job_id']}] {h['title']}  ({h['kind']}) {h['url'] or ''}")
         for sn in h["snippets"]:
             print(f"    … {sn} …")
 
 
+def cmd_embed(a):
+    print(embed_jobs(db(), ids=a.ids or None, force=a.force))
+
+
 def cmd_apps(a):
-    conn = db()
-    rows = conn.execute("""
-        SELECT a.*, j.title, j.location, j.announcement_no, j.external_url, j.open_date,
-               j.close_date, j.source
-        FROM actions a JOIN jobs j ON j.id=a.job_id
-        ORDER BY a.action_date, a.id""").fetchall()
+    rows = db().execute("""
+        SELECT a.*, j.title, j.location, j.announcement_no, j.external_url, j.open_date, j.close_date, j.source
+        FROM actions a JOIN jobs j ON j.id=a.job_id ORDER BY a.action_date, a.id""").fetchall()
     print("| job | action | date | title | location | opens / closes | resume dir | link | note |")
     print("|---|---|---|---|---|---|---|---|---|")
     for r in rows:
         oc = f"{r['open_date'] or '?'} / {r['close_date'] or '?'}"
-        print(f"| {r['job_id']} | {r['action']} | {r['action_date']} | {r['title']} | "
-              f"{r['location'] or ''} | {oc} | {r['resume_dir'] or ''} | "
-              f"{r['external_url'] or ''} | {(r['note'] or '').replace('|','/')} |")
+        print(f"| {r['job_id']} | {r['action']} | {r['action_date']} | {r['title']} | {r['location'] or ''} | {oc} | "
+              f"{r['resume_dir'] or ''} | {r['external_url'] or ''} | {(r['note'] or '').replace('|','/')} |")
 
 
 def cmd_stats(a):
     conn = db()
     v = latest_verdicts(conn)
-    tot = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+    tot = conn.execute("SELECT COUNT(*) AS n FROM jobs").fetchone()["n"]
     by = {}
     for r in v.values():
         by[r["verdict"]] = by.get(r["verdict"], 0) + 1
-    docs = conn.execute("SELECT COUNT(*), SUM(LENGTH(raw_html)) FROM documents").fetchone()
-    print(f"jobs: {tot}; pending: {tot - len(v)}; verdicts: {by}")
-    print(f"documents: {docs[0]}, raw html bytes: {docs[1] or 0}")
-    print(f"db: {DB_PATH}")
+    docs = conn.execute("SELECT COUNT(*) AS n, COALESCE(SUM(LENGTH(raw_html)),0) AS b FROM documents").fetchone()
+    emb = conn.execute("SELECT COUNT(*) AS n FROM embeddings").fetchone()["n"]
+    print(f"jobs: {tot}; pending: {tot - len(v)}; verdicts: {by}; embedded: {emb}")
+    print(f"documents: {docs['n']}, raw html bytes: {docs['b']}")
+    print(f"dsn: {DSN}")
 
 
 def cmd_profile_hash(a):
-    """Hash of EXPERIENCE.md so verdicts record which profile they were judged against."""
     print(profile_hash(a.path))
 
 
 # ----------------------------------------------------------------- main
 def main(argv=None):
-    p = argparse.ArgumentParser(description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sp = p.add_subparsers(dest="cmd", required=True)
 
     s = sp.add_parser("scan", help="fetch new postings from a source into the database")
     s.add_argument("--source", required=True, help=f"one of: {', '.join(list_sources())}")
-    s.add_argument("--days", type=int, default=7, help="only cards posted within N days")
+    s.add_argument("--days", type=int, default=7)
     s.add_argument("--all", action="store_true", help="ignore --days; walk the whole board")
     s.add_argument("--max-pages", type=int, default=100)
-    s.add_argument("--limit", type=int, help="stop after N new jobs (testing)")
+    s.add_argument("--limit", type=int)
     s.add_argument("--refetch", action="store_true", help="re-fetch jobs already stored")
+    s.add_argument("--no-embed", action="store_true", help="skip embedding new jobs")
     s.set_defaults(fn=cmd_scan)
 
-    s = sp.add_parser("pending", help="list jobs with no verdict yet")
-    s.add_argument("--source"); s.add_argument("--days", type=int)
-    s.add_argument("--open-only", action="store_true")
+    s = sp.add_parser("pending", help="list jobs with no verdict and no action")
+    s.add_argument("--source"); s.add_argument("--days", type=int); s.add_argument("--open-only", action="store_true")
     s.set_defaults(fn=cmd_pending)
 
     s = sp.add_parser("show", help="print a job's fields and stored verbatim text")
-    s.add_argument("id", type=int)
-    s.add_argument("--kind", help="only documents of this kind")
-    s.add_argument("--section", help="only this section of each document (names come from the board adapter, e.g. Qualifications)")
-    s.add_argument("--max-chars", type=int)
+    s.add_argument("id", type=int); s.add_argument("--kind"); s.add_argument("--section"); s.add_argument("--max-chars", type=int)
     s.set_defaults(fn=cmd_show)
 
     s = sp.add_parser("raw", help="print a document's verbatim raw HTML")
-    s.add_argument("doc_id", type=int)
-    s.set_defaults(fn=cmd_raw)
+    s.add_argument("doc_id", type=int); s.set_defaults(fn=cmd_raw)
 
     s = sp.add_parser("autoreject", help="record 'no' for pending jobs matching hard rules")
-    s.add_argument("--min-grade", type=int, help="reject if lowest grade >= N")
-    s.add_argument("--series-regex", help="reject if series matches, e.g. '^08'")
-    s.add_argument("--title-regex")
-    s.add_argument("--reason", default="hard exclusion from EXPERIENCE.md summary")
-    s.add_argument("--profile-hash")
-    s.add_argument("--source"); s.add_argument("--days", type=int)
-    s.add_argument("--dry-run", action="store_true")
+    s.add_argument("--min-grade", type=int); s.add_argument("--series-regex"); s.add_argument("--title-regex")
+    s.add_argument("--reason", default="hard exclusion from EXPERIENCE.md summary"); s.add_argument("--profile-hash")
+    s.add_argument("--source"); s.add_argument("--days", type=int); s.add_argument("--dry-run", action="store_true")
     s.set_defaults(fn=cmd_autoreject)
 
     s = sp.add_parser("verdict", help="record a qualification verdict")
-    s.add_argument("id", type=int)
-    s.add_argument("verdict", choices=["yes", "no", "maybe"])
-    s.add_argument("--grades", help="grades the user is eligible for, e.g. GS-5/7")
-    s.add_argument("--reason", required=True)
-    s.add_argument("--profile-hash")
+    s.add_argument("id", type=int); s.add_argument("verdict", choices=["yes", "no", "maybe"])
+    s.add_argument("--grades"); s.add_argument("--reason", required=True); s.add_argument("--profile-hash")
     s.add_argument("--author", default="claude", choices=["claude", "user"])
     s.set_defaults(fn=cmd_verdict)
 
     s = sp.add_parser("report", help="markdown table of judged jobs")
-    s.add_argument("--verdicts", default="yes,maybe")
-    s.add_argument("--source"); s.add_argument("--days", type=int)
-    s.add_argument("--open-only", action="store_true")
-    s.add_argument("--include-actioned", action="store_true",
-                   help="also list jobs already applied/skipped")
+    s.add_argument("--verdicts", default="yes,maybe"); s.add_argument("--source"); s.add_argument("--days", type=int)
+    s.add_argument("--open-only", action="store_true"); s.add_argument("--include-actioned", action="store_true")
     s.set_defaults(fn=cmd_report)
 
     s = sp.add_parser("mark", help="record an application action")
-    s.add_argument("id", type=int)
-    s.add_argument("action", choices=["applied", "drafted"])
+    s.add_argument("id", type=int); s.add_argument("action", choices=["applied", "drafted"])
     s.add_argument("--date"); s.add_argument("--resume-dir"); s.add_argument("--note")
     s.set_defaults(fn=cmd_mark)
 
     s = sp.add_parser("add", help="manually add a job not found by an adapter")
-    s.add_argument("--source", default="manual"); s.add_argument("--source-id")
-    s.add_argument("--title", required=True); s.add_argument("--location")
-    s.add_argument("--announcement"); s.add_argument("--url")
-    s.add_argument("--series"); s.add_argument("--pay-plan")
-    s.add_argument("--grade-low", type=int); s.add_argument("--grade-high", type=int)
-    s.add_argument("--salary"); s.add_argument("--open"); s.add_argument("--close")
-    s.add_argument("--first-seen")
-    s.add_argument("--text", help="verbatim posting text"); s.add_argument("--text-file")
-    s.add_argument("--kind", default="posting")
-    s.add_argument("--fetch", action="store_true", help="fetch --url and store it verbatim")
+    s.add_argument("--source", default="manual"); s.add_argument("--source-id"); s.add_argument("--title", required=True)
+    s.add_argument("--location"); s.add_argument("--announcement"); s.add_argument("--url"); s.add_argument("--series")
+    s.add_argument("--pay-plan"); s.add_argument("--grade-low", type=int); s.add_argument("--grade-high", type=int)
+    s.add_argument("--salary"); s.add_argument("--open"); s.add_argument("--close"); s.add_argument("--first-seen")
+    s.add_argument("--text"); s.add_argument("--text-file"); s.add_argument("--kind", default="posting")
+    s.add_argument("--fetch", action="store_true")
     s.set_defaults(fn=cmd_add)
 
     s = sp.add_parser("refresh", help="re-fetch stored jobs so dates/text are current")
-    s.add_argument("ids", type=int, nargs="+")
-    s.set_defaults(fn=cmd_refresh)
+    s.add_argument("ids", type=int, nargs="+"); s.set_defaults(fn=cmd_refresh)
 
-    s = sp.add_parser("search", help="full-text search over stored posting text")
-    s.add_argument("query", help='terms (AND); quote phrases')
-    s.add_argument("--kind", action="append", help="document kind filter (repeatable)")
-    s.add_argument("--limit", type=int, default=30)
+    s = sp.add_parser("search", help="keyword (default) or --semantic search over stored postings")
+    s.add_argument("query"); s.add_argument("--kind", action="append"); s.add_argument("--limit", type=int, default=30)
+    s.add_argument("--semantic", action="store_true", help="rank by embedding similarity (needs OPENAI_API_KEY)")
     s.set_defaults(fn=cmd_search)
 
-    s = sp.add_parser("apps", help="application history (all recorded actions)")
-    s.set_defaults(fn=cmd_apps)
+    s = sp.add_parser("embed", help="compute/update embeddings (needs OPENAI_API_KEY)")
+    s.add_argument("ids", type=int, nargs="*"); s.add_argument("--force", action="store_true")
+    s.set_defaults(fn=cmd_embed)
 
-    s = sp.add_parser("stats", help="counts")
-    s.set_defaults(fn=cmd_stats)
-
-    s = sp.add_parser("profile-hash", help="hash of EXPERIENCE.md for verdict records")
-    s.add_argument("--path")
-    s.set_defaults(fn=cmd_profile_hash)
+    s = sp.add_parser("apps", help="application history"); s.set_defaults(fn=cmd_apps)
+    s = sp.add_parser("stats", help="counts"); s.set_defaults(fn=cmd_stats)
+    s = sp.add_parser("profile-hash", help="hash of EXPERIENCE.md"); s.add_argument("--path"); s.set_defaults(fn=cmd_profile_hash)
 
     a = p.parse_args(argv)
     a.fn(a)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""jobboard: shared job-research service over jobscan/jobs.sqlite.
+"""jobboard: shared job-research service over the jobscan Postgres database.
 
 Human API  : GET /            single-page app (static/index.html)
 Agent API  : JSON over HTTP, documented at GET /api  (also in .claude/skills/job-search)
@@ -13,7 +13,9 @@ Agent API  : JSON over HTTP, documented at GET /api  (also in .claude/skills/job
   GET  /api/jobs/<id>?text=0      job + documents + verdict/action history
   GET  /api/jobs/<id>/sections    primary document split into named sections (board adapter decides)
   GET  /api/jobs/<id>/section?name=<heading>[&kind=<kind>]   one section (default: the board's key section)
-  GET  /api/search?q=<terms>&kind=<kind>&limit=50     full-text search, snippets
+  GET  /api/search?q=<terms>&kind=<kind>&limit=50     keyword search (AND terms, quotes for phrases), snippets
+  GET  /api/search?q=<text>&mode=semantic&limit=50    embedding similarity ranking (needs OPENAI_API_KEY)
+  POST /api/embed                 {ids?:[..], force?:false} -> {run_id}; embeds jobs lacking/changed embeddings
   POST /api/jobs                  {title, url?, location?, open_date?, close_date?, text?, fetch?:true, ...}
   POST /api/jobs/<id>/verdict     {verdict: yes|no|maybe, grades?, reason, profile_hash?, author?: claude|user}
                                   (author=user marks a human override; Claude's latest verdict is kept as claude_verdict)
@@ -40,7 +42,6 @@ from urllib.parse import urlparse, parse_qs
 HERE = os.path.dirname(os.path.abspath(__file__))
 JOBSCAN_DIR = os.path.abspath(os.environ.get("JOBSCAN_DIR", os.path.join(HERE, "..", "jobscan")))
 sys.path.insert(0, JOBSCAN_DIR)
-os.environ.setdefault("JOBSCAN_DB", os.path.join(JOBSCAN_DIR, "jobs.sqlite"))
 import jobscan as J  # noqa: E402
 
 STATIC = os.path.join(HERE, "static")
@@ -64,9 +65,9 @@ def _start_run(kind, args, target, persist=True):
     global _transient_seq
     if persist:
         conn = J.db()
-        cur = conn.execute("INSERT INTO runs (kind, args, status, started_at, log) VALUES (?,?,?,?,?)",
+        cur = conn.execute("INSERT INTO runs (kind, args, status, started_at, log) VALUES (%s,%s,%s,%s,%s) RETURNING id",
                            (kind, json.dumps(args), "running", J.now(), ""))
-        run_id = cur.lastrowid
+        run_id = cur.fetchone()["id"]
         conn.commit()
         conn.close()
     else:
@@ -83,14 +84,14 @@ def _start_run(kind, args, target, persist=True):
         def log(msg):
             lines.append(str(msg))
             if persist:
-                rconn.execute("UPDATE runs SET log=? WHERE id=?", ("\n".join(lines), run_id))
+                rconn.execute("UPDATE runs SET log=%s WHERE id=%s", ("\n".join(lines), run_id))
                 rconn.commit()
             else:
                 _transient[run_id]["log"] = "\n".join(lines)
 
         def finish(status, summary=None):
             if persist:
-                rconn.execute("UPDATE runs SET status=?, finished_at=?, summary=? WHERE id=?",
+                rconn.execute("UPDATE runs SET status=%s, finished_at=%s, summary=%s WHERE id=%s",
                               (status, J.now(), json.dumps(summary) if summary is not None else None, run_id))
                 rconn.commit()
             else:
@@ -126,7 +127,7 @@ def _get_run(rid):
     except ValueError:
         return None
     conn = J.db()
-    r = conn.execute("SELECT * FROM runs WHERE id=?", (rid,)).fetchone()
+    r = conn.execute("SELECT * FROM runs WHERE id=%s", (rid,)).fetchone()
     conn.close()
     return dict(r) if r else None
 
@@ -240,10 +241,19 @@ class Handler(SimpleHTTPRequestHandler):
                                        "sections": J.document_sections(source, d["text"], d["kind"])})
             if path == "/api/search":
                 conn = J.db()
+                if qs.get("mode") == "semantic":
+                    if not os.environ.get("OPENAI_API_KEY"):
+                        conn.close()
+                        return self._json({"error": "semantic search needs OPENAI_API_KEY in the server environment"}, 503)
+                    try:
+                        hits = J.semantic_search(conn, qs.get("q", ""), int(qs.get("limit", 50)))
+                    finally:
+                        conn.close()
+                    return self._json({"query": qs.get("q", ""), "mode": "semantic", "hits": hits})
                 kinds = [qs["kind"]] if qs.get("kind") else None
                 hits = J.search_documents(conn, qs.get("q", ""), kinds, int(qs.get("limit", 50)))
                 conn.close()
-                return self._json({"query": qs.get("q", ""), "hits": hits})
+                return self._json({"query": qs.get("q", ""), "mode": "keyword", "hits": hits})
             if path == "/api/runs":
                 conn = J.db()
                 rows = [dict(r) for r in conn.execute(
@@ -310,6 +320,16 @@ class Handler(SimpleHTTPRequestHandler):
                     return {"refreshed": len(out), "ids": ids}
                 rid = _start_run("refresh", {"ids": ids}, work, persist=False)
                 return self._json({"run_id": rid, "status": "running", "count": len(ids)}, 202)
+            if path == "/api/embed":
+                active = _active_run()
+                if active:
+                    return self._json({"error": "a run is already active", "run": active}, 409)
+                if not os.environ.get("OPENAI_API_KEY"):
+                    return self._json({"error": "OPENAI_API_KEY is not set in the server environment"}, 503)
+                ids, force = body.get("ids"), bool(body.get("force"))
+                rid = _start_run("embed", {"ids": ids, "force": force},
+                                 lambda conn, log: J.embed_jobs(conn, ids=ids, force=force, log=log), persist=False)
+                return self._json({"run_id": rid, "status": "running"}, 202)
             if path == "/api/jobs":
                 conn = J.db()
                 jid = J.add_job(conn, body["title"], body.get("source", "manual"), body.get("source_id"),
@@ -377,8 +397,9 @@ class Handler(SimpleHTTPRequestHandler):
     def _sources(self):
         conn = J.db()
         last = {r["args_source"]: r for r in conn.execute("""
-            SELECT json_extract(args, '$.source') AS args_source, MAX(started_at) AS started_at,
-                   status, summary FROM runs WHERE kind='scan' GROUP BY args_source""")}
+            SELECT DISTINCT ON (args::json->>'source') args::json->>'source' AS args_source,
+                   started_at, status, summary FROM runs WHERE kind='scan'
+            ORDER BY args::json->>'source', id DESC""")}
         out = []
         for name in J.list_sources():
             mod = J.load_source(name)
@@ -392,17 +413,19 @@ class Handler(SimpleHTTPRequestHandler):
 
     def _stats(self):
         conn = J.db()
-        tot = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+        tot = conn.execute("SELECT COUNT(*) AS n FROM jobs").fetchone()["n"]
         v = J.latest_verdicts(conn)
         by = {}
         for r in v.values():
             by[r["verdict"]] = by.get(r["verdict"], 0) + 1
         acts = J.latest_actions(conn)
-        docs = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
+        docs = conn.execute("SELECT COUNT(*) AS n FROM documents").fetchone()["n"]
+        emb = conn.execute("SELECT COUNT(*) AS n FROM embeddings").fetchone()["n"]
         srcs = [dict(r) for r in conn.execute("SELECT * FROM sources")]
         conn.close()
         return {"jobs": tot, "pending": tot - len(v), "verdicts": by, "actioned": len(acts),
-                "documents": docs, "db": os.environ["JOBSCAN_DB"], "sources": srcs,
+                "documents": docs, "embedded": emb, "embeddings_enabled": bool(os.environ.get("OPENAI_API_KEY")),
+                "dsn": J.DSN.split("@")[-1], "sources": srcs,
                 "adapters": J.list_sources(), "active_run": _active_run(),
                 "profile_hash": J.profile_hash(EXPERIENCE) if os.path.exists(EXPERIENCE) else None}
 
@@ -441,14 +464,12 @@ def _watch_and_reexec(paths, interval=1.0):
 
 
 if __name__ == "__main__":
-    if not os.path.exists(os.environ["JOBSCAN_DB"]):
-        sys.exit(f"database not found: {os.environ['JOBSCAN_DB']}")
     if os.environ.get("JOBBOARD_RELOAD") == "1":
         _watch_and_reexec([HERE, JOBSCAN_DIR])
     # Mark any run left 'running' by a previous process as failed.
     c = J.db()
-    c.execute("UPDATE runs SET status='failed', finished_at=? WHERE status='running'", (J.now(),))
+    c.execute("UPDATE runs SET status='failed', finished_at=%s WHERE status='running'", (J.now(),))
     c.commit()
     c.close()
-    print(f"jobboard: http://0.0.0.0:{PORT}  db={os.environ['JOBSCAN_DB']}  api=/api")
+    print(f"jobboard: http://0.0.0.0:{PORT}  db={J.DSN.split('@')[-1]}  api=/api  embeddings={'on' if os.environ.get('OPENAI_API_KEY') else 'off (no OPENAI_API_KEY)'}")
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()

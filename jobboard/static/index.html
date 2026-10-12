@@ -32,6 +32,9 @@
   button { font: inherit; padding: 4px 10px; border: 1px solid var(--line); border-radius: 6px;
            background: var(--card); color: var(--fg); cursor: pointer; }
   .count { color: var(--muted); margin-left: auto; }
+  .sem { font-size: 12px; color: var(--accent); }
+  .sem button { padding: 0 6px; font-size: 11px; }
+  td.score { color: var(--muted); font-size: 12px; white-space: nowrap; }
   button.on { background: var(--accent); color: #fff; border-color: var(--accent); }
   .runstat { color: var(--muted); font-size: 13px; }
   .runstat.running { color: var(--maybe); }
@@ -172,7 +175,8 @@
         <option value="last_fetched:desc">most recently fetched first</option>
       </select>
     </div>
-    <div class="group"><input type="search" id="q" placeholder="search title, location, series, reason"></div>
+    <div class="group"><input type="search" id="q" placeholder="filter as you type; press Enter for semantic search">
+      <span id="semBadge" class="sem" hidden>semantic: <b id="semQuery"></b> <button id="semClear" title="back to normal order">✕</button></span></div>
     <button id="reset">Reset</button>
   </div>
   <div class="controls" style="margin-top:8px">
@@ -216,7 +220,7 @@
 <script>
 (() => {
   const $ = (s) => document.querySelector(s);
-  const state = { jobs: [], sort: "close_date", dir: "asc", open: null, selected: new Set(), lastClicked: null, lastRows: [], bulkOpen: false };
+  const state = { jobs: [], sort: "close_date", dir: "asc", open: null, selected: new Set(), lastClicked: null, lastRows: [], bulkOpen: false, semantic: null };
   const VRANK = { yes: 0, maybe: 1, none: 2, no: 3 };
   const ARANK = { applied: 0, drafted: 1, withdrawn: 2, skipped: 3, none: 4 };
   const today = new Date().toISOString().slice(0, 10);
@@ -267,7 +271,8 @@
       if (openness === "closed" && !(c && c < today)) return false;
       if (openness === "week" && !(c && c >= today && c <= week)) return false;
       if (source && j.source !== source) return false;
-      if (q) {
+      if (state.semantic) { if (!(j.id in state.semantic)) return false; }
+      else if (q) {
         const hay = [j.title, j.location, j.series, j.verdict_reason, j.announcement_no, j.action_note, gradeOf(j)].join(" ").toLowerCase();
         if (!hay.includes(q)) return false;
       }
@@ -276,6 +281,7 @@
   }
 
   function sorted(rows) {
+    if (state.semantic) return rows.slice().sort((a, b) => state.semantic[b.id] - state.semantic[a.id]);
     const k = state.sort, d = state.dir === "asc" ? 1 : -1;
     const key = (j) => {
       if (k === "verdict") return VRANK[verdictOf(j)];
@@ -333,7 +339,7 @@
         <td>${closeCell(j)}</td>
         <td>${verdictSelect(j, v)}${overridden(j) ? `<br><small title="${esc(j.claude_reason || "")}">claude: ${esc(j.claude_verdict)}</small>` : (j.eligible_grades ? `<br><small>${esc(j.eligible_grades)}</small>` : "")}</td>
         <td>${statusSelect(j, a)}${j.action_date ? `<br><small>${j.action_date}</small>` : ""}</td>
-        <td class="title">${esc(j.title)}<small>${esc(j.series || "")}${j.announcement_no ? " · " + esc(j.announcement_no) : ""}</small></td>
+        <td class="title">${state.semantic ? `<span class="score" title="similarity">${(state.semantic[j.id] * 100).toFixed(0)}% · </span>` : ""}${esc(j.title)}<small>${esc(j.series || "")}${j.announcement_no ? " · " + esc(j.announcement_no) : ""}</small></td>
         <td class="hide-sm">${esc(gradeOf(j))}</td>
         <td class="hide-sm">${esc((j.location || "").slice(0, 60))}</td>
         <td class="hide-sm fetched" title="${esc(fmtLocal(j.last_fetched))}">${esc(fmtAgo(j.last_fetched))}</td>
@@ -389,10 +395,28 @@
     if (e.target.id === "sort") [state.sort, state.dir] = e.target.value.split(":");
     render();
   }});
-  $("#q").addEventListener("input", render);
+  $("#q").addEventListener("input", () => { if (!state.semantic) render(); });
+  async function semanticSearch(q) {
+    setRun("running", `semantic search: "${q}"…`);
+    try {
+      const r = await fetch(`/api/search?mode=semantic&limit=200&q=${encodeURIComponent(q)}`);
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || r.statusText);
+      state.semantic = Object.fromEntries(d.hits.map((h) => [h.id, h.score]));
+      $("#semBadge").hidden = false; $("#semQuery").textContent = q;
+      setRun("done", `semantic search: ${d.hits.length} ranked`);
+      render();
+    } catch (err) { setRun("failed", `semantic search failed: ${err.message}`); }
+  }
+  $("#q").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { const q = $("#q").value.trim(); if (q) semanticSearch(q); }
+    if (e.key === "Escape") { state.semantic = null; $("#semBadge").hidden = true; render(); }
+  });
+  $("#semClear").addEventListener("click", () => { state.semantic = null; $("#semBadge").hidden = true; render(); });
   $("#reset").addEventListener("click", () => {
     document.querySelectorAll('input[data-f="verdict"]').forEach((i) => i.checked = i.value === "yes" || i.value === "maybe");
     $("#applied").value = "any"; $("#openness").value = "open"; $("#source").value = ""; $("#q").value = "";
+    state.semantic = null; $("#semBadge").hidden = true;
     $("#sort").value = "close_date:asc"; state.sort = "close_date"; state.dir = "asc"; render();
   });
   document.querySelectorAll("th[data-sort]").forEach((th) => th.addEventListener("click", () => {

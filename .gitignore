@@ -3,3 +3,7 @@
 jobscan/jobs.sqlite-wal
 jobscan/jobs.sqlite-shm
 __pycache__/
+.env
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm

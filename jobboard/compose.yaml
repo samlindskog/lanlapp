@@ -1,21 +1,46 @@
 services:
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: jobboard-db
+    environment:
+      POSTGRES_USER: jobscan
+      POSTGRES_PASSWORD: jobscan
+      POSTGRES_DB: jobscan
+    volumes:
+      - pgdata:/var/lib/postgresql/data      # persistent: survives compose down / image updates
+    ports:
+      - "5432:5432"                          # so the host CLI (python3 jobscan/jobscan.py ...) can connect
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jobscan -d jobscan"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
   jobboard:
-    image: python:3.13-slim
+    build: .
     container_name: jobboard
     working_dir: /app
-    command: python3 -u server.py
+    depends_on:
+      db:
+        condition: service_healthy
     environment:
       PORT: "8080"
       JOBSCAN_DIR: /app/jobscan
+      JOBSCAN_DSN: postgresql://jobscan:jobscan@db:5432/jobscan
       EXPERIENCE_MD: /app/EXPERIENCE.md
       APPLICATIONS_DIR: /app/applications
-      JOBBOARD_RELOAD: "1"               # dev: auto-restart on .py changes; static files always fresh
-      # JOBBOARD_TOKEN: change-me   # uncomment to require X-Token on writes
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}      # from your shell or a jobboard/.env file (git-ignored)
+      JOBBOARD_RELOAD: "1"                     # dev: auto-restart on .py changes; static files always fresh
+      # JOBBOARD_TOKEN: change-me              # uncomment to require X-Token on writes
     volumes:
-      - ./:/app                          # server.py + static/, live
-      - ../jobscan:/app/jobscan          # read-write: scans and verdicts write here
+      - ./:/app                                # server.py + static/, live
+      - ../jobscan:/app/jobscan                # adapters, live
       - ../EXPERIENCE.md:/app/EXPERIENCE.md:ro
-      - ../applications:/app/applications:ro   # resumes, served inline at /files/
+      - ../applications:/app/applications:ro   # resumes, served at /files/
     ports:
       - "8080:8080"
     restart: unless-stopped
+
+volumes:
+  pgdata:
