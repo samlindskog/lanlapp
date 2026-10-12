@@ -33,8 +33,14 @@ echo "saved under /root/jobboard-bootstrap-backup (restore firewall: nft -f <fil
 
 log "packages"
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get install -y -qq git nginx nftables curl >/dev/null
+apt-get update -qq || true
+dpkg --configure -a 2>&1 | tail -3 || true
+apt-get -f install -y -qq >/dev/null 2>&1 || true
+if ! apt-get install -y -qq git nginx nftables curl >/dev/null 2>&1; then
+  echo "apt-get install failed; continuing with the tools already present:"
+fi
+for t in git nginx nft curl docker; do command -v "$t" >/dev/null || { echo "missing required tool: $t"; exit 1; }; done
+echo "git nginx nft curl docker present"
 
 log "remove hermes-hub"
 systemctl list-units --all --no-pager --plain 2>/dev/null | awk '{print $1}' | grep -Ei 'hermes|cloudflare-ips' | while read -r u; do
