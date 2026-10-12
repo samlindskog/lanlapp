@@ -75,7 +75,8 @@
   select.status.a-skipped, select.status.a-withdrawn { background: var(--none); }
   select.status.big { font-size: 13px; }
   .closed { color: var(--muted); }
-  th.sel, td.sel { width: 28px; padding-right: 0; }
+  th.sel, td.sel { width: 28px; padding-right: 0; display: none; }
+  body.select-mode th.sel, body.select-mode td.sel { display: table-cell; }
   td.sel input, th.sel input { cursor: pointer; }
   tr.row.selected td { background: color-mix(in srgb, var(--applied) 12%, transparent); }
   #layout { display: flex; align-items: flex-start; min-height: 100vh; }
@@ -107,7 +108,7 @@
 <body>
 <div id="layout">
 <aside id="bulk" hidden>
-  <button class="close" id="bulkClose" title="Hide panel">✕</button>
+  <button class="close" id="bulkClose" title="Exit selection mode">✕</button>
   <h3><span id="selCount">0</span> selected</h3>
   <label>Set status to<br><select id="bulkAction">
     <option value="applied">applied</option><option value="drafted">drafted</option>
@@ -167,7 +168,7 @@
     <div class="group"><span class="label">Actions</span>
       <button id="scan" title="Fetch new postings from a job board">Scan…</button>
       <button id="refreshAll" title="Re-fetch every posting currently listed (current filters) so dates and text are current">Refresh</button>
-      <button id="bulkToggle" title="Show or hide the bulk status panel">Bulk edit</button>
+      <button id="bulkToggle" title="Enter selection mode: shows checkboxes and the bulk status panel">Select…</button>
     </div>
     <span id="run" class="runstat"></span>
   </div>
@@ -204,7 +205,7 @@
 <script>
 (() => {
   const $ = (s) => document.querySelector(s);
-  const state = { jobs: [], sort: "close_date", dir: "asc", open: null, selected: new Set(), lastClicked: null, lastRows: [], bulkOpen: false, bulkDismissed: false };
+  const state = { jobs: [], sort: "close_date", dir: "asc", open: null, selected: new Set(), lastClicked: null, lastRows: [], bulkOpen: false };
   const VRANK = { yes: 0, maybe: 1, none: 2, no: 3 };
   const ARANK = { applied: 0, drafted: 1, withdrawn: 2, skipped: 3, none: 4 };
   const today = new Date().toISOString().slice(0, 10);
@@ -462,14 +463,17 @@
   });
   function renderSidebar() {
     const n = state.selected.size;
+    document.body.classList.toggle("select-mode", state.bulkOpen);
     $("#bulk").hidden = !state.bulkOpen;
     $("#bulkToggle").classList.toggle("on", state.bulkOpen);
+    $("#bulkToggle").textContent = state.bulkOpen ? "Done selecting" : "Select…";
     $("#selCount").textContent = n;
     $("#bulkApply").disabled = n === 0;
     if (!$("#bulkDate").value) $("#bulkDate").value = today;
   }
-  $("#bulkToggle").addEventListener("click", () => { state.bulkOpen = !state.bulkOpen; renderSidebar(); });
-  $("#bulkClose").addEventListener("click", () => { state.bulkOpen = false; state.bulkDismissed = true; renderSidebar(); });
+  function exitSelectMode() { state.bulkOpen = false; state.selected.clear(); state.lastClicked = null; render(); }
+  $("#bulkToggle").addEventListener("click", () => { if (state.bulkOpen) exitSelectMode(); else { state.bulkOpen = true; renderSidebar(); } });
+  $("#bulkClose").addEventListener("click", exitSelectMode);
   $("#rows").addEventListener("click", (e) => {
     const cb = e.target.closest("input[data-sel]"); if (!cb) return;
     e.stopPropagation();
@@ -481,7 +485,6 @@
     }
     ids.forEach((x) => want ? state.selected.add(x) : state.selected.delete(x));
     state.lastClicked = id;
-    if (want && state.selected.size > 0 && !state.bulkDismissed) state.bulkOpen = true;
     render();
   });
   $("#selAll").addEventListener("change", (e) => {
