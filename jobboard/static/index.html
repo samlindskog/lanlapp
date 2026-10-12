@@ -66,6 +66,13 @@
   .v-no { background: var(--no); } .v-none { background: var(--none); }
   .a-applied { background: var(--applied); } .a-drafted { background: #6b5ca5; }
   .a-skipped { background: var(--none); } .a-withdrawn { background: var(--none); }
+  select.status { font: inherit; font-size: 12px; font-weight: 600; padding: 1px 6px; border-radius: 999px;
+                  border: 1px solid var(--line); background: var(--chip); color: var(--fg); cursor: pointer;
+                  -webkit-appearance: none; appearance: none; }
+  select.status.a-applied, select.status.a-drafted, select.status.a-skipped, select.status.a-withdrawn { color: #fff; border-color: transparent; }
+  select.status.a-applied { background: var(--applied); } select.status.a-drafted { background: #6b5ca5; }
+  select.status.a-skipped, select.status.a-withdrawn { background: var(--none); }
+  select.status.big { font-size: 13px; }
   .closed { color: var(--muted); }
   .soon { color: var(--maybe); font-weight: 600; }
   a { color: var(--accent); }
@@ -240,6 +247,13 @@
     });
   }
 
+  const ACTIONS = ["applied", "drafted", "skipped", "withdrawn"];
+  function statusSelect(j, a, extraClass = "") {
+    return `<select class="status a-${a} ${extraClass}" data-status="${j.id}" title="Set status (saved immediately)" onclick="event.stopPropagation()">
+      <option value="" ${a === "none" ? "selected" : ""}>—</option>
+      ${ACTIONS.map((x) => `<option value="${x}" ${a === x ? "selected" : ""}>${x}</option>`).join("")}
+    </select>`;
+  }
   function closeCell(j) {
     if (!j.close_date) return '<span class="closed">?</span>';
     if (j.close_date < today) return `<span class="closed">${j.close_date}</span>`;
@@ -257,7 +271,7 @@
       return `<tr class="row" data-id="${j.id}">
         <td>${closeCell(j)}</td>
         <td><span class="badge v-${v}">${v === "none" ? "unjudged" : v}</span>${j.eligible_grades ? `<br><small>${esc(j.eligible_grades)}</small>` : ""}</td>
-        <td>${a === "none" ? "" : `<span class="badge a-${a}">${a}</span>${j.action_date ? `<br><small>${j.action_date}</small>` : ""}`}</td>
+        <td>${statusSelect(j, a)}${j.action_date ? `<br><small>${j.action_date}</small>` : ""}</td>
         <td class="title">${esc(j.title)}<small>${esc(j.series || "")}${j.announcement_no ? " · " + esc(j.announcement_no) : ""}</small></td>
         <td class="hide-sm">${esc(gradeOf(j))}</td>
         <td class="hide-sm">${esc((j.location || "").slice(0, 60))}</td>
@@ -272,7 +286,7 @@
       <div class="detail-grid">
         <div>Verdict: <b>${esc(verdictOf(j))}</b> ${j.eligible_grades ? `(${esc(j.eligible_grades)})` : ""}</div>
         <div>Reason: <b>${esc(j.verdict_reason || "—")}</b></div>
-        <div>Status: <b>${esc(actionOf(j))}</b> ${j.action_date ? esc(j.action_date) : ""}</div>
+        <div>Status: ${statusSelect(j, actionOf(j), "big")} ${j.action_date ? esc(j.action_date) : ""}</div>
         <div>Resume: ${(j.resume_files || []).filter((f) => f.name.toLowerCase().endsWith(".pdf")).map((f) => `<a href="/view.html?f=${encodeURIComponent(f.path)}" target="_blank" rel="noopener">${esc(f.path)}</a>`).join(" · ") || `<b>${esc(j.resume_dir || "—")}</b>`}</div>
         <div>Note: <b>${esc(j.action_note || "—")}</b></div>
         <div>Opens / closes: <b>${esc(j.open_date || "?")} / ${esc(j.close_date || "?")}</b></div>
@@ -408,7 +422,21 @@
     } catch (err) { setRun("failed", `refresh [${id}] failed: ${err.message}`); }
     b.disabled = false;
   });
-  $("#rows").addEventListener("click", (e) => { if (e.target.closest("details, a")) e.stopPropagation(); }, true);
+  $("#rows").addEventListener("change", async (e) => {
+    const sel = e.target.closest("select[data-status]"); if (!sel) return;
+    e.stopPropagation();
+    const id = Number(sel.dataset.status), action = sel.value, job = state.jobs.find((j) => j.id === id);
+    if (!action) { render(); return; }
+    setRun("running", `status [${id}] ${job ? job.title : ""}: saving ${action}…`);
+    try {
+      const body = { action, date: today };
+      if (job && job.resume_dir) body.resume_dir = job.resume_dir;
+      await post(`/api/jobs/${id}/action`, body);
+      setRun("done", `status [${id}] ${job ? job.title : ""}: ${action} on ${today}`);
+      await reload();
+    } catch (err) { setRun("failed", `status [${id}] failed: ${err.message}`); render(); }
+  });
+  $("#rows").addEventListener("click", (e) => { if (e.target.closest("details, a, select")) e.stopPropagation(); }, true);
 
   reload().then((d) => {
     if (d.active_run) pollRun(d.active_run.id);
