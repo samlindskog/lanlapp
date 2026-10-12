@@ -110,16 +110,23 @@ if [ ! -f "$APP/.env" ]; then
   fi
   HASH=$(cd "$APP/jobboard" && python3 -c "import auth,sys; print(auth.hash_password(sys.stdin.readline().rstrip('\n')))" <<<"$PW1")
   umask 077
+  # compose interpolates $VAR in env files, so every literal $ in the hash must be written as $$.
   cat > "$APP/.env" <<EOF
 POSTGRES_PASSWORD=$(openssl rand -hex 24)
-JOBBOARD_PASSWORD_HASH=$HASH
+JOBBOARD_PASSWORD_HASH=${HASH//\$/\$\$}
 JOBBOARD_SECRET=$(openssl rand -hex 32)
 OPENAI_API_KEY=$OAI
 EOF
   chown deploy:deploy "$APP/.env"; chmod 600 "$APP/.env"
   echo "written"
 else
-  echo "exists, kept"
+  # Repair an .env written before $-escaping: double any single $ on the hash line.
+  if grep -qE '^JOBBOARD_PASSWORD_HASH=.*[^$]\$[^$]' "$APP/.env"; then
+    sed -i -E '/^JOBBOARD_PASSWORD_HASH=/ s/\$/$$/g; /^JOBBOARD_PASSWORD_HASH=/ s/\$\$\$\$/$$/g' "$APP/.env"
+    echo "exists; escaped \$ in the password hash for compose"
+  else
+    echo "exists, kept"
+  fi
 fi
 
 log "nginx"
