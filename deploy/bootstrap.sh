@@ -73,6 +73,17 @@ Host github.com
   StrictHostKeyChecking accept-new
 EOF
 chown deploy:deploy /home/deploy/.ssh/config; chmod 600 /home/deploy/.ssh/config
+chmod 750 /home/deploy
+# sshd may restrict logins to listed users/groups: add deploy if so.
+SSHD_CHANGED=0
+for f in /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf; do
+  [ -f "$f" ] || continue
+  if grep -qE '^AllowUsers' "$f" && ! grep -qE '^AllowUsers.*\bdeploy\b' "$f"; then
+    sed -i -E 's/^(AllowUsers.*)$/\1 deploy/' "$f"; SSHD_CHANGED=1; fi
+  if grep -qE '^AllowGroups' "$f" && ! grep -qE '^AllowGroups.*\bdeploy\b' "$f"; then
+    sed -i -E 's/^(AllowGroups.*)$/\1 deploy/' "$f"; SSHD_CHANGED=1; fi
+done
+if [ "$SSHD_CHANGED" = 1 ]; then sshd -t && systemctl reload ssh && echo "sshd: deploy added to AllowUsers/AllowGroups"; fi
 
 log "checkout $APP"
 if [ ! -d "$APP/.git" ]; then
