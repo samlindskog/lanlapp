@@ -20,6 +20,7 @@ import time
 import ssl
 import urllib.request
 import urllib.error
+import zlib
 from html.parser import HTMLParser
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -176,6 +177,25 @@ class _TextExtractor(HTMLParser):
             self.parts.append(data)
 
 
+def pack_html(raw):
+    """Raw HTML is stored verbatim but zlib-compressed (USAJOBS pages are ~120 KB
+    each; the repo-committed database must stay well under GitHub's 100 MB cap)."""
+    if raw is None:
+        return None
+    return zlib.compress(raw.encode("utf-8"), 9)
+
+
+def unpack_html(blob):
+    if blob is None:
+        return None
+    if isinstance(blob, (bytes, memoryview)):
+        try:
+            return zlib.decompress(bytes(blob)).decode("utf-8", errors="replace")
+        except zlib.error:
+            return bytes(blob).decode("utf-8", errors="replace")
+    return blob
+
+
 def html_to_text(raw):
     """Verbatim text of an HTML page: all visible text, block structure kept."""
     p = _TextExtractor()
@@ -285,8 +305,8 @@ def cmd_scan(a):
         for d in docs:
             conn.execute("""INSERT INTO documents (job_id, kind, url, fetched_at,
                 raw_html, text) VALUES (?,?,?,?,?,?)""",
-                         (job_id, d["kind"], d.get("url"), now(), d.get("raw_html"),
-                          d.get("text")))
+                         (job_id, d["kind"], d.get("url"), now(),
+                          pack_html(d.get("raw_html")), d.get("text")))
         conn.commit()
     print(f"done: {new} new, {updated} already known")
 
@@ -366,6 +386,14 @@ def _extract_section(text, name):
         if on:
             out.append(ln)
     return "\n".join(out) if out else f"(section '{name}' not found)"
+
+
+def cmd_raw(a):
+    conn = db()
+    d = conn.execute("SELECT raw_html FROM documents WHERE id=?", (a.doc_id,)).fetchone()
+    if not d:
+        sys.exit("no such document")
+    sys.stdout.write(unpack_html(d["raw_html"]) or "")
 
 
 def cmd_autoreject(a):
@@ -526,6 +554,10 @@ def main(argv=None):
     s.add_argument("--section", help="only this USAJOBS section, e.g. Qualifications")
     s.add_argument("--max-chars", type=int)
     s.set_defaults(fn=cmd_show)
+
+    s = sp.add_parser("raw", help="print a document's verbatim raw HTML")
+    s.add_argument("doc_id", type=int)
+    s.set_defaults(fn=cmd_raw)
 
     s = sp.add_parser("autoreject", help="record 'no' for pending jobs matching hard rules")
     s.add_argument("--min-grade", type=int, help="reject if lowest grade >= N")
