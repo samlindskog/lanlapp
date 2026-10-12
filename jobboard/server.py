@@ -297,7 +297,8 @@ class Handler(SimpleHTTPRequestHandler):
 
     def _gate(self, path):
         """Enforce auth. Returns True when the request may proceed."""
-        if not auth.AUTH_ON or path in ("/login", "/login.html", "/api/auth/login"):
+        # /api/auth/token checks the password itself when there is no session.
+        if not auth.AUTH_ON or path in ("/login", "/login.html", "/api/auth/login", "/api/auth/token"):
             return True
         if self._who():
             return True
