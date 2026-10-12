@@ -74,6 +74,18 @@
   select.status.a-skipped, select.status.a-withdrawn { background: var(--none); }
   select.status.big { font-size: 13px; }
   .closed { color: var(--muted); }
+  th.sel, td.sel { width: 28px; padding-right: 0; }
+  td.sel input, th.sel input { cursor: pointer; }
+  tr.row.selected td { background: color-mix(in srgb, var(--applied) 12%, transparent); }
+  #bulk { position: fixed; left: 0; top: 0; bottom: 0; width: 250px; padding: 16px; background: var(--card);
+          border-right: 1px solid var(--line); z-index: 3; display: flex; flex-direction: column; gap: 10px; overflow: auto; }
+  #bulk h3 { margin: 0 0 4px; font-size: 15px; }
+  #bulk select, #bulk input { width: 100%; font: inherit; padding: 4px 8px; border: 1px solid var(--line);
+      border-radius: 6px; background: var(--bg); color: var(--fg); margin-top: 4px; }
+  #bulkApply { background: var(--accent); color: #fff; border-color: var(--accent); }
+  body.has-bulk header, body.has-bulk main { margin-left: 250px; }
+  @media (max-width: 800px) { #bulk { width: 100%; bottom: auto; border-right: 0; border-bottom: 1px solid var(--line); position: sticky; }
+    body.has-bulk header, body.has-bulk main { margin-left: 0; } }
   .soon { color: var(--maybe); font-weight: 600; }
   a { color: var(--accent); }
   tr.detail td { background: var(--card); padding: 12px 14px; }
@@ -153,9 +165,21 @@
     <div class="dlg-actions"><button value="cancel" type="button" id="scanCancel">Cancel</button><button value="start" id="scanStart">Start scan</button></div>
   </form>
 </dialog>
+<aside id="bulk" hidden>
+  <h3><span id="selCount">0</span> selected</h3>
+  <label>Set status to<br><select id="bulkAction">
+    <option value="applied">applied</option><option value="drafted">drafted</option>
+    <option value="skipped">skipped</option><option value="withdrawn">withdrawn</option></select></label>
+  <label>Date<br><input type="date" id="bulkDate"></label>
+  <label>Note (optional)<br><input type="text" id="bulkNote" placeholder="e.g. applied via USAJOBS"></label>
+  <button id="bulkApply">Apply to selected</button>
+  <button id="bulkClear">Clear selection</button>
+  <p class="muted">Tip: click a checkbox, then shift-click another to select the range between them. The header checkbox selects everything listed.</p>
+</aside>
 <main>
   <table>
     <thead><tr>
+      <th class="sel"><input type="checkbox" id="selAll" title="Select all listed"></th>
       <th data-sort="close_date">Closes</th>
       <th data-sort="verdict">Verdict</th>
       <th data-sort="action">Status</th>
@@ -171,7 +195,7 @@
 <script>
 (() => {
   const $ = (s) => document.querySelector(s);
-  const state = { jobs: [], sort: "close_date", dir: "asc", open: null };
+  const state = { jobs: [], sort: "close_date", dir: "asc", open: null, selected: new Set(), lastClicked: null, lastRows: [] };
   const VRANK = { yes: 0, maybe: 1, none: 2, no: 3 };
   const ARANK = { applied: 0, drafted: 1, withdrawn: 2, skipped: 3, none: 4 };
   const today = new Date().toISOString().slice(0, 10);
@@ -263,12 +287,16 @@
 
   function render() {
     const rows = sorted(filtered());
+    state.lastRows = rows.map((j) => j.id);
     $("#count").textContent = `${rows.length} of ${state.jobs.length}`;
+    $("#selAll").checked = rows.length > 0 && rows.every((j) => state.selected.has(j.id));
+    renderSidebar();
     document.querySelectorAll("th[data-sort]").forEach((th) => th.classList.toggle("active", th.dataset.sort === state.sort));
     $("#rows").innerHTML = rows.map((j) => {
       const v = verdictOf(j), a = actionOf(j);
       const link = j.external_url || j.board_url;
-      return `<tr class="row" data-id="${j.id}">
+      return `<tr class="row ${state.selected.has(j.id) ? "selected" : ""}" data-id="${j.id}">
+        <td class="sel"><input type="checkbox" data-sel="${j.id}" ${state.selected.has(j.id) ? "checked" : ""}></td>
         <td>${closeCell(j)}</td>
         <td><span class="badge v-${v}">${v === "none" ? "unjudged" : v}</span>${j.eligible_grades ? `<br><small>${esc(j.eligible_grades)}</small>` : ""}</td>
         <td>${statusSelect(j, a)}${j.action_date ? `<br><small>${j.action_date}</small>` : ""}</td>
@@ -282,7 +310,7 @@
   }
 
   function detailRow(j) {
-    return `<tr class="detail"><td colspan="8">
+    return `<tr class="detail"><td colspan="9">
       <div class="detail-grid">
         <div>Verdict: <b>${esc(verdictOf(j))}</b> ${j.eligible_grades ? `(${esc(j.eligible_grades)})` : ""}</div>
         <div>Reason: <b>${esc(j.verdict_reason || "—")}</b></div>
@@ -339,6 +367,7 @@
     render();
   }));
   $("#rows").addEventListener("click", (e) => {
+    if (e.target.closest("input[data-sel], select, a, details")) return;
     const tr = e.target.closest("tr.row"); if (!tr) return;
     const id = Number(tr.dataset.id);
     state.open = state.open === id ? null : id; render();
@@ -422,6 +451,44 @@
     } catch (err) { setRun("failed", `refresh [${id}] failed: ${err.message}`); }
     b.disabled = false;
   });
+  function renderSidebar() {
+    const n = state.selected.size;
+    $("#bulk").hidden = n === 0;
+    document.body.classList.toggle("has-bulk", n > 0);
+    $("#selCount").textContent = n;
+    if (!$("#bulkDate").value) $("#bulkDate").value = today;
+  }
+  $("#rows").addEventListener("click", (e) => {
+    const cb = e.target.closest("input[data-sel]"); if (!cb) return;
+    e.stopPropagation();
+    const id = Number(cb.dataset.sel), want = cb.checked;
+    let ids = [id];
+    if (e.shiftKey && state.lastClicked != null) {
+      const a = state.lastRows.indexOf(state.lastClicked), b = state.lastRows.indexOf(id);
+      if (a >= 0 && b >= 0) ids = state.lastRows.slice(Math.min(a, b), Math.max(a, b) + 1);
+    }
+    ids.forEach((x) => want ? state.selected.add(x) : state.selected.delete(x));
+    state.lastClicked = id;
+    render();
+  });
+  $("#selAll").addEventListener("change", (e) => {
+    state.lastRows.forEach((id) => e.target.checked ? state.selected.add(id) : state.selected.delete(id));
+    render();
+  });
+  $("#bulkClear").addEventListener("click", () => { state.selected.clear(); state.lastClicked = null; render(); });
+  $("#bulkApply").addEventListener("click", async () => {
+    const ids = [...state.selected], action = $("#bulkAction").value, date = $("#bulkDate").value || today, note = $("#bulkNote").value.trim();
+    let ok = 0, fail = 0;
+    for (const id of ids) {
+      setRun("running", `bulk status: ${action} ${ok + fail + 1}/${ids.length}…`);
+      const job = state.jobs.find((j) => j.id === id);
+      const body = { action, date }; if (note) body.note = note; if (job && job.resume_dir) body.resume_dir = job.resume_dir;
+      try { await post(`/api/jobs/${id}/action`, body); ok++; } catch (err) { fail++; }
+    }
+    setRun(fail ? "failed" : "done", `bulk status: ${action} set on ${ok} job(s)${fail ? `, ${fail} failed` : ""}`);
+    state.selected.clear(); state.lastClicked = null; $("#bulkNote").value = "";
+    await reload();
+  });
   $("#rows").addEventListener("change", async (e) => {
     const sel = e.target.closest("select[data-status]"); if (!sel) return;
     e.stopPropagation();
@@ -436,11 +503,11 @@
       await reload();
     } catch (err) { setRun("failed", `status [${id}] failed: ${err.message}`); render(); }
   });
-  $("#rows").addEventListener("click", (e) => { if (e.target.closest("details, a, select")) e.stopPropagation(); }, true);
+  $("#rows").addEventListener("click", (e) => { if (e.target.closest("details, a, select, input[data-sel]")) e.stopPropagation(); }, true);
 
   reload().then((d) => {
     if (d.active_run) pollRun(d.active_run.id);
-  }).catch((e) => { $("#rows").innerHTML = `<tr><td colspan="8">failed to load /api/jobs: ${esc(e)}</td></tr>`; });
+  }).catch((e) => { $("#rows").innerHTML = `<tr><td colspan="9">failed to load /api/jobs: ${esc(e)}</td></tr>`; });
 })();
 </script>
 </body>
