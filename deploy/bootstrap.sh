@@ -3,7 +3,9 @@
 #   sudo bash ~/jobboard-bootstrap/bootstrap.sh
 # Expects in the same directory: github_deploy_key (private, read-only GitHub deploy key),
 # jobboard_deploy.pub (public key for the `deploy` user: used by Claude and GitHub Actions).
-# Prompts for the web password and the OpenAI API key. Idempotent where practical.
+# Reads the web password and OpenAI key from secrets.env in the same directory
+# (WEB_PASSWORD=..., OPENAI_API_KEY=...; deleted after use), or prompts if absent.
+# Idempotent where practical.
 #
 # Does: remove hermes-hub (nginx site, nftables table, timers, /opt/hermes-hub, redis, slapd);
 #       create `deploy` user; clone the repo to /opt/jobboard; write .env; nginx site for
@@ -77,10 +79,18 @@ chmod +x "$APP/deploy/deploy.sh"
 
 log "secrets -> $APP/.env"
 if [ ! -f "$APP/.env" ]; then
-  read -rsp "web password for jobs.slindskog.net: " PW1; echo
-  read -rsp "again: " PW2; echo
-  [ "$PW1" = "$PW2" ] || { echo "passwords differ"; exit 1; }
-  read -rsp "OpenAI API key (blank to skip semantic search): " OAI; echo
+  if [ -f "$HERE/secrets.env" ]; then
+    # shellcheck disable=SC1090
+    . "$HERE/secrets.env"
+    PW1="${WEB_PASSWORD:?WEB_PASSWORD missing in secrets.env}"; OAI="${OPENAI_API_KEY:-}"
+    shred -u "$HERE/secrets.env" 2>/dev/null || rm -f "$HERE/secrets.env"
+    echo "secrets read from secrets.env (file removed)"
+  else
+    read -rsp "web password for jobs.slindskog.net: " PW1; echo
+    read -rsp "again: " PW2; echo
+    [ "$PW1" = "$PW2" ] || { echo "passwords differ"; exit 1; }
+    read -rsp "OpenAI API key (blank to skip semantic search): " OAI; echo
+  fi
   HASH=$(cd "$APP/jobboard" && python3 -c "import auth,sys; print(auth.hash_password(sys.stdin.readline().rstrip('\n')))" <<<"$PW1")
   umask 077
   cat > "$APP/.env" <<EOF
