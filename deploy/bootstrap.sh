@@ -21,6 +21,14 @@ WG_IP=10.88.0.1
 MCP_PORT=8090
 log() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 
+# --- maintenance mode: `touch ~/jobboard-bootstrap/reboot` then run; reboots the VPS (nothing else).
+if [ -f "$HERE/reboot" ]; then
+  rm -f "$HERE/reboot"
+  echo "rebooting $(hostname) now ($(date -u +%FT%TZ)); kernel $(uname -r) -> $(ls /boot/vmlinuz-* | sed 's|.*/vmlinuz-||' | sort -V | tail -1)"
+  systemctl reboot
+  exit 0
+fi
+
 # --- maintenance mode: `touch ~/jobboard-bootstrap/fix-grub` then run; repairs the half-configured
 # grub-pc package (which has been failing every apt run) and exits without touching anything else.
 if [ -f "$HERE/fix-grub" ]; then
