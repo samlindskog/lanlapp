@@ -38,7 +38,6 @@
   .runstat.done { color: var(--yes); }
   .runstat { transition: opacity .6s; }
   .runstat.fade { opacity: 0; }
-  .flash { font-size: 12px; color: var(--yes); margin-left: 6px; }
   dialog { border: 1px solid var(--line); border-radius: 10px; background: var(--card); color: var(--fg);
            padding: 18px 20px; min-width: 320px; max-width: 90vw; }
   dialog::backdrop { background: rgba(0,0,0,.35); }
@@ -281,7 +280,7 @@
         <div>Source: <b>${esc(j.source)}</b> · first seen ${esc(fmtLocal(j.first_seen, true))}</div>
         <div>Links: ${j.external_url ? `<a href="${esc(j.external_url)}" target="_blank" rel="noopener">USAJOBS</a>` : ""} ${j.board_url ? `<a href="${esc(j.board_url)}" target="_blank" rel="noopener">board</a>` : ""}</div>
         <div>Last fetched: <b>${esc(fmtLocal(j.last_fetched) || "—")}</b>
-             <button data-act="refresh" data-id="${j.id}" style="margin-left:6px">Refresh posting</button><span class="flash" id="flash-${j.id}"></span></div>
+             <button data-act="refresh" data-id="${j.id}" style="margin-left:6px">Refresh posting</button></div>
       </div>
       <div id="docs-${j.id}"><em style="color:var(--muted)">loading stored text…</em></div>
     </td></tr>`;
