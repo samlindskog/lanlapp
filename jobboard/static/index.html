@@ -178,6 +178,16 @@
     const pp = j.pay_plan || "";
     return j.grade_high && j.grade_high !== j.grade_low ? `${pp}-${j.grade_low}/${j.grade_high}` : `${pp}-${j.grade_low}`;
   };
+  // ISO timestamp -> browser-local "YYYY-MM-DD HH:MM". Naive strings (no zone)
+  // are treated by Date() as local time, which matches rows written by the CLI
+  // on this machine; zone-aware strings from the server convert correctly.
+  const fmtLocal = (iso, dateOnly = false) => {
+    if (!iso) return "";
+    const d = new Date(iso); if (isNaN(d)) return iso;
+    const p = (n) => String(n).padStart(2, "0");
+    const date = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+    return dateOnly ? date : `${date} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  };
   const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
   function filtered() {
@@ -258,9 +268,9 @@
         <div>Note: <b>${esc(j.action_note || "—")}</b></div>
         <div>Opens / closes: <b>${esc(j.open_date || "?")} / ${esc(j.close_date || "?")}</b></div>
         <div>Salary: <b>${esc(j.salary || "—")}</b></div>
-        <div>Source: <b>${esc(j.source)}</b> · first seen ${esc((j.first_seen || "").slice(0, 10))}</div>
+        <div>Source: <b>${esc(j.source)}</b> · first seen ${esc(fmtLocal(j.first_seen, true))}</div>
         <div>Links: ${j.external_url ? `<a href="${esc(j.external_url)}" target="_blank" rel="noopener">USAJOBS</a>` : ""} ${j.board_url ? `<a href="${esc(j.board_url)}" target="_blank" rel="noopener">board</a>` : ""}</div>
-        <div>Last fetched: <b>${esc((j.last_fetched || "").replace("T", " ").slice(0, 16) || "—")}</b>
+        <div>Last fetched: <b>${esc(fmtLocal(j.last_fetched) || "—")}</b>
              <button data-act="refresh" data-id="${j.id}" style="margin-left:6px">Refresh posting</button><span class="flash" id="flash-${j.id}"></span></div>
       </div>
       <div class="forms">
@@ -291,7 +301,7 @@
         const text = x.text || "";
         const qi = text.indexOf("\nQualifications\n");
         const preview = qi >= 0 ? text.slice(qi, qi + 3000) : text.slice(0, 1500);
-        return `<details ${x.kind === "usajobs_announcement" ? "open" : ""}><summary>${esc(x.kind)} · ${esc((x.fetched_at || "").slice(0, 10))} · ${text.length.toLocaleString()} chars</summary>
+        return `<details ${x.kind === "usajobs_announcement" ? "open" : ""}><summary>${esc(x.kind)} · ${esc(fmtLocal(x.fetched_at))} · ${text.length.toLocaleString()} chars</summary>
           <pre>${esc(preview)}${text.length > preview.length ? "\n…" : ""}</pre>
           <details><summary>full text</summary><pre>${esc(text)}</pre></details></details>`;
       }).join("") : '<em style="color:var(--muted)">no stored documents</em>';
@@ -358,7 +368,7 @@
   function showSourceInfo() {
     const s = sources.find((x) => x.name === $("#scanSource").value); if (!s) return;
     const ls = s.last_scan;
-    const when = ls ? `last scan ${(ls.started_at || "").replace("T", " ").slice(0, 16)} (${ls.status}${ls.summary ? `: ${ls.summary.new} new, ${ls.summary.known} known` : ""})` : "never scanned";
+    const when = ls ? `last scan ${fmtLocal(ls.started_at)} (${ls.status}${ls.summary ? `: ${ls.summary.new} new, ${ls.summary.known} known` : ""})` : "never scanned";
     $("#scanInfo").innerHTML = `${s.board_url ? `<a href="${esc(s.board_url)}" target="_blank" rel="noopener">${esc(s.board_url)}</a><br>` : ""}${esc(when)}`;
   }
   $("#scanSource").addEventListener("change", showSourceInfo);

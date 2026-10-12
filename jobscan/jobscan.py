@@ -121,7 +121,9 @@ CREATE TABLE IF NOT EXISTS runs (
 
 # ----------------------------------------------------------------- utilities
 def now():
-    return dt.datetime.now().isoformat(timespec="seconds")
+    """Zone-aware UTC timestamp, e.g. 2026-10-12T18:04:11+00:00. Clients convert
+    to local time. (Rows written before 2026-10-12 may be naive local time.)"""
+    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
 
 
 def today():
