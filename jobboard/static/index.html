@@ -66,6 +66,7 @@
   tr.row:hover td { background: color-mix(in srgb, var(--accent) 8%, transparent); }
   td.title { font-weight: 600; }
   td.title small { display: block; font-weight: 400; color: var(--muted); }
+  td.fetched { color: var(--muted); white-space: nowrap; }
   .badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 600;
            color: #fff; }
   .v-yes { background: var(--yes); } .v-maybe { background: var(--maybe); }
@@ -126,6 +127,8 @@
         <option value="title:asc">title A–Z</option>
         <option value="grade_low:asc">grade, low to high</option>
         <option value="first_seen:desc">newest in database</option>
+        <option value="last_fetched:asc">least recently fetched first</option>
+        <option value="last_fetched:desc">most recently fetched first</option>
       </select>
     </div>
     <div class="group"><input type="search" id="q" placeholder="search title, location, series, reason"></div>
@@ -159,6 +162,7 @@
       <th data-sort="title">Title</th>
       <th data-sort="grade_low" class="hide-sm">Grade</th>
       <th class="hide-sm">Location</th>
+      <th data-sort="last_fetched" class="hide-sm">Fetched</th>
       <th class="hide-sm">Link</th>
     </tr></thead>
     <tbody id="rows"></tbody>
@@ -190,6 +194,13 @@
     const p = (n) => String(n).padStart(2, "0");
     const date = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
     return dateOnly ? date : `${date} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  };
+  // Relative age for the list: "3h ago", "2d ago"; exact time is in the tooltip.
+  const fmtAgo = (iso) => {
+    if (!iso) return "—";
+    const ms = Date.now() - new Date(iso).getTime(); if (isNaN(ms)) return "";
+    const m = Math.round(ms / 6e4), h = Math.round(ms / 36e5), d = Math.round(ms / 864e5);
+    return m < 1 ? "just now" : m < 60 ? `${m}m ago` : h < 48 ? `${h}h ago` : `${d}d ago`;
   };
   const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
@@ -226,6 +237,7 @@
       if (k === "close_date") return j.close_date || "9999-99-99";
       if (k === "grade_low") return j.grade_low ?? 99;
       if (k === "first_seen") return j.first_seen || "";
+      if (k === "last_fetched") return j.last_fetched ? new Date(j.last_fetched).getTime() : 0;
       return (j.title || "").toLowerCase();
     };
     return rows.slice().sort((a, b) => {
@@ -256,13 +268,14 @@
         <td class="title">${esc(j.title)}<small>${esc(j.series || "")}${j.announcement_no ? " · " + esc(j.announcement_no) : ""}</small></td>
         <td class="hide-sm">${esc(gradeOf(j))}</td>
         <td class="hide-sm">${esc((j.location || "").slice(0, 60))}</td>
+        <td class="hide-sm fetched" title="${esc(fmtLocal(j.last_fetched))}">${esc(fmtAgo(j.last_fetched))}</td>
         <td class="hide-sm">${link ? `<a href="${esc(link)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">open ↗</a>` : ""}</td>
       </tr>` + (state.open === j.id ? detailRow(j) : "");
     }).join("");
   }
 
   function detailRow(j) {
-    return `<tr class="detail"><td colspan="7">
+    return `<tr class="detail"><td colspan="8">
       <div class="detail-grid">
         <div>Verdict: <b>${esc(verdictOf(j))}</b> ${j.eligible_grades ? `(${esc(j.eligible_grades)})` : ""}</div>
         <div>Reason: <b>${esc(j.verdict_reason || "—")}</b></div>
@@ -428,7 +441,7 @@
 
   reload().then((d) => {
     if (d.active_run) pollRun(d.active_run.id);
-  }).catch((e) => { $("#rows").innerHTML = `<tr><td colspan="7">failed to load /api/jobs: ${esc(e)}</td></tr>`; });
+  }).catch((e) => { $("#rows").innerHTML = `<tr><td colspan="8">failed to load /api/jobs: ${esc(e)}</td></tr>`; });
 })();
 </script>
 </body>
