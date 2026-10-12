@@ -153,18 +153,17 @@ log "first deploy"
 su - deploy -c "$APP/deploy/deploy.sh"
 
 log "api token for Claude"
-# Issue a token with the password just set (only on first run, when PW1 is known).
-if [ -n "${PW1:-}" ]; then
-  TOK=$(curl -s -X POST http://127.0.0.1:8080/api/auth/token -H 'Content-Type: application/json' \
-        -d "$(python3 -c "import json,sys; print(json.dumps({'name':'claude-mac','password':sys.stdin.read().rstrip(chr(10))}))" <<<"$PW1")" \
-        | python3 -c "import sys,json; print(json.load(sys.stdin).get('token',''))")
+if [ ! -f "$HERE/claude-token" ]; then
+  TOK=$(su - deploy -c "cd $APP && docker compose -f jobboard/compose.prod.yaml --env-file .env exec -T jobboard python3 server.py issue-token claude-mac" 2>/dev/null | tail -1)
   if [ -n "$TOK" ]; then
     install -m 600 -o "$(stat -c %U "$HERE")" /dev/null "$HERE/claude-token"
     echo "$TOK" > "$HERE/claude-token"
-    echo "token written to $HERE/claude-token (shown once; delete after copying)"
+    echo "token written to $HERE/claude-token (delete after copying)"
   else
-    echo "token issuance failed; issue later: POST /api/auth/token {name, password}"
+    echo "token issuance failed; later: docker compose ... exec jobboard python3 server.py issue-token <name>"
   fi
+else
+  echo "exists, kept"
 fi
 
 log "done"

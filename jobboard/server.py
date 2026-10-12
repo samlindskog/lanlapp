@@ -36,7 +36,8 @@ MCP (JOBBOARD_MCP_PORT, JOBBOARD_MCP_BIND): JSON-RPC at /mcp, bearer token requi
 
 Env: JOBSCAN_DIR (default ../jobscan), PORT (8080), JOBBOARD_RELOAD=1 (dev
 auto-restart on .py changes; static files always fresh), OPENAI_API_KEY.
-CLI: python3 server.py hash-password   (prints a JOBBOARD_PASSWORD_HASH value)
+CLI: python3 server.py hash-password        (prints a JOBBOARD_PASSWORD_HASH value)
+     python3 server.py issue-token <name>   (admin: mint a bearer token directly in the DB)
 """
 import json
 import os
@@ -582,6 +583,13 @@ def _watch_and_reexec(paths, interval=1.0):
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 2 and sys.argv[1] == "issue-token":
+        # Admin path for whoever can exec inside the container (host access = full access anyway).
+        c = J.db()
+        c.execute(auth.SCHEMA)
+        tid, tok = auth.issue_token(c, sys.argv[2], J.now())
+        print(tok)
+        sys.exit(0)
     if len(sys.argv) > 1 and sys.argv[1] == "hash-password":
         import getpass
         pw = getpass.getpass("password: ")

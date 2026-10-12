@@ -22,16 +22,16 @@ services:
   jobboard:
     build: .
     container_name: jobboard
-    working_dir: /app
+    working_dir: /repo/jobboard
     depends_on:
       db:
         condition: service_healthy
     environment:
       PORT: "8080"
-      JOBSCAN_DIR: /app/jobscan
+      JOBSCAN_DIR: /repo/jobscan
       JOBSCAN_DSN: postgresql://jobscan:${POSTGRES_PASSWORD}@db:5432/jobscan
-      EXPERIENCE_MD: /app/EXPERIENCE.md
-      APPLICATIONS_DIR: /app/applications
+      EXPERIENCE_MD: /repo/EXPERIENCE.md
+      APPLICATIONS_DIR: /repo/applications
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       JOBBOARD_AUTH: "1"
       JOBBOARD_PASSWORD_HASH: ${JOBBOARD_PASSWORD_HASH}
@@ -39,10 +39,7 @@ services:
       JOBBOARD_MCP_PORT: "8090"
       JOBBOARD_MCP_BIND: "0.0.0.0"          # inside the container; the host maps it to the WireGuard IP only
     volumes:
-      - ./:/app:ro
-      - ../jobscan:/app/jobscan:ro
-      - ../EXPERIENCE.md:/app/EXPERIENCE.md:ro
-      - ../applications:/app/applications:ro
+      - ../:/repo:ro                       # one read-only mount of the whole checkout (no nested mounts)
     ports:
       - "127.0.0.1:8080:8080"              # web + API: only via nginx
       - "10.88.0.1:8090:8090"              # MCP: only via WireGuard
