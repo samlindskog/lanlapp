@@ -78,6 +78,7 @@
   th.sel, td.sel { width: 28px; padding-right: 0; display: none; }
   body.select-mode th.sel, body.select-mode td.sel { display: table-cell; }
   td.sel input, th.sel input { cursor: pointer; }
+  body.select-mode tr.row td { user-select: none; }
   tr.row.selected td { background: color-mix(in srgb, var(--applied) 12%, transparent); }
   #layout { display: flex; align-items: flex-start; min-height: 100vh; }
   #content { flex: 1 1 auto; min-width: 0; }
@@ -476,7 +477,7 @@
   $("#bulkClose").addEventListener("click", exitSelectMode);
   $("#rows").addEventListener("click", (e) => {
     const cb = e.target.closest("input[data-sel]"); if (!cb) return;
-    e.stopPropagation();
+    if (e.shiftKey) { const sel = document.getSelection(); if (sel) sel.removeAllRanges(); }
     const id = Number(cb.dataset.sel), want = cb.checked;
     let ids = [id];
     if (e.shiftKey && state.lastClicked != null) {
@@ -519,7 +520,6 @@
       await reload();
     } catch (err) { setRun("failed", `status [${id}] failed: ${err.message}`); render(); }
   });
-  $("#rows").addEventListener("click", (e) => { if (e.target.closest("details, a, select, input[data-sel]")) e.stopPropagation(); }, true);
 
   reload().then((d) => {
     if (d.active_run) pollRun(d.active_run.id);
