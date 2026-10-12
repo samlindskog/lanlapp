@@ -348,14 +348,15 @@
     render();
     return d;
   }
+  // One status line in the header for every background activity: scans, bulk
+  // refreshes and single-posting refreshes all report here in the same style.
+  const setRun = (status, text) => { const el = $("#run"); el.className = "runstat " + status; el.textContent = text; };
   let pollTimer = null;
   async function pollRun(id) {
     clearTimeout(pollTimer);
     const r = await (await fetch(`/api/runs/${id}`)).json();
-    const el = $("#run");
     const last = (r.log || "").trim().split("\n").pop() || "";
-    el.className = "runstat " + r.status;
-    el.textContent = `${r.kind} #${r.id} ${r.status}: ${last}`;
+    setRun(r.status, `${r.kind} #${r.id} ${r.status}: ${last}`);
     if (r.status === "running") pollTimer = setTimeout(() => pollRun(id), 1500);
     else { reload(); }
   }
@@ -379,19 +380,25 @@
     const f = new FormData(e.target);
     const body = { source: f.get("source"), days: Number(f.get("days") || 7), all: !!f.get("all"), refetch: !!f.get("refetch") };
     $("#scanDlg").close();
+    setRun("running", `scan ${body.source}: starting…`);
     try { const d = await post("/api/scan", body); pollRun(d.run_id); }
-    catch (err) { $("#run").className = "runstat failed"; $("#run").textContent = err.message; }
+    catch (err) { setRun("failed", `scan failed: ${err.message}`); }
   });
   $("#refreshAll").addEventListener("click", async () => {
+    setRun("running", "refresh open matches: starting…");
     try { const d = await post("/api/refresh", { filter: "open-qualifying" }); pollRun(d.run_id); }
-    catch (e) { $("#run").className = "runstat failed"; $("#run").textContent = e.message; }
+    catch (e) { setRun("failed", `refresh failed: ${e.message}`); }
   });
   $("#rows").addEventListener("click", async (e) => {
     const b = e.target.closest("button[data-act=refresh]"); if (!b) return;
     e.stopPropagation(); b.disabled = true;
-    const flash = document.getElementById(`flash-${b.dataset.id}`);
-    try { const d = await post(`/api/jobs/${b.dataset.id}/refresh`); flash.textContent = `refreshed; closes ${d.job.close_date || "?"}`; await reload(); loadDocs(Number(b.dataset.id)); }
-    catch (err) { flash.textContent = err.message; }
+    const id = Number(b.dataset.id), job = state.jobs.find((j) => j.id === id);
+    setRun("running", `refresh [${id}] ${job ? job.title : ""}: fetching…`);
+    try {
+      const d = await post(`/api/jobs/${id}/refresh`);
+      setRun("done", `refresh [${id}] ${job ? job.title : ""} done: ${d.refresh.refetched} page(s), closes ${d.job.close_date || "?"}, fetched ${fmtLocal(d.job.last_fetched)}`);
+      await reload(); loadDocs(id);
+    } catch (err) { setRun("failed", `refresh [${id}] failed: ${err.message}`); }
     b.disabled = false;
   });
   $("#rows").addEventListener("submit", async (e) => {
