@@ -74,6 +74,7 @@
   select.status.a-applied { background: var(--applied); } select.status.a-drafted { background: #6b5ca5; }
   select.status.a-skipped, select.status.a-withdrawn { background: var(--none); }
   select.status.big { font-size: 13px; }
+  select.status { width: 7.2em; text-align: center; }
   select.status.v-yes, select.status.v-maybe, select.status.v-no { color: #fff; border-color: transparent; }
   select.status.v-yes { background: var(--yes); } select.status.v-maybe { background: var(--maybe); } select.status.v-no { background: var(--no); }
   details.reason summary { color: var(--muted); font-size: 12px; }
@@ -297,7 +298,8 @@
   // A verdict counts as overridden when the latest one is yours and differs from Claude's latest.
   const overridden = (j) => j.verdict_author === "user" && j.claude_verdict && j.verdict !== j.claude_verdict;
   function verdictSelect(j, v, extraClass = "") {
-    const reset = j.claude_verdict && v !== j.claude_verdict ? `<option value="__reset">reset to claude's (${j.claude_verdict})</option>` : "";
+    // Short label: a <select> sizes itself to its longest option, so a long reset label stretched the pill.
+    const reset = j.claude_verdict && v !== j.claude_verdict ? `<option value="__reset" title="reset to Claude's verdict (${j.claude_verdict})">↺ ${j.claude_verdict}</option>` : "";
     return `<select class="status v-${v} ${extraClass}" data-verdict="${j.id}" title="Set verdict (saved immediately)" onclick="event.stopPropagation()">
       <option value="" ${v === "none" ? "selected" : ""}>unjudged</option>
       ${VERDICTS.map((x) => `<option value="${x}" ${v === x ? "selected" : ""}>${x}</option>`).join("")}${reset}
