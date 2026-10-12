@@ -6,6 +6,7 @@ Agent API  : JSON over HTTP, documented at GET /api  (also in .claude/skills/job
 
   GET  /api                       this API description
   GET  /api/stats                 counts, db path, available sources
+  GET  /files/<path>              a resume PDF/TEX under applications/, served inline (view in browser)
   GET  /api/sources               scan workflows available: name, display_name, board_url, last_scan
   GET  /api/profile-hash          sha1 prefix of EXPERIENCE.md (record on verdicts)
   GET  /api/jobs?verdict=yes,maybe&action=none&open=1&source=&days=&q=&pending=1
@@ -44,6 +45,7 @@ STATIC = os.path.join(HERE, "static")
 PORT = int(os.environ.get("PORT", "8080"))
 TOKEN = os.environ.get("JOBBOARD_TOKEN")
 EXPERIENCE = os.environ.get("EXPERIENCE_MD", os.path.join(JOBSCAN_DIR, "..", "EXPERIENCE.md"))
+APPLICATIONS = os.path.abspath(os.environ.get("APPLICATIONS_DIR", os.path.join(JOBSCAN_DIR, "..", "applications")))
 
 API_DOC = __doc__
 
@@ -88,6 +90,26 @@ def _active_run():
     r = conn.execute("SELECT id, kind FROM runs WHERE status='running' ORDER BY id DESC LIMIT 1").fetchone()
     conn.close()
     return dict(r) if r else None
+
+
+def _resume_files(resume_dir):
+    """PDF/TEX files for a job's resume_dir ("applications/x" or "a / b"), as
+    paths relative to applications/ for the /files/ route."""
+    if not resume_dir:
+        return []
+    out = []
+    for part in resume_dir.split(" / "):
+        rel = part.strip()
+        if rel.startswith("applications/"):
+            rel = rel[len("applications/"):]
+        d = os.path.join(APPLICATIONS, rel)
+        if not os.path.isdir(d):
+            continue
+        for f in sorted(os.listdir(d)):
+            if f.lower().endswith((".pdf", ".tex")):
+                out.append({"name": f, "path": f"{rel}/{f}"})
+    out.sort(key=lambda x: (not x["name"].endswith(".pdf"), x["name"]))
+    return out
 
 
 # ------------------------------------------------------------ handler
@@ -153,6 +175,8 @@ class Handler(SimpleHTTPRequestHandler):
                                    pending_only=qs.get("pending") in ("1", "true"),
                                    q=qs.get("q") or None)
                 conn.close()
+                for r in rows:
+                    r["resume_files"] = _resume_files(r.get("resume_dir"))
                 return self._json({"jobs": rows, "count": len(rows), "active_run": _active_run()})
             if path.startswith("/api/jobs/"):
                 parts = path.split("/")
@@ -195,6 +219,8 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._json(dict(r) if r else {"error": "not found"}, 200 if r else 404)
             if path.startswith("/api/"):
                 return self._json({"error": "unknown endpoint", "see": "/api"}, 404)
+            if path.startswith("/files/"):
+                return self._serve_file(path[len("/files/"):])
         except KeyError as e:
             return self._json({"error": f"not found: {e}"}, 404)
         except (ValueError, IndexError) as e:
@@ -289,6 +315,27 @@ class Handler(SimpleHTTPRequestHandler):
             return self._json({"error": str(e)}, 400)
         except Exception as e:  # noqa: BLE001
             return self._json({"error": str(e), "trace": traceback.format_exc()}, 500)
+
+    def _serve_file(self, rel):
+        from urllib.parse import unquote
+        rel = unquote(rel)
+        full = os.path.abspath(os.path.join(APPLICATIONS, rel))
+        if not full.startswith(APPLICATIONS + os.sep) or not os.path.isfile(full):
+            return self._json({"error": "not found"}, 404)
+        ext = os.path.splitext(full)[1].lower()
+        ctype = {".pdf": "application/pdf", ".tex": "text/plain; charset=utf-8",
+                 ".txt": "text/plain; charset=utf-8", ".md": "text/plain; charset=utf-8"}.get(ext)
+        if not ctype:
+            return self._json({"error": "only pdf/tex/txt/md are served"}, 403)
+        with open(full, "rb") as f:
+            data = f.read()
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Disposition", f'inline; filename="{os.path.basename(full)}"')
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
 
     def _sources(self):
         conn = J.db()

@@ -8,12 +8,14 @@ services:
       PORT: "8080"
       JOBSCAN_DIR: /app/jobscan
       EXPERIENCE_MD: /app/EXPERIENCE.md
+      APPLICATIONS_DIR: /app/applications
       JOBBOARD_RELOAD: "1"               # dev: auto-restart on .py changes; static files always fresh
       # JOBBOARD_TOKEN: change-me   # uncomment to require X-Token on writes
     volumes:
       - ./:/app                          # server.py + static/, live
       - ../jobscan:/app/jobscan          # read-write: scans and verdicts write here
       - ../EXPERIENCE.md:/app/EXPERIENCE.md:ro
+      - ../applications:/app/applications:ro   # resumes, served inline at /files/
     ports:
       - "8080:8080"
     restart: unless-stopped
