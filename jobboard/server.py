@@ -20,7 +20,7 @@ Agent API  : JSON over HTTP, documented at GET /api  (also in .claude/skills/job
   POST /api/jobs/<id>/refresh     re-fetch the posting now (synchronous)
   POST /api/scan                  {source, days?:7, all?:false, refetch?:false}  -> {run_id}
   POST /api/refresh               {ids?:[..]} or {filter:"open-qualifying"}       -> {run_id}
-  GET  /api/runs  /api/runs/<id>  background run status + log
+  GET  /api/runs  /api/runs/<id>  background run status + log (scans persist; refresh runs are transient, ids like t3)
 
 Standard library only. Env: JOBSCAN_DIR (default ../jobscan), PORT (8080),
 JOBBOARD_TOKEN (optional; if set, writes need header X-Token),
@@ -51,16 +51,29 @@ APPLICATIONS = os.path.abspath(os.environ.get("APPLICATIONS_DIR", os.path.join(J
 API_DOC = __doc__
 
 # ------------------------------------------------------------ background runs
+# Scans are recorded in the runs table (the Scan dialog shows the last one per
+# board). Refreshes are transient: tracked in memory only while they run, with
+# nothing persisted and no run numbers.
 _run_lock = threading.Lock()
+_transient = {}          # id -> dict(kind, status, started_at, finished_at, log, summary)
+_transient_seq = 0
 
 
-def _start_run(kind, args, target):
-    conn = J.db()
-    cur = conn.execute("INSERT INTO runs (kind, args, status, started_at, log) VALUES (?,?,?,?,?)",
-                       (kind, json.dumps(args), "running", J.now(), ""))
-    run_id = cur.lastrowid
-    conn.commit()
-    conn.close()
+def _start_run(kind, args, target, persist=True):
+    global _transient_seq
+    if persist:
+        conn = J.db()
+        cur = conn.execute("INSERT INTO runs (kind, args, status, started_at, log) VALUES (?,?,?,?,?)",
+                           (kind, json.dumps(args), "running", J.now(), ""))
+        run_id = cur.lastrowid
+        conn.commit()
+        conn.close()
+    else:
+        with _run_lock:
+            _transient_seq += 1
+            run_id = f"t{_transient_seq}"
+            _transient[run_id] = {"id": run_id, "kind": kind, "args": json.dumps(args), "status": "running",
+                                  "started_at": J.now(), "finished_at": None, "log": "", "summary": None}
 
     def worker():
         rconn = J.db()
@@ -68,18 +81,26 @@ def _start_run(kind, args, target):
 
         def log(msg):
             lines.append(str(msg))
-            rconn.execute("UPDATE runs SET log=? WHERE id=?", ("\n".join(lines), run_id))
-            rconn.commit()
+            if persist:
+                rconn.execute("UPDATE runs SET log=? WHERE id=?", ("\n".join(lines), run_id))
+                rconn.commit()
+            else:
+                _transient[run_id]["log"] = "\n".join(lines)
+
+        def finish(status, summary=None):
+            if persist:
+                rconn.execute("UPDATE runs SET status=?, finished_at=?, summary=? WHERE id=?",
+                              (status, J.now(), json.dumps(summary) if summary is not None else None, run_id))
+                rconn.commit()
+            else:
+                _transient[run_id].update(status=status, finished_at=J.now(),
+                                          summary=json.dumps(summary) if summary is not None else None)
 
         try:
-            summary = target(rconn, log)
-            rconn.execute("UPDATE runs SET status='done', finished_at=?, summary=? WHERE id=?",
-                          (J.now(), json.dumps(summary), run_id))
+            finish("done", target(rconn, log))
         except Exception:  # noqa: BLE001
             log(traceback.format_exc())
-            rconn.execute("UPDATE runs SET status='failed', finished_at=? WHERE id=?",
-                          (J.now(), run_id))
-        rconn.commit()
+            finish("failed")
         rconn.close()
 
     threading.Thread(target=worker, name=f"run-{run_id}", daemon=True).start()
@@ -87,8 +108,24 @@ def _start_run(kind, args, target):
 
 
 def _active_run():
+    for r in _transient.values():
+        if r["status"] == "running":
+            return {"id": r["id"], "kind": r["kind"]}
     conn = J.db()
     r = conn.execute("SELECT id, kind FROM runs WHERE status='running' ORDER BY id DESC LIMIT 1").fetchone()
+    conn.close()
+    return dict(r) if r else None
+
+
+def _get_run(rid):
+    if rid in _transient:
+        return dict(_transient[rid])
+    try:
+        rid = int(rid)
+    except ValueError:
+        return None
+    conn = J.db()
+    r = conn.execute("SELECT * FROM runs WHERE id=?", (rid,)).fetchone()
     conn.close()
     return dict(r) if r else None
 
@@ -213,11 +250,8 @@ class Handler(SimpleHTTPRequestHandler):
                 conn.close()
                 return self._json({"runs": rows})
             if path.startswith("/api/runs/"):
-                rid = int(path.rsplit("/", 1)[1])
-                conn = J.db()
-                r = conn.execute("SELECT * FROM runs WHERE id=?", (rid,)).fetchone()
-                conn.close()
-                return self._json(dict(r) if r else {"error": "not found"}, 200 if r else 404)
+                r = _get_run(path.rsplit("/", 1)[1])
+                return self._json(r if r else {"error": "not found"}, 200 if r else 404)
             if path.startswith("/api/"):
                 return self._json({"error": "unknown endpoint", "see": "/api"}, 404)
             if path.startswith("/files/"):
@@ -273,7 +307,7 @@ class Handler(SimpleHTTPRequestHandler):
                         except Exception as e:  # noqa: BLE001
                             log(f"[{i}] failed: {e}")
                     return {"refreshed": len(out), "ids": ids}
-                rid = _start_run("refresh", {"ids": ids}, work)
+                rid = _start_run("refresh", {"ids": ids}, work, persist=False)
                 return self._json({"run_id": rid, "status": "running", "count": len(ids)}, 202)
             if path == "/api/jobs":
                 conn = J.db()

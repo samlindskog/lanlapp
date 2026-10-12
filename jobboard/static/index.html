@@ -416,7 +416,7 @@
     clearTimeout(pollTimer);
     const r = await (await fetch(`/api/runs/${id}`)).json();
     const last = (r.log || "").trim().split("\n").pop() || "";
-    setRun(r.status, `${r.kind} #${r.id} ${r.status}: ${last}`);
+    setRun(r.status, `${r.kind} ${r.status}: ${last}`);
     if (r.status === "running") pollTimer = setTimeout(() => pollRun(id), 1500);
     else { reload(); }
   }
