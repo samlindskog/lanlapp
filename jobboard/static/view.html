@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Resume</title>
+<style>
+  :root { --bg: #e9e9e6; --fg: #1c1c1c; --card: #fff; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #16181a; --fg: #e6e6e3; --card: #fff; } }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 13px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+  header { padding: 8px 14px; display: flex; gap: 14px; align-items: center; }
+  header a { color: inherit; }
+  #pages { display: flex; flex-direction: column; align-items: center; gap: 14px; padding: 0 10px 30px; }
+  canvas { background: var(--card); box-shadow: 0 2px 12px rgba(0,0,0,.25); max-width: 100%; height: auto; }
+  #msg { padding: 20px; }
+</style>
+</head>
+<body>
+<header><span id="name"></span><a id="raw" href="#" target="_blank" rel="noopener">open raw PDF</a></header>
+<div id="msg"></div>
+<div id="pages"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.6.82/pdf.min.mjs" type="module"></script>
+<script type="module">
+  import * as pdfjsLib from "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.6.82/pdf.min.mjs";
+  pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.6.82/pdf.worker.min.mjs";
+  const f = new URLSearchParams(location.search).get("f");
+  const msg = document.getElementById("msg");
+  if (!f) { msg.textContent = "no file given"; }
+  else {
+    const url = "/files/" + encodeURI(f);
+    document.title = f.split("/").pop();
+    document.getElementById("name").textContent = f;
+    document.getElementById("raw").href = url;
+    try {
+      const pdf = await pdfjsLib.getDocument(url).promise;
+      const scale = Math.min(2, (Math.min(window.innerWidth - 40, 1000) / 612) * window.devicePixelRatio);
+      for (let n = 1; n <= pdf.numPages; n++) {
+        const page = await pdf.getPage(n);
+        const vp = page.getViewport({ scale });
+        const canvas = document.createElement("canvas");
+        canvas.width = vp.width; canvas.height = vp.height;
+        canvas.style.width = (vp.width / window.devicePixelRatio) + "px";
+        document.getElementById("pages").appendChild(canvas);
+        await page.render({ canvasContext: canvas.getContext("2d"), viewport: vp }).promise;
+      }
+    } catch (e) { msg.textContent = "could not render PDF: " + e.message; }
+  }
+</script>
+</body>
+</html>

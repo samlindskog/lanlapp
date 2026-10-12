@@ -6,7 +6,7 @@ Agent API  : JSON over HTTP, documented at GET /api  (also in .claude/skills/job
 
   GET  /api                       this API description
   GET  /api/stats                 counts, db path, available sources
-  GET  /files/<path>              a resume PDF/TEX under applications/, served inline (view in browser)
+  GET  /files/<path>              a resume PDF under applications/ (raw); /view.html?f=<path> renders it in-page
   GET  /api/sources               scan workflows available: name, display_name, board_url, last_scan
   GET  /api/profile-hash          sha1 prefix of EXPERIENCE.md (record on verdicts)
   GET  /api/jobs?verdict=yes,maybe&action=none&open=1&source=&days=&q=&pending=1
@@ -106,9 +106,8 @@ def _resume_files(resume_dir):
         if not os.path.isdir(d):
             continue
         for f in sorted(os.listdir(d)):
-            if f.lower().endswith((".pdf", ".tex")):
+            if f.lower().endswith(".pdf"):
                 out.append({"name": f, "path": f"{rel}/{f}"})
-    out.sort(key=lambda x: (not x["name"].endswith(".pdf"), x["name"]))
     return out
 
 

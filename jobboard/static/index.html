@@ -273,7 +273,7 @@
         <div>Verdict: <b>${esc(verdictOf(j))}</b> ${j.eligible_grades ? `(${esc(j.eligible_grades)})` : ""}</div>
         <div>Reason: <b>${esc(j.verdict_reason || "—")}</b></div>
         <div>Status: <b>${esc(actionOf(j))}</b> ${j.action_date ? esc(j.action_date) : ""}</div>
-        <div>Resume: ${(j.resume_files || []).length ? (j.resume_files.map((f) => `<a href="/files/${encodeURI(f.path)}" target="_blank" rel="noopener">${esc(f.name)}</a>`).join(" · ")) : `<b>${esc(j.resume_dir || "—")}</b>`}</div>
+        <div>Resume: ${(j.resume_files || []).filter((f) => f.name.toLowerCase().endsWith(".pdf")).map((f) => `<a href="/view.html?f=${encodeURIComponent(f.path)}" target="_blank" rel="noopener">${esc(f.path)}</a>`).join(" · ") || `<b>${esc(j.resume_dir || "—")}</b>`}</div>
         <div>Note: <b>${esc(j.action_note || "—")}</b></div>
         <div>Opens / closes: <b>${esc(j.open_date || "?")} / ${esc(j.close_date || "?")}</b></div>
         <div>Salary: <b>${esc(j.salary || "—")}</b></div>
