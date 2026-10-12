@@ -48,7 +48,7 @@ rm -f /etc/nftables.d/hermes-*.nft 2>/dev/null || true
 docker ps -aq --filter name=hermes | xargs -r docker rm -f >/dev/null 2>&1 || true
 docker network ls -q --filter name=hermes | xargs -r docker network rm >/dev/null 2>&1 || true
 docker volume ls -q --filter name=hermes | xargs -r docker volume rm >/dev/null 2>&1 || true
-rm -rf /opt/hermes-hub
+rm -rf /opt/hermes-hub /etc/sudoers.d/hermes
 systemctl disable --now redis-server slapd 2>/dev/null || true
 apt-get purge -y -qq redis-server slapd >/dev/null 2>&1 || true
 apt-get autoremove -y -qq >/dev/null 2>&1 || true
