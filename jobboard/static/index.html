@@ -100,6 +100,8 @@
   summary { cursor: pointer; color: var(--accent); }
   pre { white-space: pre-wrap; font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
         background: var(--bg); padding: 10px; border-radius: 6px; max-height: 420px; overflow: auto; }
+  pre.expanded { max-height: none; }
+  button.more { margin: 4px 0 8px; font-size: 12px; }
   @media (max-width: 800px) {
     th.hide-sm, td.hide-sm { display: none; }
     th { top: auto; position: static; }
@@ -355,8 +357,8 @@
         const preview = key ? `${prim.key_section}\n\n${key.slice(0, 3000)}` : text.slice(0, 1500);
         const truncated = key ? key.length > 3000 : text.length > 1500;
         return `<details ${isPrimary ? "open" : ""}><summary>${esc(x.kind)} · ${esc(fmtLocal(x.fetched_at))} · ${text.length.toLocaleString()} chars</summary>
-          <pre>${esc(preview)}${truncated ? "\n…" : ""}</pre>
-          <details><summary>full text</summary><pre>${esc(text)}</pre></details></details>`;
+          <pre class="doc" data-full="${esc(text)}" data-preview="${esc(preview)}">${esc(preview)}</pre>
+          ${truncated ? `<button class="more" data-more="1">Show full text</button>` : ""}</details>`;
       }).join("") : '<em style="color:var(--muted)">no stored documents</em>';
     } catch (e) { el.textContent = "failed to load: " + e; }
   }
@@ -379,7 +381,7 @@
     render();
   }));
   $("#rows").addEventListener("click", (e) => {
-    if (e.target.closest("input[data-sel], select, a, details")) return;
+    if (e.target.closest("input[data-sel], select, a, details, button")) return;
     const tr = e.target.closest("tr.row"); if (!tr) return;
     const id = Number(tr.dataset.id);
     state.open = state.open === id ? null : id; render();
@@ -506,6 +508,15 @@
     setRun(fail ? "failed" : "done", `bulk status: ${action} set on ${ok} job(s)${fail ? `, ${fail} failed` : ""}`);
     state.selected.clear(); state.lastClicked = null; $("#bulkNote").value = "";
     await reload();
+  });
+  $("#rows").addEventListener("click", (e) => {
+    const b = e.target.closest("button[data-more]"); if (!b) return;
+    e.stopPropagation();
+    const pre = b.previousElementSibling, full = b.dataset.more === "1";
+    pre.textContent = full ? pre.dataset.full : pre.dataset.preview;
+    pre.classList.toggle("expanded", full);
+    b.dataset.more = full ? "0" : "1";
+    b.textContent = full ? "Show less" : "Show full text";
   });
   $("#rows").addEventListener("change", async (e) => {
     const sel = e.target.closest("select[data-status]"); if (!sel) return;
