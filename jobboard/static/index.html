@@ -101,6 +101,7 @@
   pre { white-space: pre-wrap; font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
         background: var(--bg); padding: 10px; border-radius: 6px; max-height: 420px; overflow: auto; }
   pre.expanded { max-height: none; }
+  pre.doc { max-height: 70vh; }
   button.more { margin: 4px 0 8px; font-size: 12px; }
   @media (max-width: 800px) {
     th.hide-sm, td.hide-sm { display: none; }
@@ -353,12 +354,13 @@
       el.innerHTML = docs.length ? docs.map((x) => {
         const text = x.text || "";
         const isPrimary = x.id === prim.doc_id;
-        const key = isPrimary && prim.key_section && prim.sections && prim.sections[prim.key_section];
-        const preview = key ? `${prim.key_section}\n\n${key.slice(0, 3000)}` : text.slice(0, 1500);
-        const truncated = key ? key.length > 3000 : text.length > 1500;
+        // Primary document: every section the adapter found, in page order, each under its heading.
+        const secs = isPrimary && prim.sections && Object.keys(prim.sections).length ? prim.sections : null;
+        const preview = secs ? Object.entries(secs).map(([h, t]) => `${h.toUpperCase()}\n${t}`).join("\n\n\n") : text.slice(0, 1500);
+        const truncated = secs ? false : text.length > 1500;
         return `<details ${isPrimary ? "open" : ""}><summary>${esc(x.kind)} · ${esc(fmtLocal(x.fetched_at))} · ${text.length.toLocaleString()} chars</summary>
           <pre class="doc" data-full="${esc(text)}" data-preview="${esc(preview)}">${esc(preview)}</pre>
-          ${truncated ? `<button class="more" data-more="1">Show full text</button>` : ""}</details>`;
+          ${truncated || secs ? `<button class="more" data-more="1">${secs ? "Show raw page text" : "Show full text"}</button>` : ""}</details>`;
       }).join("") : '<em style="color:var(--muted)">no stored documents</em>';
     } catch (e) { el.textContent = "failed to load: " + e; }
   }
@@ -513,10 +515,11 @@
     const b = e.target.closest("button[data-more]"); if (!b) return;
     e.stopPropagation();
     const pre = b.previousElementSibling, full = b.dataset.more === "1";
+    if (!b.dataset.label) b.dataset.label = b.textContent;
     pre.textContent = full ? pre.dataset.full : pre.dataset.preview;
     pre.classList.toggle("expanded", full);
     b.dataset.more = full ? "0" : "1";
-    b.textContent = full ? "Show less" : "Show full text";
+    b.textContent = full ? "Show less" : (b.dataset.label || "Show full text");
   });
   $("#rows").addEventListener("change", async (e) => {
     const sel = e.target.closest("select[data-status]"); if (!sel) return;

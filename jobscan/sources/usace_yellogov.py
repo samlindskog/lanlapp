@@ -52,7 +52,8 @@ def sections(text, kind="usajobs_announcement"):
         body = "\n".join(lines[i + 1:j]).strip()
         if body and len(body) > len(best.get(name, (0, ""))[1]):
             best[name] = (i, body)
-    return {name: body for name, (i, body) in sorted(best.items(), key=lambda kv: kv[1][0])}
+    # Present in the page's canonical order (Summary, Duties, Requirements, ...).
+    return {name: best[name][1] for name in heads if name in best}
 
 
 CARD_RE = re.compile(
