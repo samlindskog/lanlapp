@@ -84,6 +84,13 @@ for f in /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf; do
     sed -i -E 's/^(AllowGroups.*)$/\1 deploy/' "$f"; SSHD_CHANGED=1; fi
 done
 if [ "$SSHD_CHANGED" = 1 ]; then sshd -t && systemctl reload ssh && echo "sshd: deploy added to AllowUsers/AllowGroups"; fi
+# Unlock the account for key-based login (useradd leaves '!' in the shadow field; some PAM/sshd
+# setups treat that as locked) and show what sshd will do for deploy.
+usermod -p '*' deploy 2>/dev/null || true
+echo "sshd for deploy: $(sshd -T -C user=deploy,host=x,addr=203.0.113.1 2>/dev/null | grep -E '^(allowusers|pubkeyauthentication|strictmodes|authorizedkeysfile)' | tr '\n' ' ')"
+echo "authorized_keys: $(ssh-keygen -lf /home/deploy/.ssh/authorized_keys 2>&1)"
+echo "shadow: $(getent shadow deploy | cut -d: -f2 | cut -c1-2)…  home: $(stat -c '%A %U' /home/deploy) .ssh: $(stat -c '%A %U' /home/deploy/.ssh)"
+echo "recent sshd lines for deploy:"; journalctl -u ssh --since "30 min ago" --no-pager 2>/dev/null | grep -i deploy | tail -4 || true
 
 log "checkout $APP"
 if [ ! -d "$APP/.git" ]; then
@@ -169,6 +176,22 @@ echo "input: ssh 22, wireguard udp $WG_PORT, https 443, mcp $MCP_PORT on $WG_IF 
 
 log "first deploy"
 su - deploy -c "$APP/deploy/deploy.sh"
+
+log "database restore (if a dump is staged and the jobs table is empty)"
+DUMP=/tmp/jobscan-dump.sql.gz
+if [ -f "$DUMP" ]; then
+  N=$(su - deploy -c "cd $APP && docker compose -f jobboard/compose.prod.yaml --env-file .env exec -T db psql -U jobscan -d jobscan -tAc 'SELECT COUNT(*) FROM jobs'" 2>/dev/null | tail -1 || echo "?")
+  if [ "$N" = "0" ]; then
+    su - deploy -c "cd $APP && gunzip -c $DUMP | docker compose -f jobboard/compose.prod.yaml --env-file .env exec -T db psql -U jobscan -d jobscan -q -v ON_ERROR_STOP=0" >/tmp/jobscan-restore.log 2>&1 || true
+    N2=$(su - deploy -c "cd $APP && docker compose -f jobboard/compose.prod.yaml --env-file .env exec -T db psql -U jobscan -d jobscan -tAc 'SELECT COUNT(*) FROM jobs'" 2>/dev/null | tail -1)
+    echo "restored: jobs=$N2 (log: /tmp/jobscan-restore.log, errors: $(grep -c ERROR /tmp/jobscan-restore.log || true))"
+    rm -f "$DUMP"
+  else
+    echo "jobs table has $N rows; dump left untouched"
+  fi
+else
+  echo "no dump staged at $DUMP"
+fi
 
 log "api token for Claude"
 if [ ! -f "$HERE/claude-token" ]; then
