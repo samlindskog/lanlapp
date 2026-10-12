@@ -106,6 +106,16 @@ CREATE TABLE IF NOT EXISTS actions (
     note TEXT
 );
 CREATE INDEX IF NOT EXISTS actions_job ON actions(job_id);
+CREATE TABLE IF NOT EXISTS runs (
+    id INTEGER PRIMARY KEY,
+    kind TEXT NOT NULL,            -- scan | refresh
+    args TEXT,                     -- json
+    status TEXT NOT NULL,          -- running | done | failed
+    started_at TEXT,
+    finished_at TEXT,
+    log TEXT,
+    summary TEXT                   -- json
+);
 """
 
 
@@ -118,9 +128,11 @@ def today():
     return dt.date.today().isoformat()
 
 
-def db():
-    conn = sqlite3.connect(DB_PATH)
+def db(path=None):
+    conn = sqlite3.connect(path or DB_PATH, timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
     conn.executescript(SCHEMA)
     return conn
 
@@ -250,50 +262,63 @@ def grade_str(j):
     return f"{pp}-{j['grade_low']}"
 
 
-# ----------------------------------------------------------------- commands
-def cmd_scan(a):
-    src = load_source(a.source)
-    conn = db()
+# ----------------------------------------------------------------- library
+def _store_documents(conn, job_id, docs):
+    for d in docs:
+        conn.execute("""INSERT INTO documents (job_id, kind, url, fetched_at, raw_html, text)
+            VALUES (?,?,?,?,?,?)""",
+                     (job_id, d["kind"], d.get("url"), now(),
+                      pack_html(d.get("raw_html")), d.get("text")))
+
+
+def _update_fields(conn, job_id, fields, age_days=None):
+    conn.execute("""UPDATE jobs SET title=?, location=?, announcement_no=?, external_url=?,
+        board_url=?, series=?, pay_plan=?, grade_low=?, grade_high=?, salary=?, open_date=?,
+        close_date=?, posted_age_days=COALESCE(?, posted_age_days), last_seen=? WHERE id=?""",
+                 (fields.get("title"), fields.get("location"), fields.get("announcement_no"),
+                  fields.get("external_url"), fields.get("board_url"), fields.get("series"),
+                  fields.get("pay_plan"), fields.get("grade_low"), fields.get("grade_high"),
+                  fields.get("salary"), fields.get("open_date"), fields.get("close_date"),
+                  age_days, now(), job_id))
+
+
+def scan_source(conn, source_name, days=7, all_=False, limit=None, refetch=False,
+                max_pages=100, log=print):
+    """Fetch new postings from a board into the database. Returns a summary dict.
+
+    Incremental: known (source, source_id) pairs are not re-fetched unless
+    refetch=True. A new job whose announcement number was already judged under
+    another board id inherits that verdict."""
+    src = load_source(source_name)
     conn.execute("INSERT OR REPLACE INTO sources VALUES (?,?,?)",
-                 (a.source, src.DISPLAY_NAME, src.BOARD_URL))
+                 (source_name, src.DISPLAY_NAME, src.BOARD_URL))
     conn.commit()
-    cards = src.list_jobs(fetch, since_days=None if a.all else a.days,
-                          max_pages=a.max_pages)
-    print(f"{len(cards)} cards from {src.DISPLAY_NAME}")
+    cards = src.list_jobs(fetch, since_days=None if all_ else days, max_pages=max_pages)
+    log(f"{len(cards)} cards from {src.DISPLAY_NAME}")
     new = updated = carried = 0
     need_judgment = []
     for i, card in enumerate(cards):
-        if a.limit and new >= a.limit:
+        if limit and new >= limit:
             break
         row = conn.execute("SELECT id FROM jobs WHERE source=? AND source_id=?",
-                           (a.source, card["source_id"])).fetchone()
-        if row and not a.refetch:
+                           (source_name, card["source_id"])).fetchone()
+        if row and not refetch:
             conn.execute("UPDATE jobs SET last_seen=?, posted_age_days=? WHERE id=?",
                          (now(), card.get("age_days"), row["id"]))
             updated += 1
             continue
-        print(f"[{i+1}/{len(cards)}] {card['title']} — {card.get('location','')}")
+        log(f"[{i+1}/{len(cards)}] {card['title']} — {card.get('location','')}")
         docs = src.fetch_job(fetch, card)
         fields = src.parse_fields(card, docs)
         if row:
             job_id = row["id"]
-            conn.execute("""UPDATE jobs SET title=?, location=?, announcement_no=?,
-                external_url=?, board_url=?, series=?, pay_plan=?, grade_low=?,
-                grade_high=?, salary=?, open_date=?, close_date=?, posted_age_days=?,
-                last_seen=? WHERE id=?""",
-                         (fields.get("title"), fields.get("location"),
-                          fields.get("announcement_no"), fields.get("external_url"),
-                          fields.get("board_url"), fields.get("series"),
-                          fields.get("pay_plan"), fields.get("grade_low"),
-                          fields.get("grade_high"), fields.get("salary"),
-                          fields.get("open_date"), fields.get("close_date"),
-                          card.get("age_days"), now(), job_id))
+            _update_fields(conn, job_id, fields, card.get("age_days"))
         else:
             cur = conn.execute("""INSERT INTO jobs (source, source_id, title, location,
                 announcement_no, external_url, board_url, series, pay_plan, grade_low,
                 grade_high, salary, open_date, close_date, posted_age_days, first_seen,
                 last_seen) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                               (a.source, card["source_id"], fields.get("title"),
+                               (source_name, card["source_id"], fields.get("title"),
                                 fields.get("location"), fields.get("announcement_no"),
                                 fields.get("external_url"), fields.get("board_url"),
                                 fields.get("series"), fields.get("pay_plan"),
@@ -303,8 +328,6 @@ def cmd_scan(a):
                                 now(), now()))
             job_id = cur.lastrowid
             new += 1
-            # Same announcement already judged under another board id (multi-location
-            # postings, repostings)? Carry the verdict over instead of re-judging.
             prior = None
             if fields.get("announcement_no"):
                 prior = conn.execute("""
@@ -320,19 +343,194 @@ def cmd_scan(a):
                               now(), prior["profile_hash"]))
                 carried += 1
             else:
-                need_judgment.append((job_id, fields.get("title")))
-        for d in docs:
-            conn.execute("""INSERT INTO documents (job_id, kind, url, fetched_at,
-                raw_html, text) VALUES (?,?,?,?,?,?)""",
-                         (job_id, d["kind"], d.get("url"), now(),
-                          pack_html(d.get("raw_html")), d.get("text")))
+                need_judgment.append({"id": job_id, "title": fields.get("title")})
+        _store_documents(conn, job_id, docs)
         conn.commit()
-    print(f"done: {new} new, {updated} already known, {carried} verdicts carried over "
-          f"from the same announcement")
+    log(f"done: {new} new, {updated} already known, {carried} verdicts carried over "
+        f"from the same announcement")
     if need_judgment:
-        print(f"{len(need_judgment)} new jobs need judgment (run: pending):")
-        for jid, title in need_judgment:
-            print(f"  [{jid}] {title}")
+        log(f"{len(need_judgment)} new jobs need judgment (run: pending):")
+        for j in need_judgment:
+            log(f"  [{j['id']}] {j['title']}")
+    return {"cards": len(cards), "new": new, "known": updated, "carried": carried,
+            "need_judgment": need_judgment}
+
+
+def refresh_job(conn, job_id, log=print):
+    """Re-fetch a stored job's pages so dates, text and status are current.
+    Appends new documents; earlier fetches are kept."""
+    j = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+    if not j:
+        raise KeyError(job_id)
+    if j["source"] == "manual" or not j["board_url"]:
+        # Manual jobs: refetch the external url only, if any.
+        if not j["external_url"]:
+            return {"id": job_id, "refetched": 0}
+        st, body = fetch(j["external_url"])
+        if body:
+            _store_documents(conn, job_id, [{"kind": "posting", "url": j["external_url"],
+                                             "raw_html": body, "text": html_to_text(body)}])
+            conn.execute("UPDATE jobs SET last_seen=? WHERE id=?", (now(), job_id))
+            conn.commit()
+        return {"id": job_id, "refetched": 1 if body else 0}
+    src = load_source(j["source"])
+    card = {"source_id": j["source_id"], "title": j["title"], "location": j["location"],
+            "board_url": j["board_url"], "card_html": "", "age_days": None}
+    docs = [d for d in src.fetch_job(fetch, card) if d["kind"] != "board_card"]
+    fields = src.parse_fields(card, docs)
+    _update_fields(conn, job_id, fields)
+    _store_documents(conn, job_id, docs)
+    conn.commit()
+    log(f"refreshed [{job_id}] {fields.get('title')} closes {fields.get('close_date')}")
+    return {"id": job_id, "refetched": len(docs), "close_date": fields.get("close_date")}
+
+
+def search_documents(conn, query, kinds=None, limit=50, context=160):
+    """Case-insensitive AND search over stored document text (and job titles).
+    Returns one hit per job with snippets around the first match of each term."""
+    terms = [t.lower() for t in re.findall(r'"([^"]+)"|(\S+)', query) for t in t if t]
+    if not terms:
+        return []
+    sql = "SELECT d.id AS doc_id, d.job_id, d.kind, d.url, d.text, j.title FROM documents d " \
+          "JOIN jobs j ON j.id = d.job_id WHERE d.text IS NOT NULL"
+    params = []
+    if kinds:
+        sql += " AND d.kind IN (%s)" % ",".join("?" * len(kinds))
+        params += list(kinds)
+    for t in terms:
+        sql += " AND (LOWER(d.text) LIKE ? OR LOWER(j.title) LIKE ?)"
+        params += [f"%{t}%", f"%{t}%"]
+    sql += " ORDER BY d.id DESC"
+    hits, seen = [], set()
+    for r in conn.execute(sql, params):
+        if r["job_id"] in seen:
+            continue
+        seen.add(r["job_id"])
+        low = r["text"].lower()
+        snippets = []
+        for t in terms:
+            i = low.find(t)
+            if i >= 0:
+                a, b = max(0, i - context), min(len(r["text"]), i + len(t) + context)
+                snippets.append(re.sub(r"\s+", " ", r["text"][a:b]).strip())
+        hits.append({"job_id": r["job_id"], "title": r["title"], "doc_id": r["doc_id"],
+                     "kind": r["kind"], "url": r["url"], "snippets": snippets})
+        if len(hits) >= limit:
+            break
+    return hits
+
+
+def record_verdict(conn, job_id, verdict, grades=None, reason=None, profile_hash=None):
+    if verdict not in ("yes", "no", "maybe"):
+        raise ValueError("verdict must be yes, no or maybe")
+    if not conn.execute("SELECT 1 FROM jobs WHERE id=?", (job_id,)).fetchone():
+        raise KeyError(job_id)
+    cur = conn.execute("""INSERT INTO verdicts (job_id, verdict, eligible_grades, reason,
+        assessed_at, profile_hash) VALUES (?,?,?,?,?,?)""",
+                       (job_id, verdict, grades, reason, now(), profile_hash))
+    conn.commit()
+    return cur.lastrowid
+
+
+def record_action(conn, job_id, action, date=None, resume_dir=None, note=None):
+    if action not in ("applied", "skipped", "drafted", "withdrawn"):
+        raise ValueError("action must be applied, skipped, drafted or withdrawn")
+    if not conn.execute("SELECT 1 FROM jobs WHERE id=?", (job_id,)).fetchone():
+        raise KeyError(job_id)
+    cur = conn.execute("""INSERT INTO actions (job_id, action, action_date, resume_dir, note)
+        VALUES (?,?,?,?,?)""", (job_id, action, date or today(), resume_dir, note))
+    conn.commit()
+    return cur.lastrowid
+
+
+def add_job(conn, title, source="manual", source_id=None, location=None, announcement=None,
+            url=None, series=None, pay_plan=None, grade_low=None, grade_high=None,
+            salary=None, open_date=None, close_date=None, first_seen=None, text=None,
+            kind="posting", fetch_url=False):
+    conn.execute("INSERT OR IGNORE INTO sources VALUES (?,?,?)", (source, source, None))
+    sid = source_id or hashlib.sha1((title + (url or "")).encode()).hexdigest()[:16]
+    cur = conn.execute("""INSERT INTO jobs (source, source_id, title, location,
+        announcement_no, external_url, board_url, series, pay_plan, grade_low, grade_high,
+        salary, open_date, close_date, first_seen, last_seen)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       (source, sid, title, location, announcement, url, None, series,
+                        pay_plan, grade_low, grade_high, salary, open_date, close_date,
+                        first_seen or now(), now()))
+    job_id = cur.lastrowid
+    if text:
+        _store_documents(conn, job_id, [{"kind": kind, "url": url, "raw_html": None, "text": text}])
+    elif fetch_url and url:
+        st, body = fetch(url)
+        if body:
+            _store_documents(conn, job_id, [{"kind": kind, "url": url, "raw_html": body,
+                                             "text": html_to_text(body)}])
+    conn.commit()
+    return job_id
+
+
+JOBS_VIEW_SQL = """
+SELECT j.*, v.verdict, v.eligible_grades, v.reason AS verdict_reason, v.assessed_at,
+       v.profile_hash, a.action, a.action_date, a.resume_dir, a.note AS action_note,
+       (SELECT MAX(fetched_at) FROM documents WHERE job_id = j.id) AS last_fetched
+FROM jobs j
+LEFT JOIN verdicts v ON v.id = (SELECT MAX(id) FROM verdicts WHERE job_id = j.id)
+LEFT JOIN actions  a ON a.id = (SELECT MAX(id) FROM actions  WHERE job_id = j.id)
+"""
+
+
+def list_jobs(conn, verdict=None, action=None, open_only=False, source=None, days=None,
+              pending_only=False, q=None):
+    """Joined job rows with latest verdict/action. Filters are ANDed.
+    verdict/action accept comma lists; 'none' matches rows without one."""
+    where, params = ["1=1"], []
+    if source:
+        where.append("j.source=?"); params.append(source)
+    if open_only:
+        where.append("(j.close_date IS NULL OR j.close_date >= ?)"); params.append(today())
+    if days:
+        cutoff = (dt.date.today() - dt.timedelta(days=days)).isoformat()
+        where.append("(j.open_date >= ? OR j.first_seen >= ? OR j.posted_age_days <= ?)")
+        params += [cutoff, cutoff, days]
+    sql = JOBS_VIEW_SQL + " WHERE " + " AND ".join(where) + \
+          " ORDER BY j.close_date IS NULL, j.close_date, j.id"
+    rows = [dict(r) for r in conn.execute(sql, params)]
+    if verdict:
+        want = set(verdict.split(","))
+        rows = [r for r in rows if (r["verdict"] or "none") in want]
+    if action:
+        want = set(action.split(","))
+        rows = [r for r in rows if (r["action"] or "none") in want]
+    if pending_only:
+        rows = [r for r in rows if not r["verdict"] and not r["action"]]
+    if q:
+        ql = q.lower()
+        rows = [r for r in rows if ql in " ".join(str(r.get(k) or "") for k in
+                ("title", "location", "series", "announcement_no", "verdict_reason",
+                 "action_note", "pay_plan")).lower()]
+    return rows
+
+
+def job_detail(conn, job_id, with_text=True):
+    j = conn.execute(JOBS_VIEW_SQL + " WHERE j.id=?", (job_id,)).fetchone()
+    if not j:
+        raise KeyError(job_id)
+    cols = "id, kind, url, fetched_at, text" if with_text else "id, kind, url, fetched_at, LENGTH(text) AS chars"
+    docs = [dict(r) for r in conn.execute(
+        f"SELECT {cols} FROM documents WHERE job_id=? ORDER BY id", (job_id,))]
+    verdicts = [dict(r) for r in conn.execute("SELECT * FROM verdicts WHERE job_id=? ORDER BY id", (job_id,))]
+    actions = [dict(r) for r in conn.execute("SELECT * FROM actions WHERE job_id=? ORDER BY id", (job_id,))]
+    return {"job": dict(j), "documents": docs, "verdicts": verdicts, "actions": actions}
+
+
+def profile_hash(path=None):
+    path = path or os.path.join(HERE, "..", "EXPERIENCE.md")
+    return hashlib.sha1(open(path, "rb").read()).hexdigest()[:12]
+
+
+# ----------------------------------------------------------------- commands
+def cmd_scan(a):
+    scan_source(db(), a.source, days=a.days, all_=a.all, limit=a.limit, refetch=a.refetch,
+                max_pages=a.max_pages)
 
 
 def _job_filter_sql(a, alias="j"):
@@ -453,13 +651,7 @@ def cmd_autoreject(a):
 
 
 def cmd_verdict(a):
-    conn = db()
-    if not conn.execute("SELECT 1 FROM jobs WHERE id=?", (a.id,)).fetchone():
-        sys.exit("no such job")
-    conn.execute("""INSERT INTO verdicts (job_id, verdict, eligible_grades, reason,
-        assessed_at, profile_hash) VALUES (?,?,?,?,?,?)""",
-                 (a.id, a.verdict, a.grades, a.reason, now(), a.profile_hash))
-    conn.commit()
+    record_verdict(db(), a.id, a.verdict, a.grades, a.reason, a.profile_hash)
     print(f"[{a.id}] {a.verdict} ({a.grades or ''}) — {a.reason}")
 
 
@@ -485,36 +677,29 @@ def cmd_report(a):
 
 
 def cmd_mark(a):
-    conn = db()
-    if not conn.execute("SELECT 1 FROM jobs WHERE id=?", (a.id,)).fetchone():
-        sys.exit("no such job")
-    conn.execute("""INSERT INTO actions (job_id, action, action_date, resume_dir, note)
-        VALUES (?,?,?,?,?)""", (a.id, a.action, a.date or today(), a.resume_dir, a.note))
-    conn.commit()
+    record_action(db(), a.id, a.action, a.date, a.resume_dir, a.note)
     print(f"[{a.id}] {a.action} {a.date or today()} {a.resume_dir or ''}")
 
 
 def cmd_add(a):
-    """Manually add a job (postings found outside any adapter, or legacy records)."""
-    conn = db()
-    conn.execute("INSERT OR IGNORE INTO sources VALUES (?,?,?)",
-                 (a.source, a.source, None))
-    sid = a.source_id or hashlib.sha1((a.title + (a.url or "")).encode()).hexdigest()[:16]
-    cur = conn.execute("""INSERT INTO jobs (source, source_id, title, location,
-        announcement_no, external_url, board_url, series, pay_plan, grade_low, grade_high,
-        salary, open_date, close_date, first_seen, last_seen)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                       (a.source, sid, a.title, a.location, a.announcement, a.url, None,
-                        a.series, a.pay_plan, a.grade_low, a.grade_high, a.salary,
-                        a.open, a.close, a.first_seen or now(), now()))
-    job_id = cur.lastrowid
-    if a.text or a.text_file:
-        text = a.text or open(a.text_file).read()
-        conn.execute("""INSERT INTO documents (job_id, kind, url, fetched_at, raw_html,
-            text) VALUES (?,?,?,?,?,?)""", (job_id, a.kind, a.url, now(), None, text))
-    conn.commit()
+    text = a.text or (open(a.text_file).read() if a.text_file else None)
+    job_id = add_job(db(), a.title, a.source, a.source_id, a.location, a.announcement, a.url,
+                     a.series, a.pay_plan, a.grade_low, a.grade_high, a.salary, a.open,
+                     a.close, a.first_seen, text, a.kind, fetch_url=a.fetch)
     print(f"added job {job_id}")
-    return job_id
+
+
+def cmd_refresh(a):
+    conn = db()
+    for i in a.ids:
+        print(refresh_job(conn, i))
+
+
+def cmd_search(a):
+    for h in search_documents(db(), a.query, a.kind, a.limit):
+        print(f"[{h['job_id']}] {h['title']}  ({h['kind']}) {h['url'] or ''}")
+        for sn in h["snippets"]:
+            print(f"    … {sn} …")
 
 
 def cmd_apps(a):
@@ -548,8 +733,7 @@ def cmd_stats(a):
 
 def cmd_profile_hash(a):
     """Hash of EXPERIENCE.md so verdicts record which profile they were judged against."""
-    path = a.path or os.path.join(HERE, "..", "EXPERIENCE.md")
-    print(hashlib.sha1(open(path, "rb").read()).hexdigest()[:12])
+    print(profile_hash(a.path))
 
 
 # ----------------------------------------------------------------- main
@@ -625,7 +809,18 @@ def main(argv=None):
     s.add_argument("--first-seen")
     s.add_argument("--text", help="verbatim posting text"); s.add_argument("--text-file")
     s.add_argument("--kind", default="posting")
+    s.add_argument("--fetch", action="store_true", help="fetch --url and store it verbatim")
     s.set_defaults(fn=cmd_add)
+
+    s = sp.add_parser("refresh", help="re-fetch stored jobs so dates/text are current")
+    s.add_argument("ids", type=int, nargs="+")
+    s.set_defaults(fn=cmd_refresh)
+
+    s = sp.add_parser("search", help="full-text search over stored posting text")
+    s.add_argument("query", help='terms (AND); quote phrases')
+    s.add_argument("--kind", action="append", help="document kind filter (repeatable)")
+    s.add_argument("--limit", type=int, default=30)
+    s.set_defaults(fn=cmd_search)
 
     s = sp.add_parser("apps", help="application history (all recorded actions)")
     s.set_defaults(fn=cmd_apps)

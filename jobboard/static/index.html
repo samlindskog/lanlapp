@@ -32,6 +32,16 @@
   button { font: inherit; padding: 4px 10px; border: 1px solid var(--line); border-radius: 6px;
            background: var(--card); color: var(--fg); cursor: pointer; }
   .count { color: var(--muted); margin-left: auto; }
+  .runstat { color: var(--muted); font-size: 13px; }
+  .runstat.running { color: var(--maybe); }
+  .runstat.failed { color: var(--no); }
+  form.inline { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 8px; }
+  form.inline input, form.inline select { font: inherit; padding: 3px 6px; border: 1px solid var(--line);
+      border-radius: 6px; background: var(--bg); color: var(--fg); }
+  form.inline input[type=text] { min-width: 200px; }
+  .forms { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 8px 24px; margin: 6px 0 10px; }
+  .forms h4 { margin: 6px 0 2px; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+  .flash { font-size: 12px; color: var(--yes); margin-left: 6px; }
   main { padding: 0 16px 40px; }
   table { width: 100%; border-collapse: collapse; margin-top: 10px; }
   th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
@@ -106,6 +116,13 @@
     </div>
     <div class="group"><input type="search" id="q" placeholder="search title, location, series, reason"></div>
     <button id="reset">Reset</button>
+  </div>
+  <div class="controls" style="margin-top:8px">
+    <div class="group"><span class="label">Actions</span>
+      <button id="scan" title="Fetch new postings from the USACE board (last 7 days)">Scan USACE now</button>
+      <button id="refreshAll" title="Re-fetch every open yes/maybe posting so dates and text are current">Refresh open matches</button>
+    </div>
+    <span id="run" class="runstat"></span>
   </div>
 </header>
 <main>
@@ -221,6 +238,21 @@
         <div>Salary: <b>${esc(j.salary || "—")}</b></div>
         <div>Source: <b>${esc(j.source)}</b> · first seen ${esc((j.first_seen || "").slice(0, 10))}</div>
         <div>Links: ${j.external_url ? `<a href="${esc(j.external_url)}" target="_blank" rel="noopener">USAJOBS</a>` : ""} ${j.board_url ? `<a href="${esc(j.board_url)}" target="_blank" rel="noopener">board</a>` : ""}</div>
+        <div>Last fetched: <b>${esc((j.last_fetched || "").replace("T", " ").slice(0, 16) || "—")}</b>
+             <button data-act="refresh" data-id="${j.id}" style="margin-left:6px">Refresh posting</button><span class="flash" id="flash-${j.id}"></span></div>
+      </div>
+      <div class="forms">
+        <form class="inline" data-form="action" data-id="${j.id}"><h4 style="flex-basis:100%">Record status</h4>
+          <select name="action"><option value="applied">applied</option><option value="drafted">drafted</option><option value="skipped">skipped</option><option value="withdrawn">withdrawn</option></select>
+          <input type="date" name="date" value="${today}">
+          <input type="text" name="resume_dir" placeholder="applications/resumeX_mond" value="${esc(j.resume_dir || "")}">
+          <input type="text" name="note" placeholder="note">
+          <button type="submit">Save</button></form>
+        <form class="inline" data-form="verdict" data-id="${j.id}"><h4 style="flex-basis:100%">Override verdict</h4>
+          <select name="verdict"><option value="yes">yes</option><option value="maybe">maybe</option><option value="no">no</option></select>
+          <input type="text" name="grades" placeholder="eligible grades, e.g. GS-5/7" value="${esc(j.eligible_grades || "")}" style="min-width:150px">
+          <input type="text" name="reason" placeholder="reason" required>
+          <button type="submit">Save</button></form>
       </div>
       <div id="docs-${j.id}"><em style="color:var(--muted)">loading stored text…</em></div>
     </td></tr>`;
@@ -268,11 +300,65 @@
     if (state.open === id) loadDocs(id);
   });
 
-  fetch("/api/jobs").then((r) => r.json()).then((d) => {
+  async function post(url, body) {
+    const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(d.error || r.statusText);
+    return d;
+  }
+  async function reload() {
+    const d = await (await fetch("/api/jobs")).json();
     state.jobs = d.jobs;
     const sources = [...new Set(d.jobs.map((j) => j.source))].sort();
+    const cur = $("#source").value;
     $("#source").innerHTML = '<option value="">all</option>' + sources.map((s) => `<option value="${esc(s)}">${esc(s)}</option>`).join("");
+    $("#source").value = cur;
     render();
+    return d;
+  }
+  let pollTimer = null;
+  async function pollRun(id) {
+    clearTimeout(pollTimer);
+    const r = await (await fetch(`/api/runs/${id}`)).json();
+    const el = $("#run");
+    const last = (r.log || "").trim().split("\n").pop() || "";
+    el.className = "runstat " + r.status;
+    el.textContent = `${r.kind} #${r.id} ${r.status}: ${last}`;
+    if (r.status === "running") pollTimer = setTimeout(() => pollRun(id), 1500);
+    else { reload(); }
+  }
+  $("#scan").addEventListener("click", async () => {
+    try { const d = await post("/api/scan", { source: "usace_yellogov", days: 7 }); pollRun(d.run_id); }
+    catch (e) { $("#run").className = "runstat failed"; $("#run").textContent = e.message; }
+  });
+  $("#refreshAll").addEventListener("click", async () => {
+    try { const d = await post("/api/refresh", { filter: "open-qualifying" }); pollRun(d.run_id); }
+    catch (e) { $("#run").className = "runstat failed"; $("#run").textContent = e.message; }
+  });
+  $("#rows").addEventListener("click", async (e) => {
+    const b = e.target.closest("button[data-act=refresh]"); if (!b) return;
+    e.stopPropagation(); b.disabled = true;
+    const flash = document.getElementById(`flash-${b.dataset.id}`);
+    try { const d = await post(`/api/jobs/${b.dataset.id}/refresh`); flash.textContent = `refreshed; closes ${d.job.close_date || "?"}`; await reload(); loadDocs(Number(b.dataset.id)); }
+    catch (err) { flash.textContent = err.message; }
+    b.disabled = false;
+  });
+  $("#rows").addEventListener("submit", async (e) => {
+    const f = e.target.closest("form[data-form]"); if (!f) return;
+    e.preventDefault(); e.stopPropagation();
+    const body = Object.fromEntries(new FormData(f).entries());
+    Object.keys(body).forEach((k) => { if (body[k] === "") delete body[k]; });
+    const flash = document.getElementById(`flash-${f.dataset.id}`);
+    try {
+      if (f.dataset.form === "verdict") { const h = await (await fetch("/api/profile-hash")).json(); body.profile_hash = h.profile_hash; }
+      await post(`/api/jobs/${f.dataset.id}/${f.dataset.form}`, body);
+      flash.textContent = `${f.dataset.form} saved`; await reload();
+    } catch (err) { flash.textContent = err.message; }
+  });
+  $("#rows").addEventListener("click", (e) => { if (e.target.closest("form, details, a")) e.stopPropagation(); }, true);
+
+  reload().then((d) => {
+    if (d.active_run) pollRun(d.active_run.id);
   }).catch((e) => { $("#rows").innerHTML = `<tr><td colspan="7">failed to load /api/jobs: ${esc(e)}</td></tr>`; });
 })();
 </script>
