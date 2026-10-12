@@ -21,6 +21,16 @@ WG_IP=10.88.0.1
 MCP_PORT=8090
 log() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 
+# --- maintenance mode: `touch ~/jobboard-bootstrap/show-firewall` then run; prints the live nftables
+# ruleset and listening sockets, changes nothing.
+if [ -f "$HERE/show-firewall" ]; then
+  rm -f "$HERE/show-firewall"
+  echo "===== nft list ruleset"; nft list ruleset
+  echo "===== listening sockets"; ss -tulnp | awk 'NR==1 || /LISTEN|UNCONN/'
+  echo "===== wireguard"; wg show
+  exit 0
+fi
+
 # --- maintenance mode: `touch ~/jobboard-bootstrap/reboot` then run; reboots the VPS (nothing else).
 if [ -f "$HERE/reboot" ]; then
   rm -f "$HERE/reboot"
