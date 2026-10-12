@@ -451,8 +451,8 @@ def record_verdict(conn, job_id, verdict, grades=None, reason=None, profile_hash
 
 
 def record_action(conn, job_id, action, date=None, resume_dir=None, note=None):
-    if action not in ("applied", "skipped", "drafted", "withdrawn"):
-        raise ValueError("action must be applied, skipped, drafted or withdrawn")
+    if action not in ("applied", "drafted"):
+        raise ValueError("action must be applied or drafted")
     if not conn.execute("SELECT 1 FROM jobs WHERE id=?", (job_id,)).fetchone():
         raise KeyError(job_id)
     cur = conn.execute("""INSERT INTO actions (job_id, action, action_date, resume_dir, note)
@@ -884,7 +884,7 @@ def main(argv=None):
 
     s = sp.add_parser("mark", help="record an application action")
     s.add_argument("id", type=int)
-    s.add_argument("action", choices=["applied", "skipped", "drafted", "withdrawn"])
+    s.add_argument("action", choices=["applied", "drafted"])
     s.add_argument("--date"); s.add_argument("--resume-dir"); s.add_argument("--note")
     s.set_defaults(fn=cmd_mark)
 

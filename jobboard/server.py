@@ -17,7 +17,7 @@ Agent API  : JSON over HTTP, documented at GET /api  (also in .claude/skills/job
   POST /api/jobs                  {title, url?, location?, open_date?, close_date?, text?, fetch?:true, ...}
   POST /api/jobs/<id>/verdict     {verdict: yes|no|maybe, grades?, reason, profile_hash?, author?: claude|user}
                                   (author=user marks a human override; Claude's latest verdict is kept as claude_verdict)
-  POST /api/jobs/<id>/action      {action: applied|skipped|drafted|withdrawn, date?, resume_dir?, note?}
+  POST /api/jobs/<id>/action      {action: applied|drafted, date?, resume_dir?, note?}
   POST /api/jobs/<id>/refresh     re-fetch the posting now (synchronous)
   POST /api/scan                  {source, days?:7, all?:false, refetch?:false}  -> {run_id}
   POST /api/refresh               {ids?:[..]} or {filter:"open-qualifying"}       -> {run_id}

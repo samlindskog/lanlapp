@@ -118,8 +118,7 @@
   <button class="close" id="bulkClose" title="Exit selection mode">✕</button>
   <h3><span id="selCount">0</span> selected</h3>
   <label>Set status to<br><select id="bulkAction">
-    <option value="applied">applied</option><option value="drafted">drafted</option>
-    <option value="skipped">skipped</option><option value="withdrawn">withdrawn</option></select></label>
+    <option value="applied">applied</option><option value="drafted">drafted</option></select></label>
   <label>Date<br><input type="date" id="bulkDate"></label>
   <label>Note (optional)<br><input type="text" id="bulkNote" placeholder="e.g. applied via USAJOBS"></label>
   <button id="bulkApply">Apply status to selected</button>
@@ -147,7 +146,6 @@
         <option value="applied">applied</option>
         <option value="not">not applied</option>
         <option value="drafted">drafted only</option>
-        <option value="skipped">skipped</option>
         <option value="untouched">no action yet</option>
       </select>
     </div>
@@ -294,7 +292,7 @@
     });
   }
 
-  const ACTIONS = ["applied", "drafted", "skipped", "withdrawn"];
+  const ACTIONS = ["applied", "drafted"];
   const VERDICTS = ["yes", "maybe", "no"];
   // A verdict counts as overridden when the latest one is yours and differs from Claude's latest.
   const overridden = (j) => j.verdict_author === "user" && j.claude_verdict && j.verdict !== j.claude_verdict;
