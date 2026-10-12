@@ -35,6 +35,9 @@
   .runstat { color: var(--muted); font-size: 13px; }
   .runstat.running { color: var(--maybe); }
   .runstat.failed { color: var(--no); }
+  .runstat.done { color: var(--yes); }
+  .runstat { transition: opacity .6s; }
+  .runstat.fade { opacity: 0; }
   form.inline { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 8px; }
   form.inline input, form.inline select { font: inherit; padding: 3px 6px; border: 1px solid var(--line);
       border-radius: 6px; background: var(--bg); color: var(--fg); }
@@ -350,7 +353,13 @@
   }
   // One status line in the header for every background activity: scans, bulk
   // refreshes and single-posting refreshes all report here in the same style.
-  const setRun = (status, text) => { const el = $("#run"); el.className = "runstat " + status; el.textContent = text; };
+  // Finished ("done") messages fade out after a few seconds; running and failed stay.
+  let clearTimer = null;
+  const setRun = (status, text) => {
+    const el = $("#run"); clearTimeout(clearTimer);
+    el.className = "runstat " + status; el.textContent = text;
+    if (status === "done") clearTimer = setTimeout(() => { el.classList.add("fade"); clearTimer = setTimeout(() => { el.textContent = ""; el.className = "runstat"; }, 600); }, 2500);
+  };
   let pollTimer = null;
   async function pollRun(id) {
     clearTimeout(pollTimer);
