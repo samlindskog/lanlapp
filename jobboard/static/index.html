@@ -42,6 +42,17 @@
   .forms { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 8px 24px; margin: 6px 0 10px; }
   .forms h4 { margin: 6px 0 2px; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
   .flash { font-size: 12px; color: var(--yes); margin-left: 6px; }
+  dialog { border: 1px solid var(--line); border-radius: 10px; background: var(--card); color: var(--fg);
+           padding: 18px 20px; min-width: 320px; max-width: 90vw; }
+  dialog::backdrop { background: rgba(0,0,0,.35); }
+  dialog h3 { margin: 0 0 10px; font-size: 16px; }
+  dialog form { display: flex; flex-direction: column; gap: 10px; }
+  dialog select, dialog input[type=number] { font: inherit; padding: 4px 8px; border: 1px solid var(--line);
+      border-radius: 6px; background: var(--bg); color: var(--fg); }
+  dialog select { width: 100%; margin-top: 4px; }
+  .muted { color: var(--muted); font-size: 12px; }
+  .dlg-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 6px; }
+  #scanStart { background: var(--accent); color: #fff; border-color: var(--accent); }
   main { padding: 0 16px 40px; }
   table { width: 100%; border-collapse: collapse; margin-top: 10px; }
   th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
@@ -119,12 +130,23 @@
   </div>
   <div class="controls" style="margin-top:8px">
     <div class="group"><span class="label">Actions</span>
-      <button id="scan" title="Fetch new postings from the USACE board (last 7 days)">Scan USACE now</button>
+      <button id="scan" title="Fetch new postings from a job board">Scan…</button>
       <button id="refreshAll" title="Re-fetch every open yes/maybe posting so dates and text are current">Refresh open matches</button>
     </div>
     <span id="run" class="runstat"></span>
   </div>
 </header>
+<dialog id="scanDlg">
+  <form method="dialog" id="scanForm">
+    <h3>Scan a job board</h3>
+    <label>Board / workflow<br><select name="source" id="scanSource"></select></label>
+    <div id="scanInfo" class="muted"></div>
+    <label>Posted within the last <input type="number" name="days" min="1" max="365" value="7" style="width:5em"> days</label>
+    <label class="chk"><input type="checkbox" name="all"> whole board (ignore days)</label>
+    <label class="chk"><input type="checkbox" name="refetch"> re-fetch postings already stored</label>
+    <div class="dlg-actions"><button value="cancel" type="button" id="scanCancel">Cancel</button><button value="start" id="scanStart">Start scan</button></div>
+  </form>
+</dialog>
 <main>
   <table>
     <thead><tr>
@@ -327,9 +349,28 @@
     if (r.status === "running") pollTimer = setTimeout(() => pollRun(id), 1500);
     else { reload(); }
   }
-  $("#scan").addEventListener("click", async () => {
-    try { const d = await post("/api/scan", { source: "usace_yellogov", days: 7 }); pollRun(d.run_id); }
-    catch (e) { $("#run").className = "runstat failed"; $("#run").textContent = e.message; }
+  let sources = [];
+  async function loadSources() {
+    sources = (await (await fetch("/api/sources")).json()).sources;
+    $("#scanSource").innerHTML = sources.map((s) => `<option value="${esc(s.name)}">${esc(s.display_name)}</option>`).join("");
+    showSourceInfo();
+  }
+  function showSourceInfo() {
+    const s = sources.find((x) => x.name === $("#scanSource").value); if (!s) return;
+    const ls = s.last_scan;
+    const when = ls ? `last scan ${(ls.started_at || "").replace("T", " ").slice(0, 16)} (${ls.status}${ls.summary ? `: ${ls.summary.new} new, ${ls.summary.known} known` : ""})` : "never scanned";
+    $("#scanInfo").innerHTML = `${s.board_url ? `<a href="${esc(s.board_url)}" target="_blank" rel="noopener">${esc(s.board_url)}</a><br>` : ""}${esc(when)}`;
+  }
+  $("#scanSource").addEventListener("change", showSourceInfo);
+  $("#scan").addEventListener("click", async () => { await loadSources(); $("#scanDlg").showModal(); });
+  $("#scanCancel").addEventListener("click", () => $("#scanDlg").close());
+  $("#scanForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const f = new FormData(e.target);
+    const body = { source: f.get("source"), days: Number(f.get("days") || 7), all: !!f.get("all"), refetch: !!f.get("refetch") };
+    $("#scanDlg").close();
+    try { const d = await post("/api/scan", body); pollRun(d.run_id); }
+    catch (err) { $("#run").className = "runstat failed"; $("#run").textContent = err.message; }
   });
   $("#refreshAll").addEventListener("click", async () => {
     try { const d = await post("/api/refresh", { filter: "open-qualifying" }); pollRun(d.run_id); }

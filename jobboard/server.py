@@ -6,6 +6,7 @@ Agent API  : JSON over HTTP, documented at GET /api  (also in .claude/skills/job
 
   GET  /api                       this API description
   GET  /api/stats                 counts, db path, available sources
+  GET  /api/sources               scan workflows available: name, display_name, board_url, last_scan
   GET  /api/profile-hash          sha1 prefix of EXPERIENCE.md (record on verdicts)
   GET  /api/jobs?verdict=yes,maybe&action=none&open=1&source=&days=&q=&pending=1
   GET  /api/jobs/<id>?text=0      job + documents + verdict/action history
@@ -130,6 +131,8 @@ class Handler(SimpleHTTPRequestHandler):
                 return
             if path == "/api/stats":
                 return self._json(self._stats())
+            if path == "/api/sources":
+                return self._json({"sources": self._sources()})
             if path == "/api/profile-hash":
                 return self._json({"profile_hash": J.profile_hash(EXPERIENCE)})
             if path == "/api/jobs":
@@ -277,6 +280,22 @@ class Handler(SimpleHTTPRequestHandler):
             return self._json({"error": str(e)}, 400)
         except Exception as e:  # noqa: BLE001
             return self._json({"error": str(e), "trace": traceback.format_exc()}, 500)
+
+    def _sources(self):
+        conn = J.db()
+        last = {r["args_source"]: r for r in conn.execute("""
+            SELECT json_extract(args, '$.source') AS args_source, MAX(started_at) AS started_at,
+                   status, summary FROM runs WHERE kind='scan' GROUP BY args_source""")}
+        out = []
+        for name in J.list_sources():
+            mod = J.load_source(name)
+            r = last.get(name)
+            out.append({"name": name, "display_name": getattr(mod, "DISPLAY_NAME", name),
+                        "board_url": getattr(mod, "BOARD_URL", None),
+                        "last_scan": {"started_at": r["started_at"], "status": r["status"],
+                                      "summary": json.loads(r["summary"]) if r["summary"] else None} if r else None})
+        conn.close()
+        return out
 
     def _stats(self):
         conn = J.db()
