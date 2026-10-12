@@ -21,6 +21,34 @@ WG_IP=10.88.0.1
 MCP_PORT=8090
 log() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 
+# --- maintenance mode: `touch ~/jobboard-bootstrap/fix-grub` then run; repairs the half-configured
+# grub-pc package (which has been failing every apt run) and exits without touching anything else.
+if [ -f "$HERE/fix-grub" ]; then
+  rm -f "$HERE/fix-grub"
+  export DEBIAN_FRONTEND=noninteractive
+  log "grub-pc: current failure"
+  dpkg --configure grub-pc 2>&1 | tail -12 || true
+  ROOTSRC=$(findmnt -no SOURCE / 2>/dev/null); DISK="/dev/$(lsblk -ndo pkname "$ROOTSRC" 2>/dev/null || true)"
+  [ -b "$DISK" ] || DISK=/dev/sda
+  log "grub-pc: pointing install_devices at $DISK and reconfiguring"
+  echo "grub-pc grub-pc/install_devices multiselect $DISK" | debconf-set-selections
+  echo "grub-pc grub-pc/install_devices_empty boolean false" | debconf-set-selections
+  if dpkg --configure grub-pc 2>&1 | tail -5; then :; fi
+  if dpkg -s grub-pc 2>/dev/null | grep -q "^Status: install ok installed"; then
+    echo "grub-pc configured (grub installed to $DISK)"
+  else
+    log "grub-pc: still failing; telling debconf to skip the device install"
+    echo "grub-pc grub-pc/install_devices multiselect" | debconf-set-selections
+    echo "grub-pc grub-pc/install_devices_empty boolean true" | debconf-set-selections
+    dpkg --configure grub-pc 2>&1 | tail -5 || true
+  fi
+  log "finishing any other half-configured packages"
+  dpkg --configure -a 2>&1 | tail -5 || true
+  apt-get -f install -y -qq 2>&1 | tail -3 || true
+  echo "state: $(dpkg -s grub-pc 2>/dev/null | grep ^Status) ; remaining non-ok packages: $(dpkg -l | grep -Ev '^(ii|rc|Desired|\||\+)' | wc -l)"
+  exit 0
+fi
+
 [ -f "$HERE/github_deploy_key" ] || { echo "missing $HERE/github_deploy_key"; exit 1; }
 [ -f "$HERE/jobboard_deploy.pub" ] || { echo "missing $HERE/jobboard_deploy.pub"; exit 1; }
 
@@ -194,7 +222,10 @@ else
 fi
 
 log "api token for Claude"
-if [ ! -f "$HERE/claude-token" ]; then
+HAVE=$(su - deploy -c "cd $APP && docker compose -f jobboard/compose.prod.yaml --env-file .env exec -T db psql -U jobscan -d jobscan -tAc \"SELECT COUNT(*) FROM auth_tokens WHERE name='claude-mac' AND revoked_at IS NULL\"" 2>/dev/null | tail -1 || echo 0)
+if [ "${HAVE:-0}" != "0" ]; then
+  echo "an active claude-mac token already exists; not minting another (revoke it via the API to re-mint)"
+elif [ ! -f "$HERE/claude-token" ]; then
   TOK=$(su - deploy -c "cd $APP && docker compose -f jobboard/compose.prod.yaml --env-file .env exec -T jobboard python3 server.py issue-token claude-mac" 2>/dev/null | tail -1)
   if [ -n "$TOK" ]; then
     install -m 600 -o "$(stat -c %U "$HERE")" /dev/null "$HERE/claude-token"
