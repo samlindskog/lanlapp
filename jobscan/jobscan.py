@@ -265,7 +265,14 @@ def grade_str(j):
 
 
 # ----------------------------------------------------------------- library
-def _store_documents(conn, job_id, docs):
+def _store_documents(conn, job_id, docs, replace=False):
+    """Insert documents. With replace=True (refresh / re-fetch) the previous
+    document of the same kind is removed first, so a job keeps exactly one
+    current copy per kind."""
+    if replace:
+        kinds = {d["kind"] for d in docs}
+        for k in kinds:
+            conn.execute("DELETE FROM documents WHERE job_id=? AND kind=?", (job_id, k))
     for d in docs:
         conn.execute("""INSERT INTO documents (job_id, kind, url, fetched_at, raw_html, text)
             VALUES (?,?,?,?,?,?)""",
@@ -346,7 +353,7 @@ def scan_source(conn, source_name, days=7, all_=False, limit=None, refetch=False
                 carried += 1
             else:
                 need_judgment.append({"id": job_id, "title": fields.get("title")})
-        _store_documents(conn, job_id, docs)
+        _store_documents(conn, job_id, docs, replace=bool(row))
         conn.commit()
     log(f"done: {new} new, {updated} already known, {carried} verdicts carried over "
         f"from the same announcement")
@@ -360,7 +367,7 @@ def scan_source(conn, source_name, days=7, all_=False, limit=None, refetch=False
 
 def refresh_job(conn, job_id, log=print):
     """Re-fetch a stored job's pages so dates, text and status are current.
-    Appends new documents; earlier fetches are kept."""
+    Replaces the stored document of each kind with the fresh copy."""
     j = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
     if not j:
         raise KeyError(job_id)
@@ -371,7 +378,8 @@ def refresh_job(conn, job_id, log=print):
         st, body = fetch(j["external_url"])
         if body:
             _store_documents(conn, job_id, [{"kind": "posting", "url": j["external_url"],
-                                             "raw_html": body, "text": html_to_text(body)}])
+                                             "raw_html": body, "text": html_to_text(body)}],
+                             replace=True)
             conn.execute("UPDATE jobs SET last_seen=? WHERE id=?", (now(), job_id))
             conn.commit()
         return {"id": job_id, "refetched": 1 if body else 0}
@@ -381,7 +389,7 @@ def refresh_job(conn, job_id, log=print):
     docs = [d for d in src.fetch_job(fetch, card) if d["kind"] != "board_card"]
     fields = src.parse_fields(card, docs)
     _update_fields(conn, job_id, fields)
-    _store_documents(conn, job_id, docs)
+    _store_documents(conn, job_id, docs, replace=True)
     conn.commit()
     log(f"refreshed [{job_id}] {fields.get('title')} closes {fields.get('close_date')}")
     return {"id": job_id, "refetched": len(docs), "close_date": fields.get("close_date")}
