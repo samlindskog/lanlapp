@@ -43,7 +43,7 @@ for t in git nginx nft curl docker; do command -v "$t" >/dev/null || { echo "mis
 echo "git nginx nft curl docker present"
 
 log "remove hermes-hub"
-systemctl list-units --all --no-pager --plain 2>/dev/null | awk '{print $1}' | grep -Ei 'hermes|cloudflare-ips' | while read -r u; do
+for u in $(systemctl list-units --all --no-pager --plain 2>/dev/null | awk '{print $1}' | grep -Ei 'hermes|cloudflare-ips' || true); do
   systemctl disable --now "$u" 2>/dev/null || true; done
 rm -f /etc/systemd/system/*hermes* /etc/systemd/system/*cloudflare-ips* 2>/dev/null || true
 systemctl daemon-reload
