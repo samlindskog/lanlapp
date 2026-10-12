@@ -3,15 +3,15 @@ services:
     image: python:3.13-slim
     container_name: jobboard
     working_dir: /app
-    command: python3 server.py
+    command: python3 -u server.py
     environment:
       PORT: "8080"
       JOBSCAN_DIR: /app/jobscan
       EXPERIENCE_MD: /app/EXPERIENCE.md
+      JOBBOARD_RELOAD: "1"               # dev: auto-restart on .py changes; static files always fresh
       # JOBBOARD_TOKEN: change-me   # uncomment to require X-Token on writes
     volumes:
-      - ./server.py:/app/server.py:ro
-      - ./static:/app/static:ro
+      - ./:/app                          # server.py + static/, live
       - ../jobscan:/app/jobscan          # read-write: scans and verdicts write here
       - ../EXPERIENCE.md:/app/EXPERIENCE.md:ro
     ports:

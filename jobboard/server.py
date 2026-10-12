@@ -21,12 +21,15 @@ Agent API  : JSON over HTTP, documented at GET /api  (also in .claude/skills/job
   GET  /api/runs  /api/runs/<id>  background run status + log
 
 Standard library only. Env: JOBSCAN_DIR (default ../jobscan), PORT (8080),
-JOBBOARD_TOKEN (optional; if set, writes need header X-Token).
+JOBBOARD_TOKEN (optional; if set, writes need header X-Token),
+JOBBOARD_RELOAD=1 (dev: restart automatically when any .py under jobboard/ or
+jobscan/ changes; static files are always served fresh from disk).
 """
 import json
 import os
 import sys
 import threading
+import time
 import traceback
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -94,6 +97,12 @@ class Handler(SimpleHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
         sys.stderr.write("%s %s\n" % (self.address_string(), fmt % args))
+
+    def end_headers(self):
+        # Static files: always revalidate so edits show on a plain browser reload.
+        if not self.path.startswith("/api"):
+            self.send_header("Cache-Control", "no-store")
+        super().end_headers()
 
     # helpers
     def _json(self, obj, status=200):
@@ -314,9 +323,44 @@ class Handler(SimpleHTTPRequestHandler):
                 "profile_hash": J.profile_hash(EXPERIENCE) if os.path.exists(EXPERIENCE) else None}
 
 
+def _watch_and_reexec(paths, interval=1.0):
+    """Dev reloader: poll .py files; on any change, re-exec this process."""
+    def snapshot():
+        out = {}
+        for root in paths:
+            for dp, _, files in os.walk(root):
+                if "__pycache__" in dp:
+                    continue
+                for f in files:
+                    if f.endswith(".py"):
+                        fp = os.path.join(dp, f)
+                        try:
+                            out[fp] = os.stat(fp).st_mtime
+                        except OSError:
+                            pass
+        return out
+
+    def loop():
+        base = snapshot()
+        while True:
+            time.sleep(interval)
+            cur = snapshot()
+            if cur != base:
+                changed = [p for p in cur if cur.get(p) != base.get(p)] or ["(removed file)"]
+                print(f"jobboard: {os.path.relpath(changed[0])} changed, restarting", flush=True)
+                if _active_run():
+                    print("jobboard: a run is active; waiting for it before restarting", flush=True)
+                    while _active_run():
+                        time.sleep(1)
+                os.execv(sys.executable, [sys.executable] + sys.argv)
+    threading.Thread(target=loop, name="reloader", daemon=True).start()
+
+
 if __name__ == "__main__":
     if not os.path.exists(os.environ["JOBSCAN_DB"]):
         sys.exit(f"database not found: {os.environ['JOBSCAN_DB']}")
+    if os.environ.get("JOBBOARD_RELOAD") == "1":
+        _watch_and_reexec([HERE, JOBSCAN_DIR])
     # Mark any run left 'running' by a previous process as failed.
     c = J.db()
     c.execute("UPDATE runs SET status='failed', finished_at=? WHERE status='running'", (J.now(),))
