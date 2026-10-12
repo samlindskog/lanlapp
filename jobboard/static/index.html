@@ -131,7 +131,7 @@
   <div class="controls" style="margin-top:8px">
     <div class="group"><span class="label">Actions</span>
       <button id="scan" title="Fetch new postings from a job board">Scan…</button>
-      <button id="refreshAll" title="Re-fetch every open yes/maybe posting so dates and text are current">Refresh open matches</button>
+      <button id="refreshAll" title="Re-fetch every posting currently listed (current filters) so dates and text are current">Refresh</button>
     </div>
     <span id="run" class="runstat"></span>
   </div>
@@ -385,8 +385,10 @@
     catch (err) { setRun("failed", `scan failed: ${err.message}`); }
   });
   $("#refreshAll").addEventListener("click", async () => {
-    setRun("running", "refresh open matches: starting…");
-    try { const d = await post("/api/refresh", { filter: "open-qualifying" }); pollRun(d.run_id); }
+    const ids = filtered().filter((j) => j.external_url || j.board_url).map((j) => j.id);
+    if (!ids.length) { setRun("failed", "refresh: nothing listed to refresh"); return; }
+    setRun("running", `refresh ${ids.length} listed posting(s): starting…`);
+    try { const d = await post("/api/refresh", { ids }); pollRun(d.run_id); }
     catch (e) { setRun("failed", `refresh failed: ${e.message}`); }
   });
   $("#rows").addEventListener("click", async (e) => {
