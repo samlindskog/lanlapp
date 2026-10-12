@@ -260,7 +260,8 @@ def cmd_scan(a):
     cards = src.list_jobs(fetch, since_days=None if a.all else a.days,
                           max_pages=a.max_pages)
     print(f"{len(cards)} cards from {src.DISPLAY_NAME}")
-    new = updated = 0
+    new = updated = carried = 0
+    need_judgment = []
     for i, card in enumerate(cards):
         if a.limit and new >= a.limit:
             break
@@ -302,13 +303,36 @@ def cmd_scan(a):
                                 now(), now()))
             job_id = cur.lastrowid
             new += 1
+            # Same announcement already judged under another board id (multi-location
+            # postings, repostings)? Carry the verdict over instead of re-judging.
+            prior = None
+            if fields.get("announcement_no"):
+                prior = conn.execute("""
+                    SELECT v.*, j.id AS other_id FROM verdicts v JOIN jobs j ON j.id = v.job_id
+                    WHERE j.announcement_no = ? AND j.id != ?
+                    ORDER BY v.id DESC LIMIT 1""",
+                                     (fields["announcement_no"], job_id)).fetchone()
+            if prior:
+                conn.execute("""INSERT INTO verdicts (job_id, verdict, eligible_grades, reason,
+                    assessed_at, profile_hash) VALUES (?,?,?,?,?,?)""",
+                             (job_id, prior["verdict"], prior["eligible_grades"],
+                              f"same announcement as job {prior['other_id']}: {prior['reason']}",
+                              now(), prior["profile_hash"]))
+                carried += 1
+            else:
+                need_judgment.append((job_id, fields.get("title")))
         for d in docs:
             conn.execute("""INSERT INTO documents (job_id, kind, url, fetched_at,
                 raw_html, text) VALUES (?,?,?,?,?,?)""",
                          (job_id, d["kind"], d.get("url"), now(),
                           pack_html(d.get("raw_html")), d.get("text")))
         conn.commit()
-    print(f"done: {new} new, {updated} already known")
+    print(f"done: {new} new, {updated} already known, {carried} verdicts carried over "
+          f"from the same announcement")
+    if need_judgment:
+        print(f"{len(need_judgment)} new jobs need judgment (run: pending):")
+        for jid, title in need_judgment:
+            print(f"  [{jid}] {title}")
 
 
 def _job_filter_sql(a, alias="j"):
