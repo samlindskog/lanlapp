@@ -521,7 +521,13 @@ def job_detail(conn, job_id, with_text=True):
         f"SELECT {cols} FROM documents WHERE job_id=? ORDER BY id", (job_id,))]
     verdicts = [dict(r) for r in conn.execute("SELECT * FROM verdicts WHERE job_id=? ORDER BY id", (job_id,))]
     actions = [dict(r) for r in conn.execute("SELECT * FROM actions WHERE job_id=? ORDER BY id", (job_id,))]
-    return {"job": dict(j), "documents": docs, "verdicts": verdicts, "actions": actions}
+    pd, source, key = primary_document(conn, job_id)
+    primary = None
+    if pd:
+        primary = {"doc_id": pd["id"], "kind": pd["kind"], "key_section": key,
+                   "sections": document_sections(source, pd["text"], pd["kind"])}
+    return {"job": dict(j), "documents": docs, "verdicts": verdicts, "actions": actions,
+            "primary": primary}
 
 
 def profile_hash(path=None):
@@ -587,29 +593,89 @@ def cmd_show(a):
         print(f"\n===== document {d['id']}: {d['kind']} ({d['fetched_at']}) {d['url']}")
         text = d["text"] or ""
         if a.section:
-            text = _extract_section(text, a.section)
+            src = j["source"]
+            secs = document_sections(src, text, d["kind"])
+            text = secs.get(a.section) or next((v for k, v in secs.items()
+                                                if k.lower().startswith(a.section.lower())),
+                                               f"(section '{a.section}' not found; have: {', '.join(secs) or 'none'})")
         print(text if not a.max_chars else text[:a.max_chars])
 
 
-def _extract_section(text, name):
-    """Return text from the first line equal to `name` up to the next top heading."""
-    lines = text.split("\n")
-    out, on = [], False
-    stops = {"Summary", "Duties", "Requirements", "Conditions of Employment",
-             "Qualifications", "Education", "Additional information",
-             "How you will be evaluated", "Required documents", "How to apply",
-             "Benefits", "Fair and Transparent", "Next steps"}
-    for ln in lines:
-        s = ln.strip()
-        if s == name:
-            on = True
-            out.append(s)
-            continue
-        if on and s in stops and s != name:
-            break
-        if on:
-            out.append(ln)
-    return "\n".join(out) if out else f"(section '{name}' not found)"
+def generic_sections(text):
+    """Fallback splitter for boards without an adapter (manual entries): a
+    heading is a short line without sentence punctuation, Title Case or ALL
+    CAPS, followed by body text."""
+    lines = (text or "").split("\n")
+    heads = []
+    for i, ln in enumerate(lines):
+        t = ln.strip()
+        if 2 <= len(t) <= 60 and not re.search(r"[.:;,!?]$", t) and len(t.split()) <= 8 \
+                and (t.isupper() or t == t.title() or t[:1].isupper() and sum(w[:1].isupper() for w in t.split()) >= max(1, len(t.split()) - 2)) \
+                and i + 1 < len(lines) and lines[i + 1].strip():
+            heads.append((t, i))
+    out = {}
+    for n, (name, i) in enumerate(heads):
+        j = heads[n + 1][1] if n + 1 < len(heads) else len(lines)
+        body = "\n".join(lines[i + 1:j]).strip()
+        if body and name not in out:
+            out[name] = body
+    return out
+
+
+def source_meta(source_name):
+    """(adapter module or None, primary_kind, key_section) for a source."""
+    try:
+        mod = load_source(source_name) if source_name in list_sources() else None
+    except SystemExit:
+        mod = None
+    return (mod, getattr(mod, "PRIMARY_KIND", "posting"), getattr(mod, "KEY_SECTION", None))
+
+
+def document_sections(source_name, text, kind):
+    """Ordered {heading: text} for one stored document, via the board's adapter
+    when it defines sections(), else the generic splitter."""
+    mod, _, _ = source_meta(source_name)
+    if mod and hasattr(mod, "sections"):
+        try:
+            return mod.sections(text, kind)
+        except Exception:  # noqa: BLE001
+            pass
+    return generic_sections(text)
+
+
+def primary_document(conn, job_id):
+    """Latest document of the job's primary kind (adapter-declared), else the
+    latest document of any kind. Returns (row, source_name, key_section)."""
+    j = conn.execute("SELECT source FROM jobs WHERE id=?", (job_id,)).fetchone()
+    if not j:
+        raise KeyError(job_id)
+    mod, pk, key = source_meta(j["source"])
+    d = conn.execute("SELECT * FROM documents WHERE job_id=? AND kind=? ORDER BY id DESC LIMIT 1",
+                     (job_id, pk)).fetchone()
+    if not d:
+        d = conn.execute("SELECT * FROM documents WHERE job_id=? AND kind!='board_card' ORDER BY id DESC LIMIT 1",
+                         (job_id,)).fetchone()
+    return d, j["source"], key
+
+
+def get_section(conn, job_id, name=None, kind=None):
+    """Text of one named section (default: the board's key section) from the
+    job's primary document, or the newest document of `kind`."""
+    d, source, key = primary_document(conn, job_id)
+    if kind:
+        d = conn.execute("SELECT * FROM documents WHERE job_id=? AND kind=? ORDER BY id DESC LIMIT 1",
+                         (job_id, kind)).fetchone()
+    if not d:
+        return None, None
+    secs = document_sections(source, d["text"], d["kind"])
+    name = name or key
+    if name in secs:
+        return d, secs[name]
+    # case-insensitive / prefix match as a courtesy
+    for k, v in secs.items():
+        if name and k.lower().startswith(name.lower()):
+            return d, v
+    return d, None
 
 
 def cmd_raw(a):
@@ -761,7 +827,7 @@ def main(argv=None):
     s = sp.add_parser("show", help="print a job's fields and stored verbatim text")
     s.add_argument("id", type=int)
     s.add_argument("--kind", help="only documents of this kind")
-    s.add_argument("--section", help="only this USAJOBS section, e.g. Qualifications")
+    s.add_argument("--section", help="only this section of each document (names come from the board adapter, e.g. Qualifications)")
     s.add_argument("--max-chars", type=int)
     s.set_defaults(fn=cmd_show)
 

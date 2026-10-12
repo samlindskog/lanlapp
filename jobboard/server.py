@@ -11,7 +11,8 @@ Agent API  : JSON over HTTP, documented at GET /api  (also in .claude/skills/job
   GET  /api/profile-hash          sha1 prefix of EXPERIENCE.md (record on verdicts)
   GET  /api/jobs?verdict=yes,maybe&action=none&open=1&source=&days=&q=&pending=1
   GET  /api/jobs/<id>?text=0      job + documents + verdict/action history
-  GET  /api/jobs/<id>/section?name=Qualifications[&kind=usajobs_announcement]
+  GET  /api/jobs/<id>/sections    primary document split into named sections (board adapter decides)
+  GET  /api/jobs/<id>/section?name=<heading>[&kind=<kind>]   one section (default: the board's key section)
   GET  /api/search?q=<terms>&kind=<kind>&limit=50     full-text search, snippets
   POST /api/jobs                  {title, url?, location?, open_date?, close_date?, text?, fetch?:true, ...}
   POST /api/jobs/<id>/verdict     {verdict: yes|no|maybe, grades?, reason, profile_hash?}
@@ -186,18 +187,19 @@ class Handler(SimpleHTTPRequestHandler):
                     conn.close()
                     return self._json(d)
                 if parts[4] == "section":
-                    name = qs.get("name", "Qualifications")
-                    kind = qs.get("kind")
-                    out = []
-                    for d in conn.execute("SELECT id, kind, text FROM documents WHERE job_id=? ORDER BY id DESC", (jid,)):
-                        if kind and d["kind"] != kind:
-                            continue
-                        sec = J._extract_section(d["text"] or "", name)
-                        if "not found" not in sec:
-                            out.append({"doc_id": d["id"], "kind": d["kind"], "section": name, "text": sec})
-                            break
+                    d, text = J.get_section(conn, jid, qs.get("name"), qs.get("kind"))
                     conn.close()
-                    return self._json({"job_id": jid, "sections": out})
+                    if text is None:
+                        return self._json({"job_id": jid, "sections": [], "error": "section not found"}, 404)
+                    return self._json({"job_id": jid, "sections": [{"doc_id": d["id"], "kind": d["kind"],
+                                                                     "section": qs.get("name") or "key", "text": text}]})
+                if parts[4] == "sections":
+                    d, source, key = J.primary_document(conn, jid)
+                    conn.close()
+                    if not d:
+                        return self._json({"job_id": jid, "sections": {}})
+                    return self._json({"job_id": jid, "doc_id": d["id"], "kind": d["kind"], "key_section": key,
+                                       "sections": J.document_sections(source, d["text"], d["kind"])})
             if path == "/api/search":
                 conn = J.db()
                 kinds = [qs["kind"]] if qs.get("kind") else None

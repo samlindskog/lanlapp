@@ -293,12 +293,15 @@
       const r = await fetch(`/api/jobs/${id}`);
       const d = await r.json();
       const docs = d.documents.filter((x) => x.kind !== "board_card");
+      const prim = d.primary || {};
       el.innerHTML = docs.length ? docs.map((x) => {
         const text = x.text || "";
-        const qi = text.indexOf("\nQualifications\n");
-        const preview = qi >= 0 ? text.slice(qi, qi + 3000) : text.slice(0, 1500);
-        return `<details ${x.kind === "usajobs_announcement" ? "open" : ""}><summary>${esc(x.kind)} · ${esc(fmtLocal(x.fetched_at))} · ${text.length.toLocaleString()} chars</summary>
-          <pre>${esc(preview)}${text.length > preview.length ? "\n…" : ""}</pre>
+        const isPrimary = x.id === prim.doc_id;
+        const key = isPrimary && prim.key_section && prim.sections && prim.sections[prim.key_section];
+        const preview = key ? `${prim.key_section}\n\n${key.slice(0, 3000)}` : text.slice(0, 1500);
+        const truncated = key ? key.length > 3000 : text.length > 1500;
+        return `<details ${isPrimary ? "open" : ""}><summary>${esc(x.kind)} · ${esc(fmtLocal(x.fetched_at))} · ${text.length.toLocaleString()} chars</summary>
+          <pre>${esc(preview)}${truncated ? "\n…" : ""}</pre>
           <details><summary>full text</summary><pre>${esc(text)}</pre></details></details>`;
       }).join("") : '<em style="color:var(--muted)">no stored documents</em>';
     } catch (e) { el.textContent = "failed to load: " + e; }
