@@ -1,0 +1,16 @@
+services:
+  jobboard:
+    image: python:3.13-slim
+    container_name: jobboard
+    working_dir: /app
+    command: python3 server.py
+    environment:
+      PORT: "8080"
+      JOBSCAN_DB: /data/jobs.sqlite
+    volumes:
+      - ./server.py:/app/server.py:ro
+      - ./static:/app/static:ro
+      - ../jobscan/jobs.sqlite:/data/jobs.sqlite:ro
+    ports:
+      - "8080:8080"
+    restart: unless-stopped

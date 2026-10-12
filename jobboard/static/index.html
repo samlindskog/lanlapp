@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Job Board</title>
+<style>
+  :root {
+    --bg: #f7f7f5; --fg: #1c1c1c; --muted: #6b6b6b; --line: #d9d9d4; --card: #ffffff;
+    --accent: #1f5f8b; --yes: #1e7f4f; --maybe: #b26a00; --no: #9c2f2f; --none: #777;
+    --applied: #3b4cca; --chip: #ecece7;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #16181a; --fg: #e6e6e3; --muted: #9a9a96; --line: #30343a; --card: #1f2327;
+            --accent: #6fb3e0; --yes: #4fc08d; --maybe: #e0a84a; --no: #e06c6c; --none: #8a8a8a;
+            --applied: #8c9bff; --chip: #2a2f35; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+  header { padding: 14px 16px 10px; border-bottom: 1px solid var(--line); background: var(--card);
+           position: sticky; top: 0; z-index: 2; }
+  h1 { font-size: 18px; margin: 0 0 8px; }
+  .controls { display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: center; }
+  .group { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; }
+  .group > span.label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+  label.chk { display: inline-flex; align-items: center; gap: 4px; cursor: pointer;
+              padding: 2px 8px; border: 1px solid var(--line); border-radius: 999px; background: var(--chip); }
+  select, input[type=search] { font: inherit; padding: 4px 8px; border: 1px solid var(--line);
+                               border-radius: 6px; background: var(--card); color: var(--fg); }
+  input[type=search] { min-width: 220px; }
+  button { font: inherit; padding: 4px 10px; border: 1px solid var(--line); border-radius: 6px;
+           background: var(--card); color: var(--fg); cursor: pointer; }
+  .count { color: var(--muted); margin-left: auto; }
+  main { padding: 0 16px 40px; }
+  table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { position: sticky; top: 108px; background: var(--bg); font-size: 12px; text-transform: uppercase;
+       letter-spacing: .04em; color: var(--muted); cursor: pointer; user-select: none; white-space: nowrap; }
+  th.active { color: var(--accent); }
+  tr.row { cursor: pointer; }
+  tr.row:hover td { background: color-mix(in srgb, var(--accent) 8%, transparent); }
+  td.title { font-weight: 600; }
+  td.title small { display: block; font-weight: 400; color: var(--muted); }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 600;
+           color: #fff; }
+  .v-yes { background: var(--yes); } .v-maybe { background: var(--maybe); }
+  .v-no { background: var(--no); } .v-none { background: var(--none); }
+  .a-applied { background: var(--applied); } .a-drafted { background: #6b5ca5; }
+  .a-skipped { background: var(--none); } .a-withdrawn { background: var(--none); }
+  .closed { color: var(--muted); }
+  .soon { color: var(--maybe); font-weight: 600; }
+  a { color: var(--accent); }
+  tr.detail td { background: var(--card); padding: 12px 14px; }
+  .detail-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 6px 18px; margin-bottom: 10px; }
+  .detail-grid div { color: var(--muted); } .detail-grid div b { color: var(--fg); font-weight: 600; }
+  details { margin-top: 8px; }
+  summary { cursor: pointer; color: var(--accent); }
+  pre { white-space: pre-wrap; font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+        background: var(--bg); padding: 10px; border-radius: 6px; max-height: 420px; overflow: auto; }
+  @media (max-width: 800px) {
+    th.hide-sm, td.hide-sm { display: none; }
+    th { top: auto; position: static; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Job Board <span class="count" id="count"></span></h1>
+  <div class="controls">
+    <div class="group"><span class="label">Verdict</span>
+      <label class="chk"><input type="checkbox" data-f="verdict" value="yes" checked> yes</label>
+      <label class="chk"><input type="checkbox" data-f="verdict" value="maybe" checked> maybe</label>
+      <label class="chk"><input type="checkbox" data-f="verdict" value="no"> no</label>
+      <label class="chk"><input type="checkbox" data-f="verdict" value="none"> unjudged</label>
+    </div>
+    <div class="group"><span class="label">Applied</span>
+      <select id="applied">
+        <option value="any">any</option>
+        <option value="applied">applied</option>
+        <option value="not">not applied</option>
+        <option value="drafted">drafted only</option>
+        <option value="skipped">skipped</option>
+        <option value="untouched">no action yet</option>
+      </select>
+    </div>
+    <div class="group"><span class="label">Closing</span>
+      <select id="openness">
+        <option value="any">any</option>
+        <option value="open" selected>still open</option>
+        <option value="closed">closed</option>
+        <option value="week">closes within 7 days</option>
+      </select>
+    </div>
+    <div class="group"><span class="label">Source</span><select id="source"><option value="">all</option></select></div>
+    <div class="group"><span class="label">Sort</span>
+      <select id="sort">
+        <option value="close_date:asc">closing date, soonest first</option>
+        <option value="close_date:desc">closing date, latest first</option>
+        <option value="verdict:asc">verdict (yes → no)</option>
+        <option value="action:asc">applied first</option>
+        <option value="title:asc">title A–Z</option>
+        <option value="grade_low:asc">grade, low to high</option>
+        <option value="first_seen:desc">newest in database</option>
+      </select>
+    </div>
+    <div class="group"><input type="search" id="q" placeholder="search title, location, series, reason"></div>
+    <button id="reset">Reset</button>
+  </div>
+</header>
+<main>
+  <table>
+    <thead><tr>
+      <th data-sort="close_date">Closes</th>
+      <th data-sort="verdict">Verdict</th>
+      <th data-sort="action">Status</th>
+      <th data-sort="title">Title</th>
+      <th data-sort="grade_low" class="hide-sm">Grade</th>
+      <th class="hide-sm">Location</th>
+      <th class="hide-sm">Link</th>
+    </tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+</main>
+<script>
+(() => {
+  const $ = (s) => document.querySelector(s);
+  const state = { jobs: [], sort: "close_date", dir: "asc", open: null };
+  const VRANK = { yes: 0, maybe: 1, none: 2, no: 3 };
+  const ARANK = { applied: 0, drafted: 1, withdrawn: 2, skipped: 3, none: 4 };
+  const today = new Date().toISOString().slice(0, 10);
+  const week = new Date(Date.now() + 7 * 864e5).toISOString().slice(0, 10);
+
+  const verdictOf = (j) => j.verdict || "none";
+  const actionOf = (j) => j.action || "none";
+  const gradeOf = (j) => {
+    if (!j.pay_plan && j.grade_low == null) return "";
+    if (j.grade_low == null) return j.pay_plan;
+    const pp = j.pay_plan || "";
+    return j.grade_high && j.grade_high !== j.grade_low ? `${pp}-${j.grade_low}/${j.grade_high}` : `${pp}-${j.grade_low}`;
+  };
+  const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+  function filtered() {
+    const verdicts = new Set([...document.querySelectorAll('input[data-f="verdict"]:checked')].map((i) => i.value));
+    const applied = $("#applied").value, openness = $("#openness").value, source = $("#source").value;
+    const q = $("#q").value.trim().toLowerCase();
+    return state.jobs.filter((j) => {
+      if (!verdicts.has(verdictOf(j))) return false;
+      const a = actionOf(j);
+      if (applied === "applied" && a !== "applied") return false;
+      if (applied === "not" && a === "applied") return false;
+      if (applied === "drafted" && a !== "drafted") return false;
+      if (applied === "skipped" && a !== "skipped") return false;
+      if (applied === "untouched" && a !== "none") return false;
+      const c = j.close_date;
+      if (openness === "open" && c && c < today) return false;
+      if (openness === "closed" && !(c && c < today)) return false;
+      if (openness === "week" && !(c && c >= today && c <= week)) return false;
+      if (source && j.source !== source) return false;
+      if (q) {
+        const hay = [j.title, j.location, j.series, j.verdict_reason, j.announcement_no, j.action_note, gradeOf(j)].join(" ").toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      return true;
+    });
+  }
+
+  function sorted(rows) {
+    const k = state.sort, d = state.dir === "asc" ? 1 : -1;
+    const key = (j) => {
+      if (k === "verdict") return VRANK[verdictOf(j)];
+      if (k === "action") return ARANK[actionOf(j)];
+      if (k === "close_date") return j.close_date || "9999-99-99";
+      if (k === "grade_low") return j.grade_low ?? 99;
+      if (k === "first_seen") return j.first_seen || "";
+      return (j.title || "").toLowerCase();
+    };
+    return rows.slice().sort((a, b) => {
+      const x = key(a), y = key(b);
+      if (x < y) return -d; if (x > y) return d;
+      return (a.close_date || "9999") < (b.close_date || "9999") ? -1 : 1;
+    });
+  }
+
+  function closeCell(j) {
+    if (!j.close_date) return '<span class="closed">?</span>';
+    if (j.close_date < today) return `<span class="closed">${j.close_date}</span>`;
+    if (j.close_date <= week) return `<span class="soon">${j.close_date}</span>`;
+    return j.close_date;
+  }
+
+  function render() {
+    const rows = sorted(filtered());
+    $("#count").textContent = `${rows.length} of ${state.jobs.length}`;
+    document.querySelectorAll("th[data-sort]").forEach((th) => th.classList.toggle("active", th.dataset.sort === state.sort));
+    $("#rows").innerHTML = rows.map((j) => {
+      const v = verdictOf(j), a = actionOf(j);
+      const link = j.external_url || j.board_url;
+      return `<tr class="row" data-id="${j.id}">
+        <td>${closeCell(j)}</td>
+        <td><span class="badge v-${v}">${v === "none" ? "unjudged" : v}</span>${j.eligible_grades ? `<br><small>${esc(j.eligible_grades)}</small>` : ""}</td>
+        <td>${a === "none" ? "" : `<span class="badge a-${a}">${a}</span>${j.action_date ? `<br><small>${j.action_date}</small>` : ""}`}</td>
+        <td class="title">${esc(j.title)}<small>${esc(j.series || "")}${j.announcement_no ? " · " + esc(j.announcement_no) : ""}</small></td>
+        <td class="hide-sm">${esc(gradeOf(j))}</td>
+        <td class="hide-sm">${esc((j.location || "").slice(0, 60))}</td>
+        <td class="hide-sm">${link ? `<a href="${esc(link)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">open ↗</a>` : ""}</td>
+      </tr>` + (state.open === j.id ? detailRow(j) : "");
+    }).join("");
+  }
+
+  function detailRow(j) {
+    return `<tr class="detail"><td colspan="7">
+      <div class="detail-grid">
+        <div>Verdict: <b>${esc(verdictOf(j))}</b> ${j.eligible_grades ? `(${esc(j.eligible_grades)})` : ""}</div>
+        <div>Reason: <b>${esc(j.verdict_reason || "—")}</b></div>
+        <div>Status: <b>${esc(actionOf(j))}</b> ${j.action_date ? esc(j.action_date) : ""}</div>
+        <div>Resume: <b>${esc(j.resume_dir || "—")}</b></div>
+        <div>Note: <b>${esc(j.action_note || "—")}</b></div>
+        <div>Opens / closes: <b>${esc(j.open_date || "?")} / ${esc(j.close_date || "?")}</b></div>
+        <div>Salary: <b>${esc(j.salary || "—")}</b></div>
+        <div>Source: <b>${esc(j.source)}</b> · first seen ${esc((j.first_seen || "").slice(0, 10))}</div>
+        <div>Links: ${j.external_url ? `<a href="${esc(j.external_url)}" target="_blank" rel="noopener">USAJOBS</a>` : ""} ${j.board_url ? `<a href="${esc(j.board_url)}" target="_blank" rel="noopener">board</a>` : ""}</div>
+      </div>
+      <div id="docs-${j.id}"><em style="color:var(--muted)">loading stored text…</em></div>
+    </td></tr>`;
+  }
+
+  async function loadDocs(id) {
+    const el = document.getElementById(`docs-${id}`);
+    if (!el) return;
+    try {
+      const r = await fetch(`/api/jobs/${id}`);
+      const d = await r.json();
+      const docs = d.documents.filter((x) => x.kind !== "board_card");
+      el.innerHTML = docs.length ? docs.map((x) => {
+        const text = x.text || "";
+        const qi = text.indexOf("\nQualifications\n");
+        const preview = qi >= 0 ? text.slice(qi, qi + 3000) : text.slice(0, 1500);
+        return `<details ${x.kind === "usajobs_announcement" ? "open" : ""}><summary>${esc(x.kind)} · ${esc((x.fetched_at || "").slice(0, 10))} · ${text.length.toLocaleString()} chars</summary>
+          <pre>${esc(preview)}${text.length > preview.length ? "\n…" : ""}</pre>
+          <details><summary>full text</summary><pre>${esc(text)}</pre></details></details>`;
+      }).join("") : '<em style="color:var(--muted)">no stored documents</em>';
+    } catch (e) { el.textContent = "failed to load: " + e; }
+  }
+
+  document.addEventListener("change", (e) => { if (e.target.closest("header")) {
+    if (e.target.id === "sort") [state.sort, state.dir] = e.target.value.split(":");
+    render();
+  }});
+  $("#q").addEventListener("input", render);
+  $("#reset").addEventListener("click", () => {
+    document.querySelectorAll('input[data-f="verdict"]').forEach((i) => i.checked = i.value === "yes" || i.value === "maybe");
+    $("#applied").value = "any"; $("#openness").value = "open"; $("#source").value = ""; $("#q").value = "";
+    $("#sort").value = "close_date:asc"; state.sort = "close_date"; state.dir = "asc"; render();
+  });
+  document.querySelectorAll("th[data-sort]").forEach((th) => th.addEventListener("click", () => {
+    const k = th.dataset.sort;
+    state.dir = state.sort === k && state.dir === "asc" ? "desc" : "asc"; state.sort = k;
+    const opt = [...$("#sort").options].find((o) => o.value === `${k}:${state.dir}`);
+    if (opt) $("#sort").value = opt.value;
+    render();
+  }));
+  $("#rows").addEventListener("click", (e) => {
+    const tr = e.target.closest("tr.row"); if (!tr) return;
+    const id = Number(tr.dataset.id);
+    state.open = state.open === id ? null : id; render();
+    if (state.open === id) loadDocs(id);
+  });
+
+  fetch("/api/jobs").then((r) => r.json()).then((d) => {
+    state.jobs = d.jobs;
+    const sources = [...new Set(d.jobs.map((j) => j.source))].sort();
+    $("#source").innerHTML = '<option value="">all</option>' + sources.map((s) => `<option value="${esc(s)}">${esc(s)}</option>`).join("");
+    render();
+  }).catch((e) => { $("#rows").innerHTML = `<tr><td colspan="7">failed to load /api/jobs: ${esc(e)}</td></tr>`; });
+})();
+</script>
+</body>
+</html>
