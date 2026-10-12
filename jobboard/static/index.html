@@ -74,6 +74,9 @@
   select.status.a-applied { background: var(--applied); } select.status.a-drafted { background: #6b5ca5; }
   select.status.a-skipped, select.status.a-withdrawn { background: var(--none); }
   select.status.big { font-size: 13px; }
+  select.status.v-yes, select.status.v-maybe, select.status.v-no { color: #fff; border-color: transparent; }
+  select.status.v-yes { background: var(--yes); } select.status.v-maybe { background: var(--maybe); } select.status.v-no { background: var(--no); }
+  details.reason summary { color: var(--muted); font-size: 12px; }
   .closed { color: var(--muted); }
   th.sel, td.sel { width: 28px; padding-right: 0; display: none; }
   body.select-mode th.sel, body.select-mode td.sel { display: table-cell; }
@@ -119,7 +122,12 @@
     <option value="skipped">skipped</option><option value="withdrawn">withdrawn</option></select></label>
   <label>Date<br><input type="date" id="bulkDate"></label>
   <label>Note (optional)<br><input type="text" id="bulkNote" placeholder="e.g. applied via USAJOBS"></label>
-  <button id="bulkApply">Apply to selected</button>
+  <button id="bulkApply">Apply status to selected</button>
+  <hr style="border:0;border-top:1px solid var(--line);width:100%">
+  <label>Set verdict to<br><select id="bulkVerdict">
+    <option value="yes">yes</option><option value="maybe">maybe</option><option value="no">no</option>
+    <option value="__reset">reset to claude's</option></select></label>
+  <button id="bulkVerdictApply">Apply verdict to selected</button>
   <button id="bulkClear">Clear selection</button>
   <p class="muted">Tip: click a checkbox, then shift-click another to select the range between them. The header checkbox selects everything listed.</p>
 </aside>
@@ -287,6 +295,16 @@
   }
 
   const ACTIONS = ["applied", "drafted", "skipped", "withdrawn"];
+  const VERDICTS = ["yes", "maybe", "no"];
+  // A verdict counts as overridden when the latest one is yours and differs from Claude's latest.
+  const overridden = (j) => j.verdict_author === "user" && j.claude_verdict && j.verdict !== j.claude_verdict;
+  function verdictSelect(j, v, extraClass = "") {
+    const reset = j.claude_verdict && v !== j.claude_verdict ? `<option value="__reset">reset to claude's (${j.claude_verdict})</option>` : "";
+    return `<select class="status v-${v} ${extraClass}" data-verdict="${j.id}" title="Set verdict (saved immediately)" onclick="event.stopPropagation()">
+      <option value="" ${v === "none" ? "selected" : ""}>unjudged</option>
+      ${VERDICTS.map((x) => `<option value="${x}" ${v === x ? "selected" : ""}>${x}</option>`).join("")}${reset}
+    </select>`;
+  }
   function statusSelect(j, a, extraClass = "") {
     return `<select class="status a-${a} ${extraClass}" data-status="${j.id}" title="Set status (saved immediately)" onclick="event.stopPropagation()">
       <option value="" ${a === "none" ? "selected" : ""}>—</option>
@@ -313,7 +331,7 @@
       return `<tr class="row ${state.selected.has(j.id) ? "selected" : ""}" data-id="${j.id}">
         <td class="sel"><input type="checkbox" data-sel="${j.id}" ${state.selected.has(j.id) ? "checked" : ""}></td>
         <td>${closeCell(j)}</td>
-        <td><span class="badge v-${v}">${v === "none" ? "unjudged" : v}</span>${j.eligible_grades ? `<br><small>${esc(j.eligible_grades)}</small>` : ""}</td>
+        <td>${verdictSelect(j, v)}${overridden(j) ? `<br><small title="${esc(j.claude_reason || "")}">claude: ${esc(j.claude_verdict)}</small>` : (j.eligible_grades ? `<br><small>${esc(j.eligible_grades)}</small>` : "")}</td>
         <td>${statusSelect(j, a)}${j.action_date ? `<br><small>${j.action_date}</small>` : ""}</td>
         <td class="title">${esc(j.title)}<small>${esc(j.series || "")}${j.announcement_no ? " · " + esc(j.announcement_no) : ""}</small></td>
         <td class="hide-sm">${esc(gradeOf(j))}</td>
@@ -327,8 +345,10 @@
   function detailRow(j) {
     return `<tr class="detail"><td colspan="9">
       <div class="detail-grid">
-        <div>Verdict: <b>${esc(verdictOf(j))}</b> ${j.eligible_grades ? `(${esc(j.eligible_grades)})` : ""}</div>
-        <div>Reason: <b>${esc(j.verdict_reason || "—")}</b></div>
+        <div>Verdict: ${verdictSelect(j, verdictOf(j), "big")} ${j.eligible_grades ? `(${esc(j.eligible_grades)})` : ""}${j.verdict_author === "user" ? ` <small>set by you</small>` : ""}</div>
+        <div>${overridden(j)
+          ? `<details class="reason"><summary>Claude's verdict: ${esc(j.claude_verdict)}${j.claude_grades ? ` (${esc(j.claude_grades)})` : ""} — reason minimized</summary><b>${esc(j.claude_reason || "—")}</b></details>`
+          : `Reason: <b>${esc(j.claude_reason || j.verdict_reason || "—")}</b>`}</div>
         <div>Status: ${statusSelect(j, actionOf(j), "big")} ${j.action_date ? esc(j.action_date) : ""}</div>
         <div>Resume: ${(j.resume_files || []).filter((f) => f.name.toLowerCase().endsWith(".pdf")).map((f) => `<a href="/view.html?f=${encodeURIComponent(f.path)}" target="_blank" rel="noopener">${esc(f.path)}</a>`).join(" · ") || `<b>${esc(j.resume_dir || "—")}</b>`}</div>
         <div>Note: <b>${esc(j.action_note || "—")}</b></div>
@@ -474,7 +494,7 @@
     $("#bulkToggle").classList.toggle("on", state.bulkOpen);
     $("#bulkToggle").textContent = state.bulkOpen ? "Done selecting" : "Select…";
     $("#selCount").textContent = n;
-    $("#bulkApply").disabled = n === 0;
+    $("#bulkApply").disabled = n === 0; $("#bulkVerdictApply").disabled = n === 0;
     if (!$("#bulkDate").value) $("#bulkDate").value = today;
   }
   function exitSelectMode() { state.bulkOpen = false; state.selected.clear(); state.lastClicked = null; render(); }
@@ -521,7 +541,32 @@
     b.dataset.more = full ? "0" : "1";
     b.textContent = full ? "Show less" : (b.dataset.label || "Show full text");
   });
+  async function setVerdict(id, value) {
+    const job = state.jobs.find((j) => j.id === id);
+    let body;
+    if (value === "__reset") body = { verdict: job.claude_verdict, grades: job.claude_grades, reason: "reset to Claude's verdict", author: "user" };
+    else body = { verdict: value, reason: "set by user", author: "user" };
+    setRun("running", `verdict [${id}] ${job ? job.title : ""}: saving ${body.verdict}…`);
+    try { await post(`/api/jobs/${id}/verdict`, body); setRun("done", `verdict [${id}]: ${body.verdict}`); await reload(); }
+    catch (err) { setRun("failed", `verdict [${id}] failed: ${err.message}`); render(); }
+  }
+  $("#bulkVerdictApply").addEventListener("click", async () => {
+    const ids = [...state.selected], value = $("#bulkVerdict").value;
+    let ok = 0, fail = 0;
+    for (const id of ids) {
+      const job = state.jobs.find((j) => j.id === id);
+      if (value === "__reset" && !(job && job.claude_verdict)) { fail++; continue; }
+      const body = value === "__reset" ? { verdict: job.claude_verdict, grades: job.claude_grades, reason: "reset to Claude's verdict", author: "user" }
+                                       : { verdict: value, reason: "set by user", author: "user" };
+      setRun("running", `bulk verdict: ${ok + fail + 1}/${ids.length}…`);
+      try { await post(`/api/jobs/${id}/verdict`, body); ok++; } catch (err) { fail++; }
+    }
+    setRun(fail ? "failed" : "done", `bulk verdict set on ${ok} job(s)${fail ? `, ${fail} skipped/failed` : ""}`);
+    state.selected.clear(); state.lastClicked = null; await reload();
+  });
   $("#rows").addEventListener("change", async (e) => {
+    const vs = e.target.closest("select[data-verdict]");
+    if (vs) { e.stopPropagation(); if (vs.value) await setVerdict(Number(vs.dataset.verdict), vs.value); else render(); return; }
     const sel = e.target.closest("select[data-status]"); if (!sel) return;
     e.stopPropagation();
     const id = Number(sel.dataset.status), action = sel.value, job = state.jobs.find((j) => j.id === id);

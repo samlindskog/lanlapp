@@ -94,7 +94,8 @@ CREATE TABLE IF NOT EXISTS verdicts (
     eligible_grades TEXT,
     reason TEXT,
     assessed_at TEXT,
-    profile_hash TEXT
+    profile_hash TEXT,
+    author TEXT NOT NULL DEFAULT 'claude'   -- 'claude' (judged) or 'user' (override)
 );
 CREATE INDEX IF NOT EXISTS verdicts_job ON verdicts(job_id);
 CREATE TABLE IF NOT EXISTS actions (
@@ -136,6 +137,10 @@ def db(path=None):
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=30000")
     conn.executescript(SCHEMA)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(verdicts)")}
+    if "author" not in cols:
+        conn.execute("ALTER TABLE verdicts ADD COLUMN author TEXT NOT NULL DEFAULT 'claude'")
+        conn.commit()
     return conn
 
 
@@ -430,14 +435,17 @@ def search_documents(conn, query, kinds=None, limit=50, context=160):
     return hits
 
 
-def record_verdict(conn, job_id, verdict, grades=None, reason=None, profile_hash=None):
+def record_verdict(conn, job_id, verdict, grades=None, reason=None, profile_hash=None,
+                   author="claude"):
     if verdict not in ("yes", "no", "maybe"):
         raise ValueError("verdict must be yes, no or maybe")
+    if author not in ("claude", "user"):
+        raise ValueError("author must be claude or user")
     if not conn.execute("SELECT 1 FROM jobs WHERE id=?", (job_id,)).fetchone():
         raise KeyError(job_id)
     cur = conn.execute("""INSERT INTO verdicts (job_id, verdict, eligible_grades, reason,
-        assessed_at, profile_hash) VALUES (?,?,?,?,?,?)""",
-                       (job_id, verdict, grades, reason, now(), profile_hash))
+        assessed_at, profile_hash, author) VALUES (?,?,?,?,?,?,?)""",
+                       (job_id, verdict, grades, reason, now(), profile_hash, author))
     conn.commit()
     return cur.lastrowid
 
@@ -480,10 +488,14 @@ def add_job(conn, title, source="manual", source_id=None, location=None, announc
 
 JOBS_VIEW_SQL = """
 SELECT j.*, v.verdict, v.eligible_grades, v.reason AS verdict_reason, v.assessed_at,
-       v.profile_hash, a.action, a.action_date, a.resume_dir, a.note AS action_note,
+       v.profile_hash, v.author AS verdict_author,
+       c.verdict AS claude_verdict, c.eligible_grades AS claude_grades, c.reason AS claude_reason,
+       c.assessed_at AS claude_assessed_at,
+       a.action, a.action_date, a.resume_dir, a.note AS action_note,
        (SELECT MAX(fetched_at) FROM documents WHERE job_id = j.id) AS last_fetched
 FROM jobs j
 LEFT JOIN verdicts v ON v.id = (SELECT MAX(id) FROM verdicts WHERE job_id = j.id)
+LEFT JOIN verdicts c ON c.id = (SELECT MAX(id) FROM verdicts WHERE job_id = j.id AND author = 'claude')
 LEFT JOIN actions  a ON a.id = (SELECT MAX(id) FROM actions  WHERE job_id = j.id)
 """
 
@@ -727,7 +739,7 @@ def cmd_autoreject(a):
 
 
 def cmd_verdict(a):
-    record_verdict(db(), a.id, a.verdict, a.grades, a.reason, a.profile_hash)
+    record_verdict(db(), a.id, a.verdict, a.grades, a.reason, a.profile_hash, a.author)
     print(f"[{a.id}] {a.verdict} ({a.grades or ''}) — {a.reason}")
 
 
@@ -859,6 +871,7 @@ def main(argv=None):
     s.add_argument("--grades", help="grades the user is eligible for, e.g. GS-5/7")
     s.add_argument("--reason", required=True)
     s.add_argument("--profile-hash")
+    s.add_argument("--author", default="claude", choices=["claude", "user"])
     s.set_defaults(fn=cmd_verdict)
 
     s = sp.add_parser("report", help="markdown table of judged jobs")

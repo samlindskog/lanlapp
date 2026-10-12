@@ -15,7 +15,8 @@ Agent API  : JSON over HTTP, documented at GET /api  (also in .claude/skills/job
   GET  /api/jobs/<id>/section?name=<heading>[&kind=<kind>]   one section (default: the board's key section)
   GET  /api/search?q=<terms>&kind=<kind>&limit=50     full-text search, snippets
   POST /api/jobs                  {title, url?, location?, open_date?, close_date?, text?, fetch?:true, ...}
-  POST /api/jobs/<id>/verdict     {verdict: yes|no|maybe, grades?, reason, profile_hash?}
+  POST /api/jobs/<id>/verdict     {verdict: yes|no|maybe, grades?, reason, profile_hash?, author?: claude|user}
+                                  (author=user marks a human override; Claude's latest verdict is kept as claude_verdict)
   POST /api/jobs/<id>/action      {action: applied|skipped|drafted|withdrawn, date?, resume_dir?, note?}
   POST /api/jobs/<id>/refresh     re-fetch the posting now (synchronous)
   POST /api/scan                  {source, days?:7, all?:false, refetch?:false}  -> {run_id}
@@ -327,7 +328,8 @@ class Handler(SimpleHTTPRequestHandler):
                 conn = J.db()
                 if sub == "verdict":
                     vid = J.record_verdict(conn, jid, body.get("verdict"), body.get("grades"),
-                                           body.get("reason"), body.get("profile_hash"))
+                                           body.get("reason"), body.get("profile_hash"),
+                                           body.get("author", "claude"))
                     d = J.job_detail(conn, jid, with_text=False)
                     conn.close()
                     return self._json({"verdict_id": vid, "job": d["job"]}, 201)
