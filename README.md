@@ -1,8 +1,11 @@
-# Job applications workspace
+# jobboard — job research application
+
+The application only. Resumes, EXPERIENCE.md (the user's facts) and the research skills live in the
+separate workspace repo at `~/Desktop/resumes`; resume files are uploaded to this service through the
+MCP tool `upload_resume` (workspace script `bin/sync-resume`) and stored in Postgres. Nothing personal
+is synced through this repo.
 
 ```
-EXPERIENCE.md        master record of education, work, projects, skills (facts only)
-applications/        one directory per tailored resume or cover letter (LaTeX + build output)
 jobscan/             job posting tracker (PostgreSQL + pgvector, runs in the compose stack)
   jobscan.py           CLI + library: scan boards, judge, report, record applications, embed, search
   sources/             one adapter per job board (usace_yellogov.py, ...)
@@ -12,10 +15,6 @@ jobboard/            shared research service over the database
                        OPENAI_API_KEY is read from your shell (or jobboard/.env) for embeddings
   server.py            web page for the human, JSON API for Claude (GET /api lists it)
   static/index.html    the page: filters, sorting, scan/refresh buttons, status + verdict forms
-.claude/
-  skills/new-resume        how to draft a resume from EXPERIENCE.md
-  skills/job-search        board-agnostic scan → judge → report → record workflow
-  skills/job-source-usace  USACE (yellogov → USAJOBS) board mechanics
 ```
 
 API in one minute (full list at http://localhost:8080/api):
@@ -61,3 +60,5 @@ gunzip -c jobscan-backup.sql.gz | docker compose -f jobboard/compose.yaml exec -
 - One-time server setup: `deploy/bootstrap.sh` (see its header). Firewall input policy: ssh, WireGuard, 443, MCP on wg0.
   Re-runnable; also restores `/tmp/jobscan-dump.sql.gz` into an empty database. Secrets: `deploy/push-secrets.sh`.
 - Claude's token lives in `~/.config/jobboard/token` on the Mac; the MCP server is registered in Claude Code as `jobboard`.
+- MCP tools: stats, list_jobs, get_job, get_section, search, sources, scan, run_status, refresh, set_verdict,
+  set_status, add_job, upload_resume, list_resumes, logs, runs.
