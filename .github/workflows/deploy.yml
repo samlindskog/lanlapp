@@ -26,6 +26,8 @@ jobs:
       - run: pip install "psycopg[binary]>=3.2"
       - name: syntax
         run: python -m py_compile jobscan/jobscan.py jobscan/sources/*.py jobboard/server.py jobboard/auth.py jobboard/mcp.py
+      - name: adapter contract + stubbed scan
+        run: python tests/test_adapters.py
       - name: smoke test (api + auth + mcp)
         env:
           JOBSCAN_DSN: postgresql://jobscan:jobscan@localhost:5432/jobscan
