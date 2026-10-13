@@ -75,7 +75,6 @@ jobs:
           mkdir -p ~/.ssh && chmod 700 ~/.ssh
           printf '%s\n' "$KEY" > ~/.ssh/deploy && chmod 600 ~/.ssh/deploy
           printf '%s\n' "$KNOWN" > ~/.ssh/known_hosts
-          # Update the checkout first, then run the (now current) deploy script: a script that
-          # rewrites itself mid-run via git reset is not reliable.
-          ssh -i ~/.ssh/deploy -o IdentitiesOnly=yes "deploy@$HOST" \
-            "cd /opt/jobboard && git fetch --quiet origin && git reset --hard --quiet origin/master && deploy/deploy.sh origin/master"
+          # The deploy key is pinned to a forced command on the VPS (jobboard-deploy); whatever is sent here
+          # is only read as the ref to deploy. The deploy user has no docker access and no shell.
+          ssh -i ~/.ssh/deploy -o IdentitiesOnly=yes "deploy@$HOST" "jobboard-deploy origin/master"

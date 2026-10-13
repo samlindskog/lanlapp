@@ -47,8 +47,9 @@ if [ -f "$HERE/reboot" ]; then
   exit 0
 fi
 
-[ -f "$HERE/github_deploy_key" ] || { echo "missing $HERE/github_deploy_key"; exit 1; }
-[ -f "$HERE/jobboard_deploy.pub" ] || { echo "missing $HERE/jobboard_deploy.pub"; exit 1; }
+# Keys: needed on the first run; on re-runs the installed copies are reused when the staged files are absent.
+[ -f "$HERE/github_deploy_key" ] || [ -f /home/deploy/.ssh/github_deploy_key ] || { echo "missing $HERE/github_deploy_key"; exit 1; }
+[ -f "$HERE/jobboard_deploy.pub" ] || [ -f /home/deploy/.ssh/deploy_keys.pub ] || { echo "missing $HERE/jobboard_deploy.pub"; exit 1; }
 
 log "backups"
 mkdir -p /root/jobboard-bootstrap-backup
@@ -70,10 +71,15 @@ echo "git nginx nft curl docker present"
 
 log "deploy user"
 id deploy >/dev/null 2>&1 || useradd -m -s /bin/bash deploy
-usermod -aG docker deploy
+# deploy is NOT in the docker group (docker socket = root). Container work goes through the sudo helper.
+gpasswd -d deploy docker >/dev/null 2>&1 || true
 install -d -m 700 -o deploy -g deploy /home/deploy/.ssh
-install -m 600 -o deploy -g deploy "$HERE/jobboard_deploy.pub" /home/deploy/.ssh/authorized_keys
-install -m 600 -o deploy -g deploy "$HERE/github_deploy_key" /home/deploy/.ssh/github_deploy_key
+[ -f "$HERE/jobboard_deploy.pub" ] && install -m 600 -o deploy -g deploy "$HERE/jobboard_deploy.pub" /home/deploy/.ssh/deploy_keys.pub
+[ -f "$HERE/github_deploy_key" ] && install -m 600 -o deploy -g deploy "$HERE/github_deploy_key" /home/deploy/.ssh/github_deploy_key
+# Every deploy key is pinned to the forced command: the key can only run jobboard-deploy, nothing else.
+OPTS='command="/usr/local/bin/jobboard-deploy",no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-pty,restrict'
+sed -E "s#^#$OPTS #" /home/deploy/.ssh/deploy_keys.pub > /home/deploy/.ssh/authorized_keys
+chown deploy:deploy /home/deploy/.ssh/authorized_keys; chmod 600 /home/deploy/.ssh/authorized_keys
 cat > /home/deploy/.ssh/config <<EOF
 Host github.com
   IdentityFile /home/deploy/.ssh/github_deploy_key
@@ -107,7 +113,14 @@ if [ ! -d "$APP/.git" ]; then
 else
   su - deploy -c "cd $APP && git fetch --quiet origin && git reset --hard --quiet origin/master"
 fi
-chmod +x "$APP/deploy/deploy.sh"
+# Root-owned copies of the deploy scripts: a push to master cannot change how deploys run.
+install -m 755 -o root -g root "$APP/deploy/deploy.sh" /usr/local/bin/jobboard-deploy
+install -m 755 -o root -g root "$APP/deploy/compose-up.sh" /usr/local/sbin/jobboard-compose-up
+cat > /etc/sudoers.d/jobboard-deploy <<'EOF'
+deploy ALL=(root) NOPASSWD: /usr/local/sbin/jobboard-compose-up
+EOF
+chmod 440 /etc/sudoers.d/jobboard-deploy; visudo -c >/dev/null
+git config --system --add safe.directory "$APP" 2>/dev/null || true
 
 log "secrets -> $APP/.env"
 if [ ! -f "$APP/.env" ]; then
@@ -182,16 +195,16 @@ nft -f /etc/nftables.d/jobboard.nft
 systemctl enable nftables >/dev/null 2>&1 || true
 echo "input: ssh 22, wireguard udp $WG_PORT, https 443, mcp $MCP_PORT on $WG_IF only. Everything else dropped."
 
-log "first deploy"
-su - deploy -c "$APP/deploy/deploy.sh"
+log "deploy"
+su - deploy -c "/usr/local/bin/jobboard-deploy origin/master"
 
 log "database restore (if a dump is staged and the jobs table is empty)"
 DUMP=/tmp/jobscan-dump.sql.gz
 if [ -f "$DUMP" ]; then
-  N=$(su - deploy -c "cd $APP && docker compose -f jobboard/compose.prod.yaml --env-file .env exec -T db psql -U jobscan -d jobscan -tAc 'SELECT COUNT(*) FROM jobs'" 2>/dev/null | tail -1 || echo "?")
+  N=$(bash -c "cd $APP && docker compose -f jobboard/compose.prod.yaml --env-file .env exec -T db psql -U jobscan -d jobscan -tAc 'SELECT COUNT(*) FROM jobs'" 2>/dev/null | tail -1 || echo "?")
   if [ "$N" = "0" ]; then
-    su - deploy -c "cd $APP && gunzip -c $DUMP | docker compose -f jobboard/compose.prod.yaml --env-file .env exec -T db psql -U jobscan -d jobscan -q -v ON_ERROR_STOP=0" >/tmp/jobscan-restore.log 2>&1 || true
-    N2=$(su - deploy -c "cd $APP && docker compose -f jobboard/compose.prod.yaml --env-file .env exec -T db psql -U jobscan -d jobscan -tAc 'SELECT COUNT(*) FROM jobs'" 2>/dev/null | tail -1)
+    bash -c "cd $APP && gunzip -c $DUMP | docker compose -f jobboard/compose.prod.yaml --env-file .env exec -T db psql -U jobscan -d jobscan -q -v ON_ERROR_STOP=0" >/tmp/jobscan-restore.log 2>&1 || true
+    N2=$(bash -c "cd $APP && docker compose -f jobboard/compose.prod.yaml --env-file .env exec -T db psql -U jobscan -d jobscan -tAc 'SELECT COUNT(*) FROM jobs'" 2>/dev/null | tail -1)
     echo "restored: jobs=$N2 (log: /tmp/jobscan-restore.log, errors: $(grep -c ERROR /tmp/jobscan-restore.log || true))"
     rm -f "$DUMP"
   else
@@ -202,11 +215,11 @@ else
 fi
 
 log "api token for Claude"
-HAVE=$(su - deploy -c "cd $APP && docker compose -f jobboard/compose.prod.yaml --env-file .env exec -T db psql -U jobscan -d jobscan -tAc \"SELECT COUNT(*) FROM auth_tokens WHERE name='claude-mac' AND revoked_at IS NULL\"" 2>/dev/null | tail -1 || echo 0)
+HAVE=$(bash -c "cd $APP && docker compose -f jobboard/compose.prod.yaml --env-file .env exec -T db psql -U jobscan -d jobscan -tAc \"SELECT COUNT(*) FROM auth_tokens WHERE name='claude-mac' AND revoked_at IS NULL\"" 2>/dev/null | tail -1 || echo 0)
 if [ "${HAVE:-0}" != "0" ]; then
   echo "an active claude-mac token already exists; not minting another (revoke it via the API to re-mint)"
 elif [ ! -f "$HERE/claude-token" ]; then
-  TOK=$(su - deploy -c "cd $APP && docker compose -f jobboard/compose.prod.yaml --env-file .env exec -T jobboard python3 server.py issue-token claude-mac" 2>/dev/null | tail -1)
+  TOK=$(bash -c "cd $APP && docker compose -f jobboard/compose.prod.yaml --env-file .env exec -T jobboard python3 server.py issue-token claude-mac" 2>/dev/null | tail -1)
   if [ -n "$TOK" ]; then
     install -m 600 -o "$(stat -c %U "$HERE")" /dev/null "$HERE/claude-token"
     echo "$TOK" > "$HERE/claude-token"
