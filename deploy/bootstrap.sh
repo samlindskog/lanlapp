@@ -163,8 +163,8 @@ install -m 644 "$APP/deploy/homepage.html" /var/www/slindskog.net/index.html
 install -m 644 "$APP/deploy/nginx-jobboard.conf" /etc/nginx/sites-available/jobboard.conf
 ln -sf /etc/nginx/sites-available/jobboard.conf /etc/nginx/sites-enabled/jobboard.conf
 rm -f /etc/nginx/sites-enabled/default
-nginx -t && systemctl reload nginx
-echo "nginx reloaded: jobs.slindskog.net -> 127.0.0.1:8080, homepage, default 444"
+nginx -t
+echo "nginx config installed; reloaded after the deploy step (the MCP listener on $WG_IP:$MCP_PORT needs the old container gone first)"
 
 log "firewall (nftables, input policy only; NAT/forward left as they are)"
 WG_PORT=$(wg show "$WG_IF" listen-port 2>/dev/null || echo 51820)
@@ -197,6 +197,9 @@ echo "input: ssh 22, wireguard udp $WG_PORT, https 443, mcp $MCP_PORT on $WG_IF 
 
 log "deploy"
 su - deploy -c "/usr/local/bin/jobboard-deploy origin/master"
+systemctl reload nginx
+echo "nginx reloaded: jobs.slindskog.net -> 127.0.0.1:8080 (login paths open, everything else needs a cookie or token),"
+echo "                mcp $WG_IP:$MCP_PORT -> 127.0.0.1:8091 (Bearer only), homepage, default 444"
 
 log "database restore (if a dump is staged and the jobs table is empty)"
 DUMP=/tmp/jobscan-dump.sql.gz

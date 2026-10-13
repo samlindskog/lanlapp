@@ -1,6 +1,7 @@
 """Minimal MCP server (JSON-RPC over HTTP, "streamable HTTP" transport, POST only)
-exposing the jobboard API as tools. Bound to the WireGuard address only in
-production, and protected by the same bearer tokens as the API.
+exposing the jobboard API as tools. Every method on every path needs one of the
+API's bearer tokens. In production the container listens on 127.0.0.1:8091 and
+nginx fronts it on the WireGuard address, rejecting token-less requests itself.
 
 Register in Claude Code:
   claude mcp add --transport http jobboard http://10.88.0.1:8090/mcp \
@@ -139,17 +140,30 @@ def make_handler(J, api):
             if body:
                 self.wfile.write(body)
 
+        def _authorized(self):
+            """Bearer token first, on every method: nothing (not even a 404) is answered without one."""
+            if api.authorized_bearer(self.headers.get("Authorization")):
+                return True
+            self._send(401, {"error": "bearer token required"})
+            return False
+
         def do_GET(self):
-            self._send(405, {"error": "POST JSON-RPC to /mcp"})
+            if self._authorized():
+                self._send(405, {"error": "POST JSON-RPC to /mcp"})
+
+        def do_HEAD(self):
+            if self._authorized():
+                self._send(405)
 
         def do_DELETE(self):
-            self._send(204)
+            if self._authorized():
+                self._send(204)
 
         def do_POST(self):
+            if not self._authorized():
+                return
             if self.path.rstrip("/") != "/mcp":
                 return self._send(404, {"error": "not found"})
-            if not api.authorized_bearer(self.headers.get("Authorization")):
-                return self._send(401, {"error": "bearer token required"})
             n = int(self.headers.get("Content-Length") or 0)
             try:
                 req = json.loads(self.rfile.read(n) or b"{}")

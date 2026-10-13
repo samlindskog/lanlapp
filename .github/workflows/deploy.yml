@@ -49,6 +49,11 @@ jobs:
                -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_jobs","arguments":{}}}' \
                | python3 -c 'import sys,json; r=json.load(sys.stdin); assert not r["result"]["isError"]; print("mcp ok")'
           test "$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8090/mcp -d '{}')" = 401
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8090/mcp)" = 401
+          test "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE http://127.0.0.1:8090/mcp)" = 401
+          test "$(curl -s -o /dev/null -w '%{http_code}' -I http://127.0.0.1:8080/index.html)" = 302
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/view.html)" = 302
+          test "$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8080/api/auth/token -H 'Content-Type: application/json' -d '{"name":"x","password":"wrong"}')" = 403
           JID=$(curl -sf "http://127.0.0.1:8080/api/jobs?q=CI+test" -H "Authorization: Bearer $TOKEN" | python3 -c 'import sys,json; print(json.load(sys.stdin)["jobs"][0]["id"])')
           B64=$(printf '%%PDF-1.4 ci test' | base64 | tr -d '\n')
           RID=$(curl -sf -X POST http://127.0.0.1:8090/mcp -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \

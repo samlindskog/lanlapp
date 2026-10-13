@@ -59,7 +59,11 @@ gunzip -c jobscan-backup.sql.gz | docker compose -f jobboard/compose.yaml exec -
   the bootstrap, so changing deploy logic needs a bootstrap run, not a push.
   Manual: `ssh -i ~/.ssh/jobboard_deploy deploy@72.14.178.40 jobboard-deploy [ref]`.
 - Tokens: `POST /api/auth/token {name, password}` once; then `Authorization: Bearer <token>` for API and MCP.
-- MCP for Claude Code, reachable only over WireGuard:
+- Only the login paths (`/login`, `/login.html`, `POST /api/auth/login`, `POST /api/auth/token`) are reachable
+  without a credential. nginx refuses every other request that carries neither a session cookie nor a Bearer
+  token (401 for `/api/`, redirect to login for pages), and the app enforces the same rule again.
+- MCP for Claude Code, reachable only over WireGuard (nginx on 10.88.0.1:8090, Bearer only, proxied to the
+  container on 127.0.0.1:8091):
   `claude mcp add --transport http jobboard http://10.88.0.1:8090/mcp --header "Authorization: Bearer <token>"`
 - One-time server setup: `deploy/bootstrap.sh` (see its header). Firewall input policy: ssh, WireGuard, 443, MCP on wg0.
   Re-runnable; also restores `/tmp/jobscan-dump.sql.gz` into an empty database. Secrets: `deploy/push-secrets.sh`.

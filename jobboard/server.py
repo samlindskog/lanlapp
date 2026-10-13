@@ -35,6 +35,8 @@ browser; bearer tokens for the API and MCP.
   GET  /api/auth/tokens           list; POST /api/auth/tokens/<id>/revoke
   GET  /api/auth/me               who am I (session | token name)
 MCP (JOBBOARD_MCP_PORT, JOBBOARD_MCP_BIND): JSON-RPC at /mcp, bearer token required; see mcp.py.
+Everything except the four login paths needs a session cookie or Bearer token, enforced here and
+again in nginx (deploy/nginx-jobboard.conf), which drops credential-less requests before proxying.
 
 Env: JOBSCAN_DIR (default ../jobscan), PORT (8080), JOBBOARD_RELOAD=1 (dev
 auto-restart on .py changes; static files always fresh), OPENAI_API_KEY.
@@ -388,10 +390,13 @@ class Handler(SimpleHTTPRequestHandler):
     def _secure(self):
         return self.headers.get("X-Forwarded-Proto", "").lower() == "https"
 
+    # Reachable without a session or token. Both are logins: they check the password themselves and are
+    # throttled per client IP. nginx (deploy/nginx-jobboard.conf) exposes exactly the same set.
+    LOGIN_PATHS = ("/login", "/login.html", "/api/auth/login", "/api/auth/token")
+
     def _gate(self, path):
         """Enforce auth. Returns True when the request may proceed."""
-        # /api/auth/token checks the password itself when there is no session.
-        if not auth.AUTH_ON or path in ("/login", "/login.html", "/api/auth/login", "/api/auth/token"):
+        if not auth.AUTH_ON or path in self.LOGIN_PATHS:
             return True
         if self._who():
             return True
@@ -506,6 +511,11 @@ class Handler(SimpleHTTPRequestHandler):
             self.path = "/index.html"
         return super().do_GET()
 
+    # HEAD: SimpleHTTPRequestHandler answers these from the static directory; keep them behind the gate.
+    def do_HEAD(self):
+        if self._gate(urlparse(self.path).path):
+            return super().do_HEAD()
+
     # POST
     def do_POST(self):
         path = urlparse(self.path).path
@@ -546,8 +556,18 @@ class Handler(SimpleHTTPRequestHandler):
                 return
             if path == "/api/auth/token":
                 who = self._who() or {}
-                if auth.AUTH_ON and who.get("via") != "session" and not auth.check_password(body.get("password", "")):
-                    return self._json({"error": "a session or the password is required to issue tokens"}, 403)
+                if auth.AUTH_ON and who.get("via") != "session":
+                    # Password path: same throttle as the login page, so this is not a second guessing surface.
+                    ip = self._client_ip()
+                    if _login_throttled(ip):
+                        log_event("warn", f"token issue throttled for {ip}")
+                        return self._json({"error": "too many failed attempts; try again in 10 minutes"}, 429)
+                    if not auth.check_password(body.get("password", "")):
+                        _login_failed(ip)
+                        log_event("warn", f"failed token issue (wrong password) from {ip}")
+                        time.sleep(0.5)
+                        return self._json({"error": "a session or the password is required to issue tokens"}, 403)
+                    _login_ok(ip)
                 conn = J.db()
                 tid, token = auth.issue_token(conn, body.get("name") or "unnamed", J.now())
                 conn.close()
