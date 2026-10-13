@@ -103,6 +103,33 @@ def read_log(lines=200, level="all", q=None):
     rows = [r for r in rows if rank.get(r["level"], 1) >= minimum and (not q or q.lower() in r["msg"].lower())]
     return rows[-max(1, min(int(lines), 1000)):]
 
+# ------------------------------------------------------------ login throttling
+# Per client IP: after LOGIN_MAX failures within LOGIN_WINDOW seconds, refuse for LOGIN_WINDOW.
+LOGIN_MAX, LOGIN_WINDOW = 5, 600
+_login_fail = {}          # ip -> [timestamps]
+_login_lock = threading.Lock()
+
+
+def _login_throttled(ip):
+    now_ts = time.time()
+    with _login_lock:
+        ts = [t for t in _login_fail.get(ip, []) if now_ts - t < LOGIN_WINDOW]
+        _login_fail[ip] = ts
+        return len(ts) >= LOGIN_MAX
+
+
+def _login_failed(ip):
+    with _login_lock:
+        _login_fail.setdefault(ip, []).append(time.time())
+        if len(_login_fail) > 10000:          # bound the table under a flood
+            _login_fail.clear()
+
+
+def _login_ok(ip):
+    with _login_lock:
+        _login_fail.pop(ip, None)
+
+
 # ------------------------------------------------------------ background runs
 # Scans are recorded in the runs table (the Scan dialog shows the last one per
 # board). Refreshes are transient: tracked in memory only while they run, with
@@ -287,11 +314,42 @@ class Handler(SimpleHTTPRequestHandler):
         lvl = "error" if code.startswith("5") else "warn" if code.startswith("4") else "debug"
         log_event(lvl, f"{self.address_string()} {msg}")
 
+    SECURITY_HEADERS = (
+        ("X-Content-Type-Options", "nosniff"),
+        ("X-Frame-Options", "DENY"),
+        ("Referrer-Policy", "same-origin"),
+        ("Permissions-Policy", "camera=(), microphone=(), geolocation=()"),
+        # Inline scripts/styles are part of the three static pages; PDF.js (module + worker) comes from cdnjs.
+        ("Content-Security-Policy",
+         "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; "
+         "worker-src 'self' blob: https://cdnjs.cloudflare.com; style-src 'self' 'unsafe-inline'; "
+         "img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'"),
+    )
+
     def end_headers(self):
         # Static files: always revalidate so edits show on a plain browser reload.
         if not self.path.startswith("/api"):
             self.send_header("Cache-Control", "no-store")
+        for k, v in self.SECURITY_HEADERS:
+            self.send_header(k, v)
         super().end_headers()
+
+    def _client_ip(self):
+        # Behind nginx the real client is in X-Real-IP (nginx sets it from Cloudflare's CF-Connecting-IP via
+        # the realip snippet); otherwise the socket peer.
+        return self.headers.get("X-Real-IP") or self.client_address[0]
+
+    def _cross_site(self):
+        """True for a browser request that comes from another origin (CSRF guard for cookie auth)."""
+        sfs = self.headers.get("Sec-Fetch-Site", "").lower()
+        if sfs and sfs not in ("same-origin", "same-site", "none"):
+            return True
+        origin = self.headers.get("Origin")
+        if origin:
+            from urllib.parse import urlparse
+            host = self.headers.get("Host", "")
+            return urlparse(origin).netloc.lower() != host.lower()
+        return False
 
     # helpers
     def _json(self, obj, status=200):
@@ -457,9 +515,16 @@ class Handler(SimpleHTTPRequestHandler):
         if path == "/api/auth/login":
             if not auth.AUTH_ON:
                 return self._json({"ok": True, "auth": "off"})
+            ip = self._client_ip()
+            if _login_throttled(ip):
+                log_event("warn", f"login throttled for {ip}")
+                return self._json({"error": "too many failed attempts; try again in 10 minutes"}, 429)
             if not auth.check_password(body.get("password", "")):
+                _login_failed(ip)
+                log_event("warn", f"failed login from {ip}")
                 time.sleep(0.5)
                 return self._json({"error": "wrong password"}, 401)
+            _login_ok(ip)
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Set-Cookie", auth.new_session_cookie(self._secure()))
@@ -468,6 +533,9 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if not self._gate(path):
             return
+        # Cookie-authenticated browsers must not be driven by another site (bearer callers are exempt).
+        if auth.AUTH_ON and not self.headers.get("Authorization") and self._cross_site():
+            return self._json({"error": "cross-site request rejected"}, 403)
         try:
             if path == "/api/auth/logout":
                 self.send_response(200)

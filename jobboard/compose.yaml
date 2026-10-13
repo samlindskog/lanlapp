@@ -9,7 +9,7 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data      # persistent: survives compose down / image updates
     ports:
-      - "5432:5432"                          # so the host CLI (python3 jobscan/jobscan.py ...) can connect
+      - "127.0.0.1:5432:5432"                # host CLI only; never the LAN (trivial dev password)
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U jobscan -d jobscan"]
       interval: 3s
@@ -35,7 +35,7 @@ services:
       - ./:/app                                # server.py + static/, live
       - ../jobscan:/app/jobscan                # adapters, live
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"                # dev stack has no auth: loopback only
     restart: unless-stopped
 
 volumes:

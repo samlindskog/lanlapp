@@ -43,6 +43,11 @@ services:
       - "10.88.0.1:8090:8090"              # MCP: only via WireGuard
     restart: unless-stopped
     mem_limit: 512m
+    user: "65534:65534"                      # nobody: the app never writes to disk
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
 
 volumes:
   pgdata:
