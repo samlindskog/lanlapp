@@ -10,7 +10,10 @@ git fetch --quiet origin
 git reset --hard --quiet "$REF"
 echo "== at $(git rev-parse --short HEAD): $(git log -1 --pretty=%s)"
 echo "== compose up"
-docker compose -f jobboard/compose.prod.yaml --env-file .env up -d --build --remove-orphans
+# --force-recreate: the code is bind-mounted, so a new commit does not change the image; without
+# recreating, the running process keeps the old modules it already imported.
+docker compose -f jobboard/compose.prod.yaml --env-file .env up -d --build --remove-orphans --force-recreate jobboard
+docker compose -f jobboard/compose.prod.yaml --env-file .env up -d --remove-orphans
 echo "== health"
 for i in $(seq 1 40); do
   code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/login.html || true)
