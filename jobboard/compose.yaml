@@ -28,16 +28,12 @@ services:
       PORT: "8080"
       JOBSCAN_DIR: /app/jobscan
       JOBSCAN_DSN: postgresql://jobscan:jobscan@db:5432/jobscan
-      EXPERIENCE_MD: /app/EXPERIENCE.md
-      APPLICATIONS_DIR: /app/applications
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}      # from your shell or a jobboard/.env file (git-ignored)
       JOBBOARD_RELOAD: "1"                     # dev: auto-restart on .py changes; static files always fresh
       # dev stack runs without auth; production (compose.prod.yaml) sets JOBBOARD_AUTH=1
     volumes:
       - ./:/app                                # server.py + static/, live
       - ../jobscan:/app/jobscan                # adapters, live
-      - ../EXPERIENCE.md:/app/EXPERIENCE.md:ro
-      - ../applications:/app/applications:ro   # resumes, served at /files/
     ports:
       - "8080:8080"
     restart: unless-stopped

@@ -45,8 +45,10 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {"id": {"type": "integer"}, "status": {"type": "string", "enum": ["applied", "drafted"]}, "date": {"type": "string", "description": "YYYY-MM-DD, default today"}, "resume_dir": {"type": "string", "description": "e.g. applications/resumeX_oct12"}, "note": {"type": "string"}}, "required": ["id", "status"]}},
     {"name": "add_job", "description": "Add a posting found outside any board, fetching the page verbatim (embedded automatically).",
      "inputSchema": {"type": "object", "properties": {"title": {"type": "string"}, "url": {"type": "string"}, "location": {"type": "string"}, "open_date": {"type": "string"}, "close_date": {"type": "string"}, "text": {"type": "string"}}, "required": ["title"]}},
-    {"name": "profile_hash", "description": "Hash of EXPERIENCE.md, to stamp on verdicts.",
-     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "upload_resume", "description": "Store a resume or cover letter file (PDF or .tex) for a job; this is the only upload path. Idempotent: identical bytes are a no-op, changed bytes become a new version. The page links to the newest version per filename.",
+     "inputSchema": {"type": "object", "properties": {"job_id": {"type": "integer"}, "filename": {"type": "string"}, "content_base64": {"type": "string"}, "label": {"type": "string", "description": "workspace directory name, e.g. resumeRedstone1102_oct12"}}, "required": ["job_id", "filename", "content_base64"]}},
+    {"name": "list_resumes", "description": "Resume files stored for a job (newest version per filename), with ids usable at /files/<id>/<filename>.",
+     "inputSchema": {"type": "object", "properties": {"job_id": {"type": "integer"}}, "required": ["job_id"]}},
     {"name": "logs", "description": "Server log (in-memory ring buffer since the last restart): request lines, 4xx/5xx, tracebacks, run outcomes, embedding results. Use level=error to see only failures.",
      "inputSchema": {"type": "object", "properties": {"lines": {"type": "integer", "default": 100}, "level": {"type": "string", "enum": ["all", "info", "warn", "error"], "default": "warn"}, "q": {"type": "string", "description": "substring filter"}}}},
     {"name": "runs", "description": "Recent background runs (scans persisted, refreshes transient) with status and summary; use run_status for a run's full log.",
@@ -55,7 +57,7 @@ TOOLS = [
 
 
 def make_handler(J, api):
-    """api: object with start_scan/get_run/active_run/sources/stats/experience/authorized_bearer/read_log/list_runs/log_event."""
+    """api: object with start_scan/get_run/active_run/sources/stats/authorized_bearer/read_log/list_runs/log_event."""
 
     def call(name, args):
         conn = J.db()
@@ -105,8 +107,16 @@ def make_handler(J, api):
                                 None, None, None, None, None, args.get("open_date"), args.get("close_date"),
                                 None, args.get("text"), "posting", fetch_url=bool(args.get("url")) and not args.get("text"))
                 return {"job": J.job_detail(conn, jid, with_text=False)["job"]}
-            if name == "profile_hash":
-                return {"profile_hash": J.profile_hash(api.experience)}
+            if name == "upload_resume":
+                import base64
+                data = base64.b64decode(args["content_base64"])
+                if len(data) > 15 * 1024 * 1024:
+                    raise ValueError("file too large (15 MB max)")
+                r = J.store_resume(conn, int(args["job_id"]), args["filename"], data, args.get("label"))
+                r["url"] = f"/files/{r['id']}/{os.path.basename(args['filename'])}"
+                return r
+            if name == "list_resumes":
+                return {"resumes": J.list_resumes(conn, int(args["job_id"]))}
             if name == "logs":
                 return {"lines": api.read_log(int(args.get("lines") or 100), args.get("level") or "warn", args.get("q"))}
             if name == "runs":

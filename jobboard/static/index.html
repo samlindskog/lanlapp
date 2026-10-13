@@ -353,7 +353,7 @@
           ? `<details class="reason"><summary>Claude's verdict: ${esc(j.claude_verdict)}${j.claude_grades ? ` (${esc(j.claude_grades)})` : ""} — reason minimized</summary><b>${esc(j.claude_reason || "—")}</b></details>`
           : `Reason: <b>${esc(j.claude_reason || j.verdict_reason || "—")}</b>`}</div>
         <div>Status: ${statusSelect(j, actionOf(j), "big")} ${j.action_date ? esc(j.action_date) : ""}</div>
-        <div>Resume: ${(j.resume_files || []).filter((f) => f.name.toLowerCase().endsWith(".pdf")).map((f) => `<a href="/view.html?f=${encodeURIComponent(f.path)}" target="_blank" rel="noopener">${esc(f.path)}</a>`).join(" · ") || `<b>${esc(j.resume_dir || "—")}</b>`}</div>
+        <div>Resume: ${(j.resume_files || []).filter((f) => f.kind === "pdf").map((f) => `<a href="/view.html?f=${encodeURIComponent(f.id + "/" + f.name)}" target="_blank" rel="noopener" title="${esc(f.label || "")} · ${esc(fmtLocal(f.uploaded_at))}">${esc((f.label ? f.label + "/" : "") + f.name)}</a>`).join(" · ") || `<b>${esc(j.resume_dir || "—")}</b>`}</div>
         <div>Note: <b>${esc(j.action_note || "—")}</b></div>
         <div>Opens / closes: <b>${esc(j.open_date || "?")} / ${esc(j.close_date || "?")}</b></div>
         <div>Salary: <b>${esc(j.salary || "—")}</b></div>

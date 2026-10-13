@@ -6,9 +6,10 @@ Agent API  : JSON over HTTP, documented at GET /api  (also in .claude/skills/job
 
   GET  /api                       this API description
   GET  /api/stats                 counts, db path, available sources
-  GET  /files/<path>              a resume PDF under applications/ (raw); /view.html?f=<path> renders it in-page
+  GET  /api/jobs/<id>/resumes     resume files stored for a job (newest version per filename)
+  GET  /files/<resume_id>/<name>  a stored resume file (raw); /view.html?f=<resume_id>/<name> renders a PDF in-page
+                                  (uploads happen only through the MCP tool upload_resume)
   GET  /api/sources               scan workflows available: name, display_name, board_url, last_scan
-  GET  /api/profile-hash          sha1 prefix of EXPERIENCE.md (record on verdicts)
   GET  /api/jobs?verdict=yes,maybe&action=none&open=1&source=&days=&q=&pending=1
   GET  /api/jobs/<id>?text=0      job + documents + verdict/action history
   GET  /api/jobs/<id>/sections    primary document split into named sections (board adapter decides)
@@ -62,8 +63,6 @@ STATIC = os.path.join(HERE, "static")
 PORT = int(os.environ.get("PORT", "8080"))
 MCP_PORT = int(os.environ.get("JOBBOARD_MCP_PORT", "0") or 0)
 MCP_BIND = os.environ.get("JOBBOARD_MCP_BIND", "127.0.0.1")
-EXPERIENCE = os.environ.get("EXPERIENCE_MD", os.path.join(JOBSCAN_DIR, "..", "EXPERIENCE.md"))
-APPLICATIONS = os.path.abspath(os.environ.get("APPLICATIONS_DIR", os.path.join(JOBSCAN_DIR, "..", "applications")))
 
 API_DOC = __doc__
 
@@ -188,25 +187,6 @@ def _get_run(rid):
     return dict(r) if r else None
 
 
-def _resume_files(resume_dir):
-    """PDF/TEX files for a job's resume_dir ("applications/x" or "a / b"), as
-    paths relative to applications/ for the /files/ route."""
-    if not resume_dir:
-        return []
-    out = []
-    for part in resume_dir.split(" / "):
-        rel = part.strip()
-        if rel.startswith("applications/"):
-            rel = rel[len("applications/"):]
-        d = os.path.join(APPLICATIONS, rel)
-        if not os.path.isdir(d):
-            continue
-        for f in sorted(os.listdir(d)):
-            if f.lower().endswith(".pdf"):
-                out.append({"name": f, "path": f"{rel}/{f}"})
-    return out
-
-
 def sources_info():
     conn = J.db()
     last = {r["args_source"]: r for r in conn.execute("""
@@ -241,7 +221,14 @@ def stats_info():
             "documents": docs, "embedded": emb, "embeddings_enabled": bool(os.environ.get("OPENAI_API_KEY")),
             "dsn": J.DSN.split("@")[-1], "sources": srcs, "adapters": J.list_sources(),
             "active_run": _active_run(), "auth": auth.AUTH_ON,
-            "profile_hash": J.profile_hash(EXPERIENCE) if os.path.exists(EXPERIENCE) else None}
+            "resumes": resume_count()}
+
+
+def resume_count():
+    c = J.db()
+    n = c.execute("SELECT COUNT(*) AS n FROM resumes").fetchone()["n"]
+    c.close()
+    return n
 
 
 def start_scan(source, days=7, all_=False, refetch=False):
@@ -277,7 +264,6 @@ def bearer_ok(header):
 
 class _Api:
     """Facade handed to the MCP server."""
-    experience = EXPERIENCE
     stats = staticmethod(stats_info)
     sources = staticmethod(sources_info)
     start_scan = staticmethod(start_scan)
@@ -387,8 +373,6 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._json(stats_info())
             if path == "/api/sources":
                 return self._json({"sources": sources_info()})
-            if path == "/api/profile-hash":
-                return self._json({"profile_hash": J.profile_hash(EXPERIENCE)})
             if path == "/api/jobs":
                 conn = J.db()
                 rows = J.list_jobs(conn, verdict=qs.get("verdict"), action=qs.get("action"),
@@ -398,8 +382,6 @@ class Handler(SimpleHTTPRequestHandler):
                                    pending_only=qs.get("pending") in ("1", "true"),
                                    q=qs.get("q") or None)
                 conn.close()
-                for r in rows:
-                    r["resume_files"] = _resume_files(r.get("resume_dir"))
                 return self._json({"jobs": rows, "count": len(rows), "active_run": _active_run()})
             if path.startswith("/api/jobs/"):
                 parts = path.split("/")
@@ -416,6 +398,10 @@ class Handler(SimpleHTTPRequestHandler):
                         return self._json({"job_id": jid, "sections": [], "error": "section not found"}, 404)
                     return self._json({"job_id": jid, "sections": [{"doc_id": d["id"], "kind": d["kind"],
                                                                      "section": qs.get("name") or "key", "text": text}]})
+                if parts[4] == "resumes":
+                    out = J.list_resumes(conn, jid)
+                    conn.close()
+                    return self._json({"job_id": jid, "resumes": out})
                 if parts[4] == "sections":
                     d, source, key = J.primary_document(conn, jid)
                     conn.close()
@@ -450,7 +436,7 @@ class Handler(SimpleHTTPRequestHandler):
             if path.startswith("/api/"):
                 return self._json({"error": "unknown endpoint", "see": "/api"}, 404)
             if path.startswith("/files/"):
-                return self._serve_file(path[len("/files/"):])
+                return self._serve_resume(path[len("/files/"):])
         except KeyError as e:
             return self._json({"error": f"not found: {e}"}, 404)
         except (ValueError, IndexError) as e:
@@ -575,24 +561,24 @@ class Handler(SimpleHTTPRequestHandler):
             log_event("error", f"POST {path} failed: {e}\n{traceback.format_exc()}")
             return self._json({"error": str(e), "trace": traceback.format_exc()}, 500)
 
-    def _serve_file(self, rel):
+    def _serve_resume(self, rel):
         from urllib.parse import unquote
-        rel = unquote(rel)
-        full = os.path.abspath(os.path.join(APPLICATIONS, rel))
-        if not full.startswith(APPLICATIONS + os.sep) or not os.path.isfile(full):
+        try:
+            rid = int(unquote(rel).split("/", 1)[0])
+        except ValueError:
             return self._json({"error": "not found"}, 404)
-        ext = os.path.splitext(full)[1].lower()
-        ctype = {".pdf": "application/pdf", ".tex": "text/plain; charset=utf-8",
-                 ".txt": "text/plain; charset=utf-8", ".md": "text/plain; charset=utf-8"}.get(ext)
-        if not ctype:
-            return self._json({"error": "only pdf/tex/txt/md are served"}, 403)
-        with open(full, "rb") as f:
-            data = f.read()
+        conn = J.db()
+        r = J.get_resume(conn, rid)
+        conn.close()
+        if not r:
+            return self._json({"error": "not found"}, 404)
+        ctype = {"pdf": "application/pdf", "tex": "text/plain; charset=utf-8"}.get(r["kind"], "application/octet-stream")
+        data = bytes(r["bytes"])
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
-        self.send_header("Content-Disposition", f'inline; filename="{os.path.basename(full)}"')
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Disposition", f'inline; filename="{r["filename"]}"')
+        self.send_header("Cache-Control", "private, max-age=3600")
         self.end_headers()
         self.wfile.write(data)
 

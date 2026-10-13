@@ -129,6 +129,19 @@ CREATE TABLE IF NOT EXISTS runs (
     log TEXT,
     summary TEXT
 );
+CREATE TABLE IF NOT EXISTS resumes (
+    id SERIAL PRIMARY KEY,
+    job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    filename TEXT NOT NULL,
+    kind TEXT NOT NULL,              -- pdf | tex | other
+    label TEXT,                      -- workspace directory name, e.g. resumeRedstone1102_oct12
+    sha256 TEXT NOT NULL,
+    bytes BYTEA NOT NULL,
+    size INTEGER NOT NULL,
+    uploaded_at TEXT NOT NULL,
+    UNIQUE(job_id, filename, sha256)
+);
+CREATE INDEX IF NOT EXISTS resumes_job ON resumes(job_id);
 CREATE TABLE IF NOT EXISTS embeddings (
     job_id INTEGER PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
     model TEXT NOT NULL,
@@ -639,6 +652,12 @@ def list_jobs(conn, verdict=None, action=None, open_only=False, source=None, day
         rows = [r for r in rows if ql in " ".join(str(r.get(k) or "") for k in
                 ("title", "location", "series", "announcement_no", "verdict_reason",
                  "action_note", "pay_plan")).lower()]
+    files = {}
+    for f in list_resumes(conn):
+        files.setdefault(f["job_id"], []).append({"id": f["id"], "name": f["filename"], "kind": f["kind"],
+                                                  "label": f["label"], "uploaded_at": f["uploaded_at"]})
+    for r in rows:
+        r["resume_files"] = files.get(r["id"], [])
     return rows
 
 
@@ -658,9 +677,49 @@ def job_detail(conn, job_id, with_text=True):
     return {"job": dict(j), "documents": docs, "verdicts": verdicts, "actions": actions, "primary": primary}
 
 
-def profile_hash(path=None):
-    path = path or os.path.join(HERE, "..", "EXPERIENCE.md")
-    return hashlib.sha1(open(path, "rb").read()).hexdigest()[:12]
+# ----------------------------------------------------------------- resumes
+def store_resume(conn, job_id, filename, data, label=None):
+    """Store a resume/cover-letter file for a job. Idempotent: identical bytes for the
+    same job and filename return the existing row. A changed file becomes a new
+    version; the newest per filename is what the page links to."""
+    if not conn.execute("SELECT 1 FROM jobs WHERE id=%s", (job_id,)).fetchone():
+        raise KeyError(job_id)
+    filename = os.path.basename(filename)
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    kind = ext if ext in ("pdf", "tex") else "other"
+    sha = hashlib.sha256(data).hexdigest()
+    row = conn.execute("SELECT id FROM resumes WHERE job_id=%s AND filename=%s AND sha256=%s",
+                       (job_id, filename, sha)).fetchone()
+    if row:
+        return {"id": row["id"], "created": False, "sha256": sha, "size": len(data)}
+    rid = conn.execute("""INSERT INTO resumes (job_id, filename, kind, label, sha256, bytes, size, uploaded_at)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                       (job_id, filename, kind, label, sha, data, len(data), now())).fetchone()["id"]
+    conn.commit()
+    return {"id": rid, "created": True, "sha256": sha, "size": len(data)}
+
+
+def list_resumes(conn, job_id=None, latest_only=True):
+    """Resume files, newest version per (job, filename) unless latest_only=False."""
+    sql = "SELECT id, job_id, filename, kind, label, sha256, size, uploaded_at FROM resumes"
+    params = []
+    if job_id is not None:
+        sql += " WHERE job_id=%s"; params.append(job_id)
+    sql += " ORDER BY job_id, filename, id DESC"
+    rows = [dict(r) for r in conn.execute(sql, params)]
+    if latest_only:
+        seen, out = set(), []
+        for r in rows:
+            k = (r["job_id"], r["filename"])
+            if k not in seen:
+                seen.add(k); out.append(r)
+        rows = out
+    return rows
+
+
+def get_resume(conn, resume_id):
+    r = conn.execute("SELECT * FROM resumes WHERE id=%s", (resume_id,)).fetchone()
+    return dict(r) if r else None
 
 
 # ----------------------------------------------------------------- sections
@@ -887,10 +946,6 @@ def cmd_stats(a):
     print(f"dsn: {DSN}")
 
 
-def cmd_profile_hash(a):
-    print(profile_hash(a.path))
-
-
 # ----------------------------------------------------------------- main
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -958,7 +1013,6 @@ def main(argv=None):
 
     s = sp.add_parser("apps", help="application history"); s.set_defaults(fn=cmd_apps)
     s = sp.add_parser("stats", help="counts"); s.set_defaults(fn=cmd_stats)
-    s = sp.add_parser("profile-hash", help="hash of EXPERIENCE.md"); s.add_argument("--path"); s.set_defaults(fn=cmd_profile_hash)
 
     a = p.parse_args(argv)
     a.fn(a)

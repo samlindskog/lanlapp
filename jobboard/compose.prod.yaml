@@ -30,8 +30,6 @@ services:
       PORT: "8080"
       JOBSCAN_DIR: /repo/jobscan
       JOBSCAN_DSN: postgresql://jobscan:${POSTGRES_PASSWORD}@db:5432/jobscan
-      EXPERIENCE_MD: /repo/EXPERIENCE.md
-      APPLICATIONS_DIR: /repo/applications
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       JOBBOARD_AUTH: "1"
       JOBBOARD_PASSWORD_HASH: ${JOBBOARD_PASSWORD_HASH}
