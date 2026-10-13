@@ -23,6 +23,8 @@ Agent API  : JSON over HTTP, documented at GET /api  (also in .claude/skills/job
   POST /api/scan                  {source, days?:7, all?:false, refetch?:false}  -> {run_id}
   POST /api/refresh               {ids?:[..]} or {filter:"open-qualifying"}       -> {run_id}
   GET  /api/runs  /api/runs/<id>  background run status + log (scans persist; refresh runs are transient, ids like t3)
+  GET  /api/logs?lines=200&level=all|warn|error&q=<substring>   server log ring buffer (requests, errors,
+                                  tracebacks, run outcomes, embedding results); newest last
 
 Auth (JOBBOARD_AUTH=1, see auth.py): password login -> session cookie for the
 browser; bearer tokens for the API and MCP.
@@ -38,6 +40,7 @@ auto-restart on .py changes; static files always fresh), OPENAI_API_KEY.
 CLI: python3 server.py hash-password        (prints a JOBBOARD_PASSWORD_HASH value)
      python3 server.py issue-token <name>   (admin: mint a bearer token directly in the DB)
 """
+import collections
 import json
 import os
 import sys
@@ -63,6 +66,28 @@ EXPERIENCE = os.environ.get("EXPERIENCE_MD", os.path.join(JOBSCAN_DIR, "..", "EX
 APPLICATIONS = os.path.abspath(os.environ.get("APPLICATIONS_DIR", os.path.join(JOBSCAN_DIR, "..", "applications")))
 
 API_DOC = __doc__
+
+# ------------------------------------------------------------ log ring buffer
+# Everything the server prints also lands here so it can be read over the API/MCP.
+_LOG = collections.deque(maxlen=int(os.environ.get("JOBBOARD_LOG_LINES", "3000")))
+_LOG_LOCK = threading.Lock()
+
+
+def log_event(level, msg):
+    line = {"t": J.now(), "level": level, "msg": str(msg).rstrip()}
+    with _LOG_LOCK:
+        _LOG.append(line)
+    sys.stderr.write(f"{line['t']} {level.upper():5} {line['msg']}\n")
+    sys.stderr.flush()
+
+
+def read_log(lines=200, level="all", q=None):
+    rank = {"debug": 0, "info": 1, "warn": 2, "error": 3}
+    minimum = {"all": 0, "info": 1, "warn": 2, "error": 3}.get(level, 0)
+    with _LOG_LOCK:
+        rows = list(_LOG)
+    rows = [r for r in rows if rank.get(r["level"], 1) >= minimum and (not q or q.lower() in r["msg"].lower())]
+    return rows[-int(lines):]
 
 # ------------------------------------------------------------ background runs
 # Scans are recorded in the runs table (the Scan dialog shows the last one per
@@ -111,10 +136,14 @@ def _start_run(kind, args, target, persist=True):
                                           summary=json.dumps(summary) if summary is not None else None)
 
         try:
-            finish("done", target(rconn, log))
+            summary = target(rconn, log)
+            finish("done", summary)
+            log_event("info", f"run {run_id} ({kind}) done: {json.dumps(summary, default=str)[:300]}")
         except Exception:  # noqa: BLE001
-            log(traceback.format_exc())
+            tb = traceback.format_exc()
+            log(tb)
             finish("failed")
+            log_event("error", f"run {run_id} ({kind}) failed:\n{tb}")
         rconn.close()
 
     threading.Thread(target=worker, name=f"run-{run_id}", daemon=True).start()
@@ -211,6 +240,15 @@ def start_scan(source, days=7, all_=False, refetch=False):
     return {"run_id": rid, "status": "running"}
 
 
+def list_runs(limit=20):
+    conn = J.db()
+    rows = [dict(r) for r in conn.execute(
+        "SELECT id, kind, args, status, started_at, finished_at, summary FROM runs ORDER BY id DESC LIMIT %s", (limit,))]
+    conn.close()
+    transient = [{k: v for k, v in r.items() if k != "log"} for r in _transient.values()]
+    return sorted(transient + rows, key=lambda r: r.get("started_at") or "", reverse=True)[:limit]
+
+
 def bearer_ok(header):
     """True when auth is off, or the Authorization header carries a valid token."""
     if not auth.AUTH_ON:
@@ -229,6 +267,9 @@ class _Api:
     sources = staticmethod(sources_info)
     start_scan = staticmethod(start_scan)
     get_run = staticmethod(lambda rid: _get_run(rid))
+    read_log = staticmethod(lambda lines, level, q: read_log(lines, level, q))
+    log_event = staticmethod(lambda level, msg: log_event(level, msg))
+    list_runs = staticmethod(lambda: list_runs())
     active_run = staticmethod(_active_run)
     authorized_bearer = staticmethod(bearer_ok)
 
@@ -239,7 +280,11 @@ class Handler(SimpleHTTPRequestHandler):
         super().__init__(*a, directory=STATIC, **kw)
 
     def log_message(self, fmt, *args):
-        sys.stderr.write("%s %s\n" % (self.address_string(), fmt % args))
+        msg = fmt % args
+        # 4xx/5xx responses are worth keeping at warn/error; normal traffic at debug.
+        code = args[1] if len(args) > 1 and isinstance(args[1], str) else ""
+        lvl = "error" if code.startswith("5") else "warn" if code.startswith("4") else "debug"
+        log_event(lvl, f"{self.address_string()} {msg}")
 
     def end_headers(self):
         # Static files: always revalidate so edits show on a plain browser reload.
@@ -378,12 +423,10 @@ class Handler(SimpleHTTPRequestHandler):
                 hits = J.search_documents(conn, qs.get("q", ""), kinds, int(qs.get("limit", 50)))
                 conn.close()
                 return self._json({"query": qs.get("q", ""), "mode": "keyword", "hits": hits})
+            if path == "/api/logs":
+                return self._json({"lines": read_log(int(qs.get("lines", 200)), qs.get("level", "all"), qs.get("q"))})
             if path == "/api/runs":
-                conn = J.db()
-                rows = [dict(r) for r in conn.execute(
-                    "SELECT id, kind, args, status, started_at, finished_at, summary FROM runs ORDER BY id DESC LIMIT 20")]
-                conn.close()
-                return self._json({"runs": rows})
+                return self._json({"runs": list_runs(int(qs.get("limit", 20)))})
             if path.startswith("/api/runs/"):
                 r = _get_run(path.rsplit("/", 1)[1])
                 return self._json(r if r else {"error": "not found"}, 200 if r else 404)
@@ -396,6 +439,7 @@ class Handler(SimpleHTTPRequestHandler):
         except (ValueError, IndexError) as e:
             return self._json({"error": str(e)}, 400)
         except Exception as e:  # noqa: BLE001
+            log_event("error", f"GET {path} failed: {e}\n{traceback.format_exc()}")
             return self._json({"error": str(e), "trace": traceback.format_exc()}, 500)
         if path == "/":
             self.path = "/index.html"
@@ -511,6 +555,7 @@ class Handler(SimpleHTTPRequestHandler):
         except ValueError as e:
             return self._json({"error": str(e)}, 400)
         except Exception as e:  # noqa: BLE001
+            log_event("error", f"POST {path} failed: {e}\n{traceback.format_exc()}")
             return self._json({"error": str(e), "trace": traceback.format_exc()}, 500)
 
     def _serve_file(self, rel):
@@ -604,9 +649,10 @@ if __name__ == "__main__":
                 c2 = J.db()
                 r = J.embed_jobs(c2, log=lambda m: None)
                 c2.close()
-                print(f"embeddings catch-up: {r}", flush=True)
+                log_event("info", f"embeddings catch-up: {r}")
             except Exception as e:  # noqa: BLE001
-                print(f"embeddings catch-up skipped: {e}", flush=True)
+                log_event("error", f"embeddings catch-up failed: {e}")
         threading.Thread(target=_catch_up, name="embed-catchup", daemon=True).start()
-    print(f"auth: {'on' if auth.AUTH_ON else 'off'}", flush=True)
+    log_event("info", f"server start: auth={'on' if auth.AUTH_ON else 'off'} mcp={'on' if MCP_PORT else 'off'} "
+                      f"embeddings={'on' if os.environ.get('OPENAI_API_KEY') else 'off'} db={J.DSN.split('@')[-1]}")
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()

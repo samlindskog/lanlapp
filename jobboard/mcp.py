@@ -47,11 +47,15 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {"title": {"type": "string"}, "url": {"type": "string"}, "location": {"type": "string"}, "open_date": {"type": "string"}, "close_date": {"type": "string"}, "text": {"type": "string"}}, "required": ["title"]}},
     {"name": "profile_hash", "description": "Hash of EXPERIENCE.md, to stamp on verdicts.",
      "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "logs", "description": "Server log (in-memory ring buffer since the last restart): request lines, 4xx/5xx, tracebacks, run outcomes, embedding results. Use level=error to see only failures.",
+     "inputSchema": {"type": "object", "properties": {"lines": {"type": "integer", "default": 100}, "level": {"type": "string", "enum": ["all", "info", "warn", "error"], "default": "warn"}, "q": {"type": "string", "description": "substring filter"}}}},
+    {"name": "runs", "description": "Recent background runs (scans persisted, refreshes transient) with status and summary; use run_status for a run's full log.",
+     "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "default": 20}}}},
 ]
 
 
 def make_handler(J, api):
-    """api: object with start_scan/get_run/active_run/sources/stats/experience/authorized_bearer."""
+    """api: object with start_scan/get_run/active_run/sources/stats/experience/authorized_bearer/read_log/list_runs/log_event."""
 
     def call(name, args):
         conn = J.db()
@@ -103,13 +107,17 @@ def make_handler(J, api):
                 return {"job": J.job_detail(conn, jid, with_text=False)["job"]}
             if name == "profile_hash":
                 return {"profile_hash": J.profile_hash(api.experience)}
+            if name == "logs":
+                return {"lines": api.read_log(int(args.get("lines") or 100), args.get("level") or "warn", args.get("q"))}
+            if name == "runs":
+                return {"runs": api.list_runs()[: int(args.get("limit") or 20)]}
             raise KeyError(f"unknown tool {name}")
         finally:
             conn.close()
 
     class MCPHandler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *a):
-            sys.stderr.write("mcp %s %s\n" % (self.address_string(), fmt % a))
+            api.log_event("debug", "mcp %s %s" % (self.address_string(), fmt % a))
 
         def _send(self, status, obj=None):
             body = json.dumps(obj, default=str).encode() if obj is not None else b""
@@ -153,6 +161,7 @@ def make_handler(J, api):
                         out = call(params.get("name"), params.get("arguments") or {})
                         result = {"content": [{"type": "text", "text": json.dumps(out, default=str, indent=1)}], "isError": False}
                     except Exception as e:  # noqa: BLE001
+                        api.log_event("error", f"mcp tool {params.get('name')} failed: {e}\n{traceback.format_exc()}")
                         result = {"content": [{"type": "text", "text": f"error: {e}"}], "isError": True}
                 else:
                     return self._send(200, {"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": f"unknown method {method}"}})
