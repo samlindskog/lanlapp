@@ -33,9 +33,9 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {"q": {"type": "string"}, "mode": {"type": "string", "enum": ["keyword", "semantic"], "default": "keyword"}, "limit": {"type": "integer", "default": 20}}, "required": ["q"]}},
     {"name": "sources", "description": "Scan workflows (board adapters) available, with last scan info.",
      "inputSchema": {"type": "object", "properties": {}}},
-    {"name": "scan", "description": "Start a background scan of a board. Returns a run id to poll with run_status.",
+    {"name": "scan", "description": "Start a background scan of a board; new/changed postings are embedded automatically. Returns a run id to poll with run_status.",
      "inputSchema": {"type": "object", "properties": {"source": {"type": "string"}, "days": {"type": "integer", "default": 7}, "all": {"type": "boolean", "default": False}, "refetch": {"type": "boolean", "default": False}}, "required": ["source"]}},
-    {"name": "run_status", "description": "Status, log and summary of a background run (scan/refresh/embed).",
+    {"name": "run_status", "description": "Status, log and summary of a background run (scan/refresh).",
      "inputSchema": {"type": "object", "properties": {"run_id": {"type": "string"}}, "required": ["run_id"]}},
     {"name": "refresh", "description": "Re-fetch postings now (synchronous, up to 20 ids).",
      "inputSchema": {"type": "object", "properties": {"ids": {"type": "array", "items": {"type": "integer"}}}, "required": ["ids"]}},
@@ -43,17 +43,15 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {"id": {"type": "integer"}, "verdict": {"type": "string", "enum": ["yes", "maybe", "no"]}, "grades": {"type": "string"}, "reason": {"type": "string"}, "profile_hash": {"type": "string"}, "author": {"type": "string", "enum": ["claude", "user"], "default": "claude"}}, "required": ["id", "verdict", "reason"]}},
     {"name": "set_action", "description": "Record that a resume was drafted or an application submitted.",
      "inputSchema": {"type": "object", "properties": {"id": {"type": "integer"}, "action": {"type": "string", "enum": ["applied", "drafted"]}, "date": {"type": "string"}, "resume_dir": {"type": "string"}, "note": {"type": "string"}}, "required": ["id", "action"]}},
-    {"name": "add_job", "description": "Add a posting found outside any board, fetching the page verbatim.",
+    {"name": "add_job", "description": "Add a posting found outside any board, fetching the page verbatim (embedded automatically).",
      "inputSchema": {"type": "object", "properties": {"title": {"type": "string"}, "url": {"type": "string"}, "location": {"type": "string"}, "open_date": {"type": "string"}, "close_date": {"type": "string"}, "text": {"type": "string"}}, "required": ["title"]}},
-    {"name": "embed", "description": "Compute embeddings for jobs missing them (background run).",
-     "inputSchema": {"type": "object", "properties": {"force": {"type": "boolean", "default": False}}}},
     {"name": "profile_hash", "description": "Hash of EXPERIENCE.md, to stamp on verdicts.",
      "inputSchema": {"type": "object", "properties": {}}},
 ]
 
 
 def make_handler(J, api):
-    """api: object with start_scan/start_refresh/start_embed/get_run/active_run/sources/stats/experience."""
+    """api: object with start_scan/get_run/active_run/sources/stats/experience/authorized_bearer."""
 
     def call(name, args):
         conn = J.db()
@@ -103,8 +101,6 @@ def make_handler(J, api):
                                 None, None, None, None, None, args.get("open_date"), args.get("close_date"),
                                 None, args.get("text"), "posting", fetch_url=bool(args.get("url")) and not args.get("text"))
                 return {"job": J.job_detail(conn, jid, with_text=False)["job"]}
-            if name == "embed":
-                return api.start_embed(None, bool(args.get("force")))
             if name == "profile_hash":
                 return {"profile_hash": J.profile_hash(api.experience)}
             raise KeyError(f"unknown tool {name}")

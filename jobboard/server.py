@@ -15,7 +15,6 @@ Agent API  : JSON over HTTP, documented at GET /api  (also in .claude/skills/job
   GET  /api/jobs/<id>/section?name=<heading>[&kind=<kind>]   one section (default: the board's key section)
   GET  /api/search?q=<terms>&kind=<kind>&limit=50     keyword search (AND terms, quotes for phrases), snippets
   GET  /api/search?q=<text>&mode=semantic&limit=50    embedding similarity ranking (needs OPENAI_API_KEY)
-  POST /api/embed                 {ids?:[..], force?:false} -> {run_id}; embeds jobs lacking/changed embeddings
   POST /api/jobs                  {title, url?, location?, open_date?, close_date?, text?, fetch?:true, ...}
   POST /api/jobs/<id>/verdict     {verdict: yes|no|maybe, grades?, reason, profile_hash?, author?: claude|user}
                                   (author=user marks a human override; Claude's latest verdict is kept as claude_verdict)
@@ -212,16 +211,6 @@ def start_scan(source, days=7, all_=False, refetch=False):
     return {"run_id": rid, "status": "running"}
 
 
-def start_embed(ids=None, force=False):
-    if _active_run():
-        return {"error": "a run is already active", "run": _active_run()}
-    if not os.environ.get("OPENAI_API_KEY"):
-        return {"error": "OPENAI_API_KEY is not set in the server environment"}
-    rid = _start_run("embed", {"ids": ids, "force": force},
-                     lambda conn, log: J.embed_jobs(conn, ids=ids, force=force, log=log), persist=False)
-    return {"run_id": rid, "status": "running"}
-
-
 def bearer_ok(header):
     """True when auth is off, or the Authorization header carries a valid token."""
     if not auth.AUTH_ON:
@@ -239,7 +228,6 @@ class _Api:
     stats = staticmethod(stats_info)
     sources = staticmethod(sources_info)
     start_scan = staticmethod(start_scan)
-    start_embed = staticmethod(start_embed)
     get_run = staticmethod(lambda rid: _get_run(rid))
     active_run = staticmethod(_active_run)
     authorized_bearer = staticmethod(bearer_ok)
@@ -475,15 +463,13 @@ class Handler(SimpleHTTPRequestHandler):
                     out = []
                     for i in ids:
                         try:
-                            out.append(J.refresh_job(conn, i, log=log))
+                            out.append(J.refresh_job(conn, i, log=log, embed=False))
                         except Exception as e:  # noqa: BLE001
                             log(f"[{i}] failed: {e}")
-                    return {"refreshed": len(out), "ids": ids}
+                    emb = J.embed_if_possible(conn, [r["id"] for r in out], log)
+                    return {"refreshed": len(out), "ids": ids, "embedded": emb.get("embedded", 0)}
                 rid = _start_run("refresh", {"ids": ids}, work, persist=False)
                 return self._json({"run_id": rid, "status": "running", "count": len(ids)}, 202)
-            if path == "/api/embed":
-                r = start_embed(body.get("ids"), bool(body.get("force")))
-                return self._json(r, 202 if "run_id" in r else (409 if "run" in r else 503))
             if path == "/api/jobs":
                 conn = J.db()
                 jid = J.add_job(conn, body["title"], body.get("source", "manual"), body.get("source_id"),
@@ -610,5 +596,17 @@ if __name__ == "__main__":
     print(f"jobboard: http://0.0.0.0:{PORT}  db={J.DSN.split('@')[-1]}  api=/api  embeddings={'on' if os.environ.get('OPENAI_API_KEY') else 'off (no OPENAI_API_KEY)'}")
     if MCP_PORT:
         threading.Thread(target=mcp_mod.serve, args=(J, _Api, MCP_BIND, MCP_PORT), name="mcp", daemon=True).start()
+    if os.environ.get("OPENAI_API_KEY"):
+        # Catch-up: embed anything missing or stale (e.g. key added later, or a restore). Hash-based,
+        # so it is a no-op when nothing changed.
+        def _catch_up():
+            try:
+                c2 = J.db()
+                r = J.embed_jobs(c2, log=lambda m: None)
+                c2.close()
+                print(f"embeddings catch-up: {r}", flush=True)
+            except Exception as e:  # noqa: BLE001
+                print(f"embeddings catch-up skipped: {e}", flush=True)
+        threading.Thread(target=_catch_up, name="embed-catchup", daemon=True).start()
     print(f"auth: {'on' if auth.AUTH_ON else 'off'}", flush=True)
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()

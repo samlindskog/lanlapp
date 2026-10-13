@@ -29,8 +29,8 @@ curl -s -X POST localhost:8080/api/jobs/ID/verdict -H 'Content-Type: application
 curl -s -X POST localhost:8080/api/jobs/ID/action  -H 'Content-Type: application/json' -d '{"action":"applied","resume_dir":"applications/..."}'
 ```
 
-Semantic search: type in the search box and press Enter (needs OPENAI_API_KEY; `POST /api/embed`
-or `python3 jobscan/jobscan.py embed` computes embeddings; scans embed new postings automatically).
+Semantic search: type in the search box and press Enter (needs OPENAI_API_KEY). Embeddings are kept
+current automatically: after scans, refreshes and manual adds, and a hash-based catch-up at startup.
 
 CLI equivalents (from the repo root; needs `pip install "psycopg[binary]"` and the db container up):
 

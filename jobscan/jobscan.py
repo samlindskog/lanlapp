@@ -8,7 +8,8 @@ jobscan/sources/<name>.py adapters.
 
 Env:
   JOBSCAN_DSN     postgresql://jobscan:jobscan@localhost:5432/jobscan  (compose exposes 5432)
-  OPENAI_API_KEY  for `embed` and semantic search (text-embedding-3-small)
+  OPENAI_API_KEY  embeddings (text-embedding-3-small) for semantic search; kept current
+                  automatically after scans, refreshes and manual adds (hash-based, idempotent)
 
 Usage: jobscan.py <command> [options]   (run with -h for details)
 Requires: pip install "psycopg[binary]"
@@ -371,18 +372,14 @@ def scan_source(conn, source_name, days=7, all_=False, limit=None, refetch=False
         log(f"{len(need_judgment)} new jobs need judgment (run: pending):")
         for j in need_judgment:
             log(f"  [{j['id']}] {j['title']}")
-    embedded = 0
-    if embed and touched and os.environ.get("OPENAI_API_KEY"):
-        try:
-            embedded = embed_jobs(conn, ids=touched, log=log)["embedded"]
-        except Exception as e:  # noqa: BLE001
-            log(f"embedding skipped: {e}")
+    embedded = embed_if_possible(conn, touched, log)["embedded"] if embed else 0
     return {"cards": len(cards), "new": new, "known": updated, "carried": carried,
             "need_judgment": need_judgment, "embedded": embedded}
 
 
-def refresh_job(conn, job_id, log=print):
-    """Re-fetch a stored job's pages; replaces the stored document of each kind."""
+def refresh_job(conn, job_id, log=print, embed=True):
+    """Re-fetch a stored job's pages; replaces the stored document of each kind and
+    re-embeds the job if its text changed (embed=False lets a bulk caller batch that)."""
     j = conn.execute("SELECT * FROM jobs WHERE id=%s", (job_id,)).fetchone()
     if not j:
         raise KeyError(job_id)
@@ -395,6 +392,8 @@ def refresh_job(conn, job_id, log=print):
                                              "raw_html": body, "text": html_to_text(body)}], replace=True)
             conn.execute("UPDATE jobs SET last_seen=%s WHERE id=%s", (now(), job_id))
             conn.commit()
+            if embed:
+                embed_if_possible(conn, [job_id], log)
         return {"id": job_id, "refetched": 1 if body else 0}
     src = load_source(j["source"])
     card = {"source_id": j["source_id"], "title": j["title"], "location": j["location"],
@@ -405,6 +404,8 @@ def refresh_job(conn, job_id, log=print):
     _store_documents(conn, job_id, docs, replace=True)
     conn.commit()
     log(f"refreshed [{job_id}] {fields.get('title')} closes {fields.get('close_date')}")
+    if embed:
+        embed_if_possible(conn, [job_id], log)
     return {"id": job_id, "refetched": len(docs), "close_date": fields.get("close_date")}
 
 
@@ -487,6 +488,19 @@ def embedding_text(conn, job):
 
 def _vec(v):
     return "[" + ",".join(f"{x:.7f}" for x in v) + "]"
+
+
+def embed_if_possible(conn, ids, log=lambda m: None):
+    """Keep embeddings current after data changes. Idempotent: embed_jobs only
+    re-embeds a job whose embedding text hash changed. Silently skipped when no
+    OPENAI_API_KEY is set, and never raises (embedding must not break ingestion)."""
+    if not ids or not os.environ.get("OPENAI_API_KEY"):
+        return {"embedded": 0, "skipped": len(ids or [])}
+    try:
+        return embed_jobs(conn, ids=list(ids), log=log)
+    except Exception as e:  # noqa: BLE001
+        log(f"embedding skipped: {e}")
+        return {"embedded": 0, "error": str(e)}
 
 
 def embed_jobs(conn, ids=None, force=False, log=print, batch=32):
@@ -578,6 +592,7 @@ def add_job(conn, title, source="manual", source_id=None, location=None, announc
             _store_documents(conn, job_id, [{"kind": kind, "url": url, "raw_html": body,
                                              "text": html_to_text(body)}])
     conn.commit()
+    embed_if_possible(conn, [job_id])
     return job_id
 
 
@@ -846,10 +861,6 @@ def cmd_search(a):
             print(f"    … {sn} …")
 
 
-def cmd_embed(a):
-    print(embed_jobs(db(), ids=a.ids or None, force=a.force))
-
-
 def cmd_apps(a):
     rows = db().execute("""
         SELECT a.*, j.title, j.location, j.announcement_no, j.external_url, j.open_date, j.close_date, j.source
@@ -892,7 +903,7 @@ def main(argv=None):
     s.add_argument("--max-pages", type=int, default=100)
     s.add_argument("--limit", type=int)
     s.add_argument("--refetch", action="store_true", help="re-fetch jobs already stored")
-    s.add_argument("--no-embed", action="store_true", help="skip embedding new jobs")
+    s.add_argument("--no-embed", action="store_true", help="skip embedding new jobs (dev only)")
     s.set_defaults(fn=cmd_scan)
 
     s = sp.add_parser("pending", help="list jobs with no verdict and no action")
@@ -944,10 +955,6 @@ def main(argv=None):
     s.add_argument("query"); s.add_argument("--kind", action="append"); s.add_argument("--limit", type=int, default=30)
     s.add_argument("--semantic", action="store_true", help="rank by embedding similarity (needs OPENAI_API_KEY)")
     s.set_defaults(fn=cmd_search)
-
-    s = sp.add_parser("embed", help="compute/update embeddings (needs OPENAI_API_KEY)")
-    s.add_argument("ids", type=int, nargs="*"); s.add_argument("--force", action="store_true")
-    s.set_defaults(fn=cmd_embed)
 
     s = sp.add_parser("apps", help="application history"); s.set_defaults(fn=cmd_apps)
     s = sp.add_parser("stats", help="counts"); s.set_defaults(fn=cmd_stats)
