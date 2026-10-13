@@ -25,6 +25,7 @@ BOARD_ID = "rHrorPQ_B8HbgbWJDca8Ng"
 BASE = "https://usace.yellogov.com"
 BOARD_URL = f"{BASE}/job_boards/{BOARD_ID}"
 DISPLAY_NAME = "USACE Talent Acquisition (Yello)"
+SEARCH_URL = f"{BOARD_URL}/search?page_number={{page}}"
 PRIMARY_KIND = "usajobs_announcement"
 KEY_SECTION = "Qualifications"
 
