@@ -41,8 +41,8 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {"ids": {"type": "array", "items": {"type": "integer"}}}, "required": ["ids"]}},
     {"name": "set_verdict", "description": "Record a qualification verdict for a job.",
      "inputSchema": {"type": "object", "properties": {"id": {"type": "integer"}, "verdict": {"type": "string", "enum": ["yes", "maybe", "no"]}, "grades": {"type": "string"}, "reason": {"type": "string"}, "profile_hash": {"type": "string"}, "author": {"type": "string", "enum": ["claude", "user"], "default": "claude"}}, "required": ["id", "verdict", "reason"]}},
-    {"name": "set_action", "description": "Record that a resume was drafted or an application submitted.",
-     "inputSchema": {"type": "object", "properties": {"id": {"type": "integer"}, "action": {"type": "string", "enum": ["applied", "drafted"]}, "date": {"type": "string"}, "resume_dir": {"type": "string"}, "note": {"type": "string"}}, "required": ["id", "action"]}},
+    {"name": "set_status", "description": "Set a job's application status (what the page calls Status): drafted when a resume exists, applied when submitted. Appends to the history; the latest status wins.",
+     "inputSchema": {"type": "object", "properties": {"id": {"type": "integer"}, "status": {"type": "string", "enum": ["applied", "drafted"]}, "date": {"type": "string", "description": "YYYY-MM-DD, default today"}, "resume_dir": {"type": "string", "description": "e.g. applications/resumeX_oct12"}, "note": {"type": "string"}}, "required": ["id", "status"]}},
     {"name": "add_job", "description": "Add a posting found outside any board, fetching the page verbatim (embedded automatically).",
      "inputSchema": {"type": "object", "properties": {"title": {"type": "string"}, "url": {"type": "string"}, "location": {"type": "string"}, "open_date": {"type": "string"}, "close_date": {"type": "string"}, "text": {"type": "string"}}, "required": ["title"]}},
     {"name": "profile_hash", "description": "Hash of EXPERIENCE.md, to stamp on verdicts.",
@@ -97,9 +97,9 @@ def make_handler(J, api):
                 vid = J.record_verdict(conn, int(args["id"]), args["verdict"], args.get("grades"), args.get("reason"),
                                        args.get("profile_hash"), args.get("author", "claude"))
                 return {"verdict_id": vid, "job": J.job_detail(conn, int(args["id"]), with_text=False)["job"]}
-            if name == "set_action":
-                aid = J.record_action(conn, int(args["id"]), args["action"], args.get("date"), args.get("resume_dir"), args.get("note"))
-                return {"action_id": aid, "job": J.job_detail(conn, int(args["id"]), with_text=False)["job"]}
+            if name == "set_status":
+                aid = J.record_action(conn, int(args["id"]), args["status"], args.get("date"), args.get("resume_dir"), args.get("note"))
+                return {"status_id": aid, "job": J.job_detail(conn, int(args["id"]), with_text=False)["job"]}
             if name == "add_job":
                 jid = J.add_job(conn, args["title"], "manual", None, args.get("location"), None, args.get("url"),
                                 None, None, None, None, None, args.get("open_date"), args.get("close_date"),
