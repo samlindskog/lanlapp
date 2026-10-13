@@ -32,7 +32,7 @@ services:
       APPLICATIONS_DIR: /app/applications
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}      # from your shell or a jobboard/.env file (git-ignored)
       JOBBOARD_RELOAD: "1"                     # dev: auto-restart on .py changes; static files always fresh
-      # JOBBOARD_TOKEN: change-me              # uncomment to require X-Token on writes
+      # dev stack runs without auth; production (compose.prod.yaml) sets JOBBOARD_AUTH=1
     volumes:
       - ./:/app                                # server.py + static/, live
       - ../jobscan:/app/jobscan                # adapters, live

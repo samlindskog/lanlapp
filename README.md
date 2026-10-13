@@ -6,7 +6,6 @@ applications/        one directory per tailored resume or cover letter (LaTeX + 
 jobscan/             job posting tracker (PostgreSQL + pgvector, runs in the compose stack)
   jobscan.py           CLI + library: scan boards, judge, report, record applications, embed, search
   sources/             one adapter per job board (usace_yellogov.py, ...)
-  migrate_sqlite.py    one-time import of the old jobs.sqlite (already done)
 jobboard/            shared research service over the database
   compose.yaml         `cd jobboard && docker compose up -d` → http://localhost:8080
                        services: db (pgvector/pg16, data in the `pgdata` volume, port 5432) + jobboard

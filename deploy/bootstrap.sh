@@ -7,10 +7,10 @@
 # (WEB_PASSWORD=..., OPENAI_API_KEY=...; deleted after use), or prompts if absent.
 # Idempotent where practical.
 #
-# Does: remove hermes-hub (nginx site, nftables table, timers, /opt/hermes-hub, redis, slapd);
-#       create `deploy` user; clone the repo to /opt/jobboard; write .env; nginx site for
+# Does: create `deploy` user; clone the repo to /opt/jobboard; write .env; nginx site for
 #       jobs.slindskog.net + homepage; nftables input policy (ssh, wireguard, 443, MCP on wg0 only);
-#       first deploy; issue Claude's API token.
+#       first deploy; restore a staged dump into an empty database; issue Claude's API token.
+# Maintenance modes (flag file in the same directory, then run): show-firewall, reboot, remove-sudo-rule.
 set -euo pipefail
 [ "$(id -u)" = 0 ] || { echo "run with sudo"; exit 1; }
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -47,34 +47,6 @@ if [ -f "$HERE/reboot" ]; then
   exit 0
 fi
 
-# --- maintenance mode: `touch ~/jobboard-bootstrap/fix-grub` then run; repairs the half-configured
-# grub-pc package (which has been failing every apt run) and exits without touching anything else.
-if [ -f "$HERE/fix-grub" ]; then
-  rm -f "$HERE/fix-grub"
-  export DEBIAN_FRONTEND=noninteractive
-  log "grub-pc: current failure"
-  dpkg --configure grub-pc 2>&1 | tail -12 || true
-  ROOTSRC=$(findmnt -no SOURCE / 2>/dev/null); DISK="/dev/$(lsblk -ndo pkname "$ROOTSRC" 2>/dev/null || true)"
-  [ -b "$DISK" ] || DISK=/dev/sda
-  log "grub-pc: pointing install_devices at $DISK and reconfiguring"
-  echo "grub-pc grub-pc/install_devices multiselect $DISK" | debconf-set-selections
-  echo "grub-pc grub-pc/install_devices_empty boolean false" | debconf-set-selections
-  if dpkg --configure grub-pc 2>&1 | tail -5; then :; fi
-  if dpkg -s grub-pc 2>/dev/null | grep -q "^Status: install ok installed"; then
-    echo "grub-pc configured (grub installed to $DISK)"
-  else
-    log "grub-pc: still failing; telling debconf to skip the device install"
-    echo "grub-pc grub-pc/install_devices multiselect" | debconf-set-selections
-    echo "grub-pc grub-pc/install_devices_empty boolean true" | debconf-set-selections
-    dpkg --configure grub-pc 2>&1 | tail -5 || true
-  fi
-  log "finishing any other half-configured packages"
-  dpkg --configure -a 2>&1 | tail -5 || true
-  apt-get -f install -y -qq 2>&1 | tail -3 || true
-  echo "state: $(dpkg -s grub-pc 2>/dev/null | grep ^Status) ; remaining non-ok packages: $(dpkg -l | grep -Ev '^(ii|rc|Desired|\||\+)' | wc -l)"
-  exit 0
-fi
-
 [ -f "$HERE/github_deploy_key" ] || { echo "missing $HERE/github_deploy_key"; exit 1; }
 [ -f "$HERE/jobboard_deploy.pub" ] || { echo "missing $HERE/jobboard_deploy.pub"; exit 1; }
 
@@ -95,24 +67,6 @@ if ! apt-get install -y -qq git nginx nftables curl >/dev/null 2>&1; then
 fi
 for t in git nginx nft curl docker; do command -v "$t" >/dev/null || { echo "missing required tool: $t"; exit 1; }; done
 echo "git nginx nft curl docker present"
-
-log "remove hermes-hub"
-for u in $(systemctl list-units --all --no-pager --plain 2>/dev/null | awk '{print $1}' | grep -Ei 'hermes|cloudflare-ips' || true); do
-  systemctl disable --now "$u" 2>/dev/null || true; done
-rm -f /etc/systemd/system/*hermes* /etc/systemd/system/*cloudflare-ips* 2>/dev/null || true
-systemctl daemon-reload
-rm -f /etc/nginx/sites-enabled/hermes-hub.conf /etc/nginx/sites-available/hermes-hub.conf /etc/nginx/conf.d/hermes-limits.conf
-nft delete table inet hermes_hub 2>/dev/null || true
-if [ -f /etc/nftables.conf ]; then sed -i '/hermes/d' /etc/nftables.conf; fi
-rm -f /etc/nftables.d/hermes-*.nft 2>/dev/null || true
-docker ps -aq --filter name=hermes | xargs -r docker rm -f >/dev/null 2>&1 || true
-docker network ls -q --filter name=hermes | xargs -r docker network rm >/dev/null 2>&1 || true
-docker volume ls -q --filter name=hermes | xargs -r docker volume rm >/dev/null 2>&1 || true
-rm -rf /opt/hermes-hub /etc/sudoers.d/hermes
-systemctl disable --now redis-server slapd 2>/dev/null || true
-apt-get purge -y -qq redis-server slapd >/dev/null 2>&1 || true
-apt-get autoremove -y -qq >/dev/null 2>&1 || true
-echo "hermes-hub, redis, slapd removed"
 
 log "deploy user"
 id deploy >/dev/null 2>&1 || useradd -m -s /bin/bash deploy

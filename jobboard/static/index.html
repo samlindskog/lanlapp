@@ -69,13 +69,11 @@
   .v-yes { background: var(--yes); } .v-maybe { background: var(--maybe); }
   .v-no { background: var(--no); } .v-none { background: var(--none); }
   .a-applied { background: var(--applied); } .a-drafted { background: #6b5ca5; }
-  .a-skipped { background: var(--none); } .a-withdrawn { background: var(--none); }
   select.status { font: inherit; font-size: 12px; font-weight: 600; padding: 1px 6px; border-radius: 999px;
                   border: 1px solid var(--line); background: var(--chip); color: var(--fg); cursor: pointer;
                   -webkit-appearance: none; appearance: none; }
-  select.status.a-applied, select.status.a-drafted, select.status.a-skipped, select.status.a-withdrawn { color: #fff; border-color: transparent; }
+  select.status.a-applied, select.status.a-drafted { color: #fff; border-color: transparent; }
   select.status.a-applied { background: var(--applied); } select.status.a-drafted { background: #6b5ca5; }
-  select.status.a-skipped, select.status.a-withdrawn { background: var(--none); }
   select.status.big { font-size: 13px; }
   select.status { width: 7.2em; text-align: center; }
   select.status.v-yes, select.status.v-maybe, select.status.v-no { color: #fff; border-color: transparent; }
@@ -222,7 +220,7 @@
   const $ = (s) => document.querySelector(s);
   const state = { jobs: [], sort: "close_date", dir: "asc", open: null, selected: new Set(), lastClicked: null, lastRows: [], bulkOpen: false, semantic: null };
   const VRANK = { yes: 0, maybe: 1, none: 2, no: 3 };
-  const ARANK = { applied: 0, drafted: 1, withdrawn: 2, skipped: 3, none: 4 };
+  const ARANK = { applied: 0, drafted: 1, none: 4 };   // legacy values sort last
   const today = new Date().toISOString().slice(0, 10);
   const week = new Date(Date.now() + 7 * 864e5).toISOString().slice(0, 10);
 
@@ -264,7 +262,6 @@
       if (applied === "applied" && a !== "applied") return false;
       if (applied === "not" && a === "applied") return false;
       if (applied === "drafted" && a !== "drafted") return false;
-      if (applied === "skipped" && a !== "skipped") return false;
       if (applied === "untouched" && a !== "none") return false;
       const c = j.close_date;
       if (openness === "open" && c && c < today) return false;
@@ -285,7 +282,7 @@
     const k = state.sort, d = state.dir === "asc" ? 1 : -1;
     const key = (j) => {
       if (k === "verdict") return VRANK[verdictOf(j)];
-      if (k === "action") return ARANK[actionOf(j)];
+      if (k === "action") return ARANK[actionOf(j)] ?? 9;
       if (k === "close_date") return j.close_date || "9999-99-99";
       if (k === "grade_low") return j.grade_low ?? 99;
       if (k === "first_seen") return j.first_seen || "";
