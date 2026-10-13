@@ -69,15 +69,30 @@ API_DOC = __doc__
 
 # ------------------------------------------------------------ log ring buffer
 # Everything the server prints also lands here so it can be read over the API/MCP.
+# Bounded three ways: line count, bytes per line (long tracebacks keep head and tail), and total bytes.
 _LOG = collections.deque(maxlen=int(os.environ.get("JOBBOARD_LOG_LINES", "3000")))
 _LOG_LOCK = threading.Lock()
+_LOG_MAX_LINE = int(os.environ.get("JOBBOARD_LOG_MAX_LINE", "4000"))          # chars per entry
+_LOG_MAX_BYTES = int(os.environ.get("JOBBOARD_LOG_MAX_BYTES", str(2 * 1024 * 1024)))  # ~2 MB total
+_LOG_BYTES = 0
 
 
 def log_event(level, msg):
-    line = {"t": J.now(), "level": level, "msg": str(msg).rstrip()}
+    global _LOG_BYTES
+    msg = str(msg).rstrip()
+    if len(msg) > _LOG_MAX_LINE:
+        keep = _LOG_MAX_LINE // 2
+        msg = msg[:keep] + f"\n… [{len(msg) - 2 * keep} chars truncated] …\n" + msg[-keep:]
+    line = {"t": J.now(), "level": level, "msg": msg}
+    size = len(msg) + 40
     with _LOG_LOCK:
+        if len(_LOG) == _LOG.maxlen:
+            _LOG_BYTES -= len(_LOG[0]["msg"]) + 40
         _LOG.append(line)
-    sys.stderr.write(f"{line['t']} {level.upper():5} {line['msg']}\n")
+        _LOG_BYTES += size
+        while _LOG_BYTES > _LOG_MAX_BYTES and len(_LOG) > 1:
+            _LOG_BYTES -= len(_LOG.popleft()["msg"]) + 40
+    sys.stderr.write(f"{line['t']} {level.upper():5} {msg}\n")
     sys.stderr.flush()
 
 
@@ -87,7 +102,7 @@ def read_log(lines=200, level="all", q=None):
     with _LOG_LOCK:
         rows = list(_LOG)
     rows = [r for r in rows if rank.get(r["level"], 1) >= minimum and (not q or q.lower() in r["msg"].lower())]
-    return rows[-int(lines):]
+    return rows[-max(1, min(int(lines), 1000)):]
 
 # ------------------------------------------------------------ background runs
 # Scans are recorded in the runs table (the Scan dialog shows the last one per
@@ -424,7 +439,9 @@ class Handler(SimpleHTTPRequestHandler):
                 conn.close()
                 return self._json({"query": qs.get("q", ""), "mode": "keyword", "hits": hits})
             if path == "/api/logs":
-                return self._json({"lines": read_log(int(qs.get("lines", 200)), qs.get("level", "all"), qs.get("q"))})
+                return self._json({"lines": read_log(int(qs.get("lines", 200)), qs.get("level", "all"), qs.get("q")),
+                                   "buffer": {"entries": len(_LOG), "bytes": _LOG_BYTES, "max_entries": _LOG.maxlen,
+                                              "max_bytes": _LOG_MAX_BYTES}})
             if path == "/api/runs":
                 return self._json({"runs": list_runs(int(qs.get("limit", 20)))})
             if path.startswith("/api/runs/"):
