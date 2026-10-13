@@ -10,12 +10,34 @@ jobscan/             job posting tracker (PostgreSQL + pgvector, runs in the com
   jobscan.py           CLI + library: scan boards, judge, report, record applications, embed, search
   sources/             one adapter per job board (usace_yellogov.py, ...)
 jobboard/            shared research service over the database
-  compose.yaml         `cd jobboard && docker compose up -d` → http://localhost:8080
-                       services: db (pgvector/pg16, data in the `pgdata` volume, port 5432) + jobboard
-                       OPENAI_API_KEY is read from your shell (or jobboard/.env) for embeddings
   server.py            web page for the human, JSON API for Claude (GET /api lists it)
-  static/index.html    the page: filters, sorting, scan/refresh buttons, status + verdict forms
+  auth.py, mcp.py      password/session/token auth; MCP server (JSON-RPC over HTTP) for Claude Code
+  static/              index.html (the board), view.html (one job), login.html
+  Dockerfile           the production image: python:3.13-slim + psycopg + jobscan/ + jobboard/, nothing else
+  compose.yaml         dev stack;  compose.auth.yaml: overlay with auth + nginx;  compose.prod.yaml: VPS
+  dev.sh               up | up-auth | smoke | token | logs | ps | down
+deploy/              VPS: bootstrap.sh, deploy.sh, compose-up.sh, nginx/ (site + rule snippets shared with dev)
+tests/               test_adapters.py (board adapters), smoke.sh (end-to-end against a running auth stack)
 ```
+
+## Development (local Docker)
+
+```
+cd jobboard
+./dev.sh up        # db + app, no auth:  http://127.0.0.1:8080   MCP http://127.0.0.1:8090/mcp
+./dev.sh up-auth   # + auth and nginx:   http://127.0.0.1:8081   MCP http://127.0.0.1:8091/mcp   (password: dev)
+./dev.sh smoke     # tests/smoke.sh through nginx: gate, cookies, tokens, MCP, job + resume round trip
+./dev.sh token     # mint a dev bearer token (auth stack) for curl or a local `claude mcp add`
+```
+
+The dev image is the production image; `jobboard/` and `jobscan/` are bind-mounted over it and the server
+restarts on .py edits (static files are always fresh). With `up-auth` the app ports stay published, so
+you can compare nginx (8081/8091) with the app alone (8080/8090). nginx in dev loads the exact rule
+snippets production uses (`deploy/nginx/jobboard-*.conf`); only the server shells differ (TLS, listen,
+WireGuard allow-list). Data lives in the `pgdata` volume and survives `down`. OPENAI_API_KEY is read
+from your shell (or `jobboard/.env`) for embeddings.
+
+CI runs `tests/test_adapters.py`, then brings up the same auth stack and runs `tests/smoke.sh` against it.
 
 API in one minute (full list at http://localhost:8080/api):
 
@@ -31,7 +53,7 @@ curl -s -X POST localhost:8080/api/jobs/ID/action  -H 'Content-Type: application
 Semantic search: type in the search box and press Enter (needs OPENAI_API_KEY). Embeddings are kept
 current automatically: after scans, refreshes and manual adds, and a hash-based catch-up at startup.
 
-CLI equivalents (from the repo root; needs `pip install "psycopg[binary]"` and the db container up):
+CLI equivalents (from the repo root; needs `pip install "psycopg[binary]"` and the dev db container up):
 
 ```
 python3 jobscan/jobscan.py scan --source usace_yellogov --days 7
@@ -51,7 +73,12 @@ gunzip -c jobscan-backup.sql.gz | docker compose -f jobboard/compose.yaml exec -
 ## Production (uscentral1)
 
 - https://jobs.slindskog.net behind nginx (Cloudflare origin cert + authenticated origin pulls), password login.
-- Stack: `jobboard/compose.prod.yaml` under `/opt/jobboard`, Postgres data in the `pgdata` volume.
+- Stack: `jobboard/compose.prod.yaml` under `/opt/jobboard`, Postgres data in the `pgdata` volume. The app
+  image is built from the checkout and holds only `jobboard/` and `jobscan/` (`.dockerignore` at the repo
+  root); no code or repo is mounted. Container: nobody user, read-only, no capabilities, 512 MB.
+- nginx: `deploy/nginx/jobboard.conf` (site: TLS, listeners, WireGuard allow-list) installed to
+  sites-available, plus the rule snippets `deploy/nginx/jobboard-*.conf` installed to `/etc/nginx/jobboard/`.
+  Both are installed by the bootstrap, so an nginx change needs a bootstrap run, not a push.
 - Deploy: push to master -> GitHub Actions tests, then ssh as `deploy`. The deploy keys are pinned to a
   forced command (`/usr/local/bin/jobboard-deploy`, root-owned copy of `deploy/deploy.sh`): a key holder can
   only deploy a ref. `deploy` has no docker access; the container work runs through the sudoers-whitelisted

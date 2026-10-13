@@ -1,0 +1,11 @@
+# Only the application goes into the image (see jobboard/Dockerfile). Last matching rule wins.
+*
+!jobscan
+!jobboard
+**/__pycache__
+**/*.pyc
+jobboard/Dockerfile
+jobboard/compose*.yaml
+jobboard/dev.sh
+jobboard/dev
+jobboard/.env

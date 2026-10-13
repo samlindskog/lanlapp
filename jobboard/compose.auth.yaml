@@ -1,0 +1,23 @@
+# Overlay for the dev stack: production-like auth and nginx in front, still loopback only.
+#   ./dev.sh up-auth    (= docker compose -f compose.yaml -f compose.auth.yaml up -d --build)
+# Through nginx (the real deploy/nginx/ rules): web http://127.0.0.1:8081, MCP http://127.0.0.1:8091/mcp
+# Direct to the app (bypassing nginx):          web http://127.0.0.1:8080, MCP http://127.0.0.1:8090/mcp
+# Login password: dev. Mint a token: ./dev.sh token [name]. Smoke test: ./dev.sh smoke
+services:
+  jobboard:
+    environment:
+      JOBBOARD_AUTH: "1"
+      JOBBOARD_PASSWORD_HASH: "pbkdf2_sha256$$100000$$QYAPoqwiiS1ugpEbXoCFMg==$$fXfao2tTnUJv9150rDtTrXKNI7N0fCkN5sV9cxGIzwk="
+      JOBBOARD_SECRET: dev-secret-not-for-production
+
+  nginx:
+    image: nginx:alpine
+    container_name: jobboard-nginx
+    depends_on: [jobboard]
+    volumes:
+      - ../deploy/nginx:/etc/nginx/jobboard:ro            # the production rule snippets, unchanged
+      - ./dev/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "127.0.0.1:8081:80"
+      - "127.0.0.1:8091:8090"
+    restart: unless-stopped

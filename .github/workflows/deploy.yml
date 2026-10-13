@@ -8,61 +8,25 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    services:
-      db:
-        image: pgvector/pgvector:pg16
-        env:
-          POSTGRES_USER: jobscan
-          POSTGRES_PASSWORD: jobscan
-          POSTGRES_DB: jobscan
-        ports: ["5432:5432"]
-        options: >-
-          --health-cmd "pg_isready -U jobscan -d jobscan"
-          --health-interval 5s --health-timeout 3s --health-retries 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.13" }
-      - run: pip install "psycopg[binary]>=3.2"
       - name: syntax
         run: python -m py_compile jobscan/jobscan.py jobscan/sources/*.py jobboard/server.py jobboard/auth.py jobboard/mcp.py
-      - name: adapter contract + stubbed scan
+      - name: adapter contract + stubbed scan (offline)
         run: python tests/test_adapters.py
-      - name: smoke test (api + auth + mcp)
-        env:
-          JOBSCAN_DSN: postgresql://jobscan:jobscan@localhost:5432/jobscan
-          JOBBOARD_AUTH: "1"
-          JOBBOARD_SECRET: ci-secret
-          JOBBOARD_MCP_PORT: "8090"
-          JOBBOARD_MCP_BIND: "127.0.0.1"
+      - name: dev stack with auth + nginx (production image and nginx rules)
+        run: cd jobboard && ./dev.sh up-auth
+      - name: smoke test through nginx (gate, cookies, tokens, MCP, job + resume round trip)
+        run: tests/smoke.sh http://127.0.0.1:8081 http://127.0.0.1:8091 dev
+      - name: image holds only the application
         run: |
-          export JOBBOARD_PASSWORD_HASH=$(python3 -c "import sys; sys.path.insert(0,'jobboard'); import auth; print(auth.hash_password('ci-pass'))")
-          (cd jobboard && PORT=8080 python3 server.py > server.log 2>&1 &)
-          for i in $(seq 1 30); do curl -sf http://127.0.0.1:8080/login.html >/dev/null && break; sleep 1; done
-          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/api/stats)" = 401
-          TOKEN=$(curl -s -X POST http://127.0.0.1:8080/api/auth/token -H 'Content-Type: application/json' \
-                  -d '{"name":"ci","password":"ci-pass"}' | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])')
-          curl -sf http://127.0.0.1:8080/api/stats -H "Authorization: Bearer $TOKEN" | python3 -c 'import sys,json; d=json.load(sys.stdin); assert d["auth"] is True; print(d)'
-          curl -sf -X POST http://127.0.0.1:8080/api/jobs -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-               -d '{"title":"CI test job","text":"Qualifications\nA degree."}' >/dev/null
-          curl -sf -X POST http://127.0.0.1:8090/mcp -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-               -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_jobs","arguments":{}}}' \
-               | python3 -c 'import sys,json; r=json.load(sys.stdin); assert not r["result"]["isError"]; print("mcp ok")'
-          test "$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8090/mcp -d '{}')" = 401
-          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8090/mcp)" = 401
-          test "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE http://127.0.0.1:8090/mcp)" = 401
-          test "$(curl -s -o /dev/null -w '%{http_code}' -I http://127.0.0.1:8080/index.html)" = 302
-          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/view.html)" = 302
-          test "$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8080/api/auth/token -H 'Content-Type: application/json' -d '{"name":"x","password":"wrong"}')" = 403
-          JID=$(curl -sf "http://127.0.0.1:8080/api/jobs?q=CI+test" -H "Authorization: Bearer $TOKEN" | python3 -c 'import sys,json; print(json.load(sys.stdin)["jobs"][0]["id"])')
-          B64=$(printf '%%PDF-1.4 ci test' | base64 | tr -d '\n')
-          RID=$(curl -sf -X POST http://127.0.0.1:8090/mcp -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-               -d "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"upload_resume\",\"arguments\":{\"job_id\":$JID,\"filename\":\"resume.pdf\",\"content_base64\":\"$B64\",\"label\":\"ci\"}}}" \
-               | python3 -c 'import sys,json; r=json.load(sys.stdin)["result"]; assert not r["isError"], r; print(json.loads(r["content"][0]["text"])["id"])')
-          curl -sf "http://127.0.0.1:8080/files/$RID/resume.pdf" -H "Authorization: Bearer $TOKEN" | grep -q "PDF-1.4 ci test" && echo "resume roundtrip ok"
-      - name: server log
+          docker run --rm --entrypoint sh jobboard-jobboard -c 'find /app -maxdepth 2 | sort'
+          docker run --rm --entrypoint sh jobboard-jobboard -c '! ls /app/jobboard/compose.yaml /app/jobboard/dev.sh /app/deploy 2>/dev/null'
+      - name: stack logs
         if: failure()
-        run: cat jobboard/server.log || true
+        run: cd jobboard && docker compose -f compose.yaml -f compose.auth.yaml logs --tail 200
 
   deploy:
     needs: test

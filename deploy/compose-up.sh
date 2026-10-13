@@ -6,9 +6,8 @@
 set -euo pipefail
 cd /opt/jobboard
 C="docker compose -f jobboard/compose.prod.yaml --env-file .env"
-# --force-recreate: the code is bind-mounted, so a new commit does not change the image.
-$C up -d --build --remove-orphans --force-recreate jobboard
-$C up -d --remove-orphans
+# The app image is built from the checkout (code baked in), so --build picks up the new commit.
+$C up -d --build --remove-orphans
 for i in $(seq 1 40); do
   code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/login.html || true)
   if [ "$code" = "200" ]; then echo "ok (login page 200)"; exit 0; fi

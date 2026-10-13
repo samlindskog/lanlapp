@@ -1,6 +1,7 @@
-# Production stack on the VPS. Run from /opt/jobboard:
+# Production stack on the VPS. Run from /opt/jobboard (deploy/compose-up.sh does this):
 #   docker compose -f jobboard/compose.prod.yaml --env-file .env up -d --build
 # .env (deploy-owned, 0600) holds: POSTGRES_PASSWORD, JOBBOARD_PASSWORD_HASH, JOBBOARD_SECRET, OPENAI_API_KEY
+# The app image is built from the checkout and contains only jobboard/ and jobscan/; nothing is mounted.
 services:
   db:
     image: pgvector/pgvector:pg16
@@ -20,15 +21,15 @@ services:
     # no ports: reachable only from the app container
 
   jobboard:
-    build: .
+    build:
+      context: ..
+      dockerfile: jobboard/Dockerfile
     container_name: jobboard
-    working_dir: /repo/jobboard
     depends_on:
       db:
         condition: service_healthy
     environment:
       PORT: "8080"
-      JOBSCAN_DIR: /repo/jobscan
       JOBSCAN_DSN: postgresql://jobscan:${POSTGRES_PASSWORD}@db:5432/jobscan
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       JOBBOARD_AUTH: "1"
@@ -36,8 +37,6 @@ services:
       JOBBOARD_SECRET: ${JOBBOARD_SECRET}
       JOBBOARD_MCP_PORT: "8090"
       JOBBOARD_MCP_BIND: "0.0.0.0"          # inside the container; the host maps it to loopback for nginx
-    volumes:
-      - ../:/repo:ro                       # one read-only mount of the whole checkout (no nested mounts)
     ports:
       - "127.0.0.1:8080:8080"              # web + API: only via nginx (443)
       - "127.0.0.1:8091:8090"              # MCP: only via nginx (10.88.0.1:8090 over WireGuard)

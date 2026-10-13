@@ -1,3 +1,6 @@
+# Dev stack: ./dev.sh up   (or: docker compose up -d --build)  -> http://127.0.0.1:8080, MCP http://127.0.0.1:8090/mcp
+# No auth, loopback only. The code is bind-mounted over the image's copy and the server restarts on .py edits.
+# Add compose.auth.yaml (./dev.sh up-auth) for the production-like variant: auth on + nginx in front.
 services:
   db:
     image: pgvector/pgvector:pg16
@@ -18,24 +21,26 @@ services:
     restart: unless-stopped
 
   jobboard:
-    build: .
+    build:
+      context: ..
+      dockerfile: jobboard/Dockerfile
     container_name: jobboard
-    working_dir: /app
     depends_on:
       db:
         condition: service_healthy
     environment:
       PORT: "8080"
-      JOBSCAN_DIR: /app/jobscan
       JOBSCAN_DSN: postgresql://jobscan:jobscan@db:5432/jobscan
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}      # from your shell or a jobboard/.env file (git-ignored)
       JOBBOARD_RELOAD: "1"                     # dev: auto-restart on .py changes; static files always fresh
-      # dev stack runs without auth; production (compose.prod.yaml) sets JOBBOARD_AUTH=1
+      JOBBOARD_MCP_PORT: "8090"
+      JOBBOARD_MCP_BIND: "0.0.0.0"             # inside the container; published on loopback below
     volumes:
-      - ./:/app                                # server.py + static/, live
+      - ./:/app/jobboard                       # server.py, auth.py, mcp.py, static/: live
       - ../jobscan:/app/jobscan                # adapters, live
     ports:
-      - "127.0.0.1:8080:8080"                # dev stack has no auth: loopback only
+      - "127.0.0.1:8080:8080"                # web + API (direct, no nginx)
+      - "127.0.0.1:8090:8090"                # MCP (direct); without auth any client on this Mac may call it
     restart: unless-stopped
 
 volumes:

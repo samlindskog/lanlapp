@@ -160,7 +160,9 @@ fi
 log "nginx"
 install -d -m 755 /var/www/slindskog.net
 install -m 644 "$APP/deploy/homepage.html" /var/www/slindskog.net/index.html
-install -m 644 "$APP/deploy/nginx-jobboard.conf" /etc/nginx/sites-available/jobboard.conf
+install -d -m 755 /etc/nginx/jobboard
+install -m 644 "$APP"/deploy/nginx/jobboard-*.conf /etc/nginx/jobboard/           # rule snippets shared with dev
+install -m 644 "$APP/deploy/nginx/jobboard.conf" /etc/nginx/sites-available/jobboard.conf
 ln -sf /etc/nginx/sites-available/jobboard.conf /etc/nginx/sites-enabled/jobboard.conf
 rm -f /etc/nginx/sites-enabled/default
 nginx -t
