@@ -116,15 +116,19 @@ adapter (USACE on Yello) covers one board. Each board can carry `include` / `exc
 posting titles so a 4,000-job Workday tenant only yields the analyst roles. A scan walks any set of
 boards in one run; the web page's Scan dialog lists them with checkboxes and an add-by-URL box.
 
-Pages are fetched through a real Chrome (`jobscan/browser.py`: Selenium + undetected-chromedriver,
-Chromium in the image) so sites behind Cloudflare and JSON backends that expect a session work.
-JSON and POST calls run as `fetch()` inside a page of the same origin. One Chrome lives for the
-whole run (sockets and proxy tunnels are reused; images, fonts and media are off) and restarts only
-when the proxy must change. `JOBSCAN_BROWSER=0` forces plain HTTP with a keep-alive pool (CI, tests).
+All outbound traffic to career sites goes through one `browser.Session` per top-level operation
+(a scan run, one `add_boards` request, one refresh batch): it owns the Chrome, the keep-alive HTTP
+pool, the proxy escalation state and the log, and is torn down with the operation, so nothing
+(blocks, proxy sessions, a wedged browser) carries over to the next one. Pages are fetched through
+a real Chrome (`jobscan/browser.py`: Selenium + undetected-chromedriver, Chromium in the image) so
+sites behind Cloudflare and JSON backends that expect a session work. JSON and POST calls run as
+`fetch()` inside a page of the same origin. One Chrome lives for the whole operation (sockets and
+proxy tunnels are reused; images and fonts are off) and restarts only when the proxy must change.
+`JOBSCAN_BROWSER=0` forces plain HTTP with a keep-alive pool (CI, tests).
 
 Proxy: every host is tried direct first. A 403/429/503 or a Cloudflare challenge that never clears
 escalates that host to the proxy, then to fresh proxy sessions, `JOBSCAN_PROXY_TRIES` (3) in all;
-after that the host is blocked for the rest of the run and the scan moves on. `JOBSCAN_PROXY` lists
+after that the host is blocked for the rest of the operation and the scan moves on. `JOBSCAN_PROXY` lists
 the proxies, one per level, as `host:port:user:pass` or `http://user:pass@host:port` entries separated
 by commas (Decodo's sticky-port endpoint list pastes straight in: each port is its own IP), or one URL
 with `{session}` in the username for session-based gateways; leave it empty for direct only.

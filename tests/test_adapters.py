@@ -211,16 +211,17 @@ def check_guards():
 
 
 def check_escalation():
-    """Per-host proxy escalation: direct -> session 1..3 -> blocked, then immediate 403s; a host
-    that works direct never sees the proxy; close() resets everything."""
+    """Per-host proxy escalation inside one Session: direct -> session 1..3 -> blocked, then
+    immediate 403s; a host that works direct never sees the proxy; a tunnel refusal moves to the
+    next proxy; a new Session starts clean."""
     import browser as B
-    B.ACCESS = B.Access(B.ProxyPool("http://u-session-{session}:p@gw.example.net:7000", 3))
-    B.ACCESS.log = lambda m: None
-    B._host_ok.update({"fine.example.com", "blocked.example.com", "flaky.example.com", "gov.example.com"})   # skip DNS in the guard
+    B._host_ok.update({"fine.example.com", "blocked.example.com", "flaky.example.com", "gov.example.com"})  # skip DNS
+    cfg = B.Config({"JOBSCAN_BROWSER": "0", "JOBSCAN_PROXY": "http://u-session-{session}:p@gw.example.net:7000",
+                    "JOBSCAN_PROXY_TRIES": "3"})
     calls = []
 
     def transport(url, method, data, headers, accept, proxy):
-        calls.append((B.Access.host(url), B.ProxyPool.label(proxy)))
+        calls.append((B.Access.host(url), B.ProxyPool.label(proxy), proxy))
         if "blocked.example.com" in url:
             return 403, "<title>Just a moment...</title>"
         if "flaky.example.com" in url and proxy is None:
@@ -228,29 +229,34 @@ def check_escalation():
         if "gov.example.com" in url:                       # direct blocked, proxy 1 refuses the tunnel
             if proxy is None:
                 return 403, ""
-            return (0, "net::ERR_TUNNEL_CONNECTION_FAILED") if proxy == B.ACCESS.pool.url(1) else (200, "ok")
+            return (0, "net::ERR_TUNNEL_CONNECTION_FAILED") if proxy == s.pool.url(1) else (200, "ok")
         return 200, "ok"
-    assert B.fetch("https://fine.example.com/a", delay=0, transport=transport) == (200, "ok")
-    assert B.fetch("https://blocked.example.com/x", delay=0, transport=transport) == (403, "")
-    assert B.fetch("https://blocked.example.com/y", delay=0, transport=transport) == (403, "")   # no transport call
-    assert B.fetch("https://flaky.example.com/z", delay=0, transport=transport) == (200, "ok")
-    assert B.fetch("https://fine.example.com/b", delay=0, transport=transport) == (200, "ok")
-    labels = [c for c in calls if c[0] == "blocked.example.com"]
-    assert [l[1] for l in labels][0] == "direct" and len(labels) == 4, labels        # direct + 3 sessions
-    assert len({l[1] for l in labels}) == 4, labels                                   # four distinct sessions
-    assert [c[1] for c in calls if c[0] == "flaky.example.com"] == ["direct", labels[1][1]], calls  # reuses session 1
-    assert all(c[1] == "direct" for c in calls if c[0] == "fine.example.com")
-    assert B.fetch("https://gov.example.com/j", delay=0, transport=transport) == (200, "ok")
-    g = [c[1] for c in calls if c[0] == "gov.example.com"]
-    assert g[0] == "direct" and g[1] == labels[1][1] and g[2] == labels[2][1] and len(g) == 3, g   # refused -> next proxy
-    assert "blocked.example.com" in B.ACCESS.blocked
-    B.ACCESS.reset()
-    assert not B.ACCESS.blocked and B.ACCESS.proxy_for("https://blocked.example.com/") is None
-    # without a proxy configured a block is final at once
-    B.ACCESS = B.Access(B.ProxyPool(None, 3)); B.ACCESS.log = lambda m: None
+    with B.Session(lambda m: None, cfg) as s:
+        assert s.fetch("https://fine.example.com/a", delay=0, transport=transport) == (200, "ok")
+        assert s.fetch("https://blocked.example.com/x", delay=0, transport=transport) == (403, "")
+        assert s.fetch("https://blocked.example.com/y", delay=0, transport=transport) == (403, "")   # no transport call
+        assert s.fetch("https://flaky.example.com/z", delay=0, transport=transport) == (200, "ok")
+        assert s.fetch("https://fine.example.com/b", delay=0, transport=transport) == (200, "ok")
+        assert s.fetch("https://gov.example.com/j", delay=0, transport=transport) == (200, "ok")
+        labels = [c for c in calls if c[0] == "blocked.example.com"]
+        assert [l[1] for l in labels][0] == "direct" and len(labels) == 4, labels        # direct + 3 sessions
+        assert len({l[1] for l in labels}) == 4, labels                                   # four distinct sessions
+        assert [c[1] for c in calls if c[0] == "flaky.example.com"] == ["direct", labels[1][1]], calls  # reuses session 1
+        assert all(c[1] == "direct" for c in calls if c[0] == "fine.example.com")
+        g = [c[1] for c in calls if c[0] == "gov.example.com"]
+        assert g == ["direct", labels[1][1], labels[2][1]], g                              # refused -> next proxy
+        assert "blocked.example.com" in s.access.blocked
+        first_sessions = {c[2] for c in calls if c[2]}
+    # state does not outlive the operation: a new Session starts direct with new proxy sessions
     calls.clear()
-    assert B.fetch("https://blocked.example.com/x", delay=0, transport=transport) == (403, "")
-    assert len(calls) == 1 and calls[0][1] == "direct"
+    with B.Session(lambda m: None, cfg) as s:
+        assert s.fetch("https://blocked.example.com/x", delay=0, transport=transport) == (403, "")
+        assert calls[0][1] == "direct" and not ({c[2] for c in calls if c[2]} & first_sessions)
+    # without a proxy configured a block is final at once
+    calls.clear()
+    with B.Session(lambda m: None, B.Config({"JOBSCAN_BROWSER": "0"})) as s:
+        assert s.fetch("https://blocked.example.com/x", delay=0, transport=transport) == (403, "")
+        assert len(calls) == 1 and calls[0][1] == "direct"
     assert B.looks_blocked(200, "<html><title>Attention Required! | Cloudflare</title>") and not B.looks_blocked(200, "<title>Jobs</title>")
     # proxy lists: Decodo endpoint lines, URLs, or a {session} template
     pool = B.ProxyPool("gate.decodo.com:10001:u:p:w\ngate.decodo.com:10002:u:pw, http://x:y@h:3", 5)

@@ -1,82 +1,53 @@
-"""Fetch layer for board adapters: a real Chrome (Selenium + undetected-chromedriver) with an
-optional proxy, falling back to urllib when the browser is disabled or not installed.
+"""Outbound access for board adapters: one Session per top-level operation (a scan run, one
+add_boards call, one refresh batch) owning the transports, the proxy escalation state and the
+browser lifecycle. Adapters only ever see session.fetch(url, ...) -> (status, body).
 
-Why a browser: many career sites sit behind Cloudflare or bot walls that refuse plain HTTP, and
-their JSON APIs (Workday CXS, Oracle HCM REST, UKG) expect the cookies a page visit sets.
-Every request goes through one of two paths:
-  page      driver.get(url) -> rendered HTML            (postings, HTML search pages)
-  xhr       window.fetch(url) run inside a page of the same origin -> (status, body)
-            (JSON endpoints, POST bodies, custom headers); the origin is visited once first so
-            the request carries the site's cookies and passes its challenge like a user would.
+Layers (each testable on its own):
+  Config        everything read from the environment, in one place
+  check_url     refuses loopback/private/link-local targets before any request
+  ProxyPool     escalation level -> proxy URL (Decodo sticky ports, or the gateway with {session}
+                and {country} placeholders: a fresh session per level, countries cycled)
+  Access        per-host state for one operation: direct -> proxy levels -> blocked
+  Chrome        headless Chromium via undetected-chromedriver: pages rendered, JSON/POST as
+                in-page fetch; a loopback ProxyRelay adds proxy credentials; cleanup is scoped to
+                this session's own process tree
+  HttpPool      plain HTTP with keep-alive: curl_cffi impersonating Chrome's TLS fingerprint when
+                installed, else http.client tunnels
+  Session       fetch(): the escalation loop over the transports; close(): tear everything down.
+                Nothing outlives the session: the next operation starts direct with new sessions.
 
-Proxy and blocking (Access): every host starts direct. A 403/429/503 or a challenge page that
-never clears escalates that host to the proxy, then to a fresh proxy session (a new IP when the
-proxy URL carries a {session} placeholder in its username, as Decodo sticky sessions do), up to
-JOBSCAN_PROXY_TRIES sessions. After that the host is blocked for the rest of the run and every
-request to it returns at once, so a scan moves on to the next board. Hosts that work direct
-never use the proxy. One Chrome stays up for the whole run and restarts only when the proxy
-must change, so sockets and proxy tunnels are reused; images, fonts and media are disabled to
-keep proxied page loads small. The plain-HTTP fallback keeps one tunnel per proxy and host.
-
-Env:
-  JOBSCAN_BROWSER=0        force plain HTTP for everything (CI, offline tests)
-  JOBSCAN_PROXY            optional proxies, one per escalation level, as a comma/space/newline-separated
-                           list of http://user:pass@host:port or host:port:user:pass entries (Decodo's
-                           sticky-port endpoints: each port is its own IP), or one URL with {session}
-                           and optionally {country} in the username for the rotating gateway, e.g.
+Env (Config):
+  JOBSCAN_BROWSER=0        plain HTTP only (CI, offline tests)
+  JOBSCAN_PROXY            proxies, one per escalation level: comma/space/newline-separated
+                           http://user:pass@host:port or host:port:user:pass entries, or one URL with
+                           {session} (and optionally {country}) in the username, e.g.
                            http://user-NAME-country-{country}-session-{session}-sessionduration-30:PASS@gate.decodo.com:7000
-                           (a fresh session per level, the IP kept for the run). Credentials are
-                           added by an in-process loopback relay that Chrome is pointed at.
-  JOBSCAN_PROXY_TRIES      proxy levels to try per host before giving up (default 3, capped by the
-                           number of proxies listed)
-  JOBSCAN_PROXY_COUNTRIES  e.g. "us,ca": pin each proxy's exit country by rewriting its username to
-                           Decodo's user-<name>-country-<cc> form, cycling the list across the proxies
-                           (empty: usernames used as given, i.e. the provider's default pool)
-Plain HTTP uses curl_cffi impersonating Chrome's TLS/HTTP2 fingerprint when installed (the image
-has it), else http.client; the browser path is real Chromium, so its fingerprint is Chrome's own.
-  JOBSCAN_CHROME           browser binary (container: /usr/bin/chromium); default: auto-detect
-  JOBSCAN_CHROMEDRIVER     chromedriver binary (container: /usr/bin/chromedriver); default: the
-                           library downloads one matching the installed Chrome
-  JOBSCAN_BROWSER_DIR      scratch dir for the profile and patched driver (default: a temp dir)
-  JOBSCAN_OWN_CHROME=1     every Chromium process on this host is ours (the container): kill them all
-                           before a start and on close, not only the ones we can match by profile dir
+  JOBSCAN_PROXY_TRIES      proxy levels per host before it is blocked for the operation (default 3)
+  JOBSCAN_PROXY_COUNTRIES  e.g. "us,ca": exit countries cycled over the levels (Decodo username form)
+  JOBSCAN_CHROME / JOBSCAN_CHROMEDRIVER   binaries (the image sets both); default: auto-detect / download
+  JOBSCAN_OWN_CHROME=1     every Chromium on this host is ours (the container): kill_all_chrome() at
+                           server start sweeps leftovers from a crashed process
+  JOBSCAN_BROWSER_DIR      scratch dir for profiles and the patched driver (default: a temp dir per session)
 """
+import contextvars
+import http.client
 import ipaddress
 import json
 import os
 import re
-import socket
+import secrets
 import shutil
+import socket
 import subprocess
 import sys
-import http.client
-import secrets
 import tempfile
 import threading
 import time
 import urllib.parse
 
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) jobscan/2.0"
-
-
-def _stderr(msg):
-    print(msg, file=sys.stderr)
-
-
-LOG = _stderr          # jobscan points this at the run log during scans/refreshes
-
-
-def log(msg):
-    LOG(msg)
-ENABLED = os.environ.get("JOBSCAN_BROWSER", "1") != "0"
-PROXY = os.environ.get("JOBSCAN_PROXY") or None
-PROXY_TRIES = int(os.environ.get("JOBSCAN_PROXY_TRIES", "3") or 0)
-PROXY_COUNTRIES = [c.strip().lower() for c in os.environ.get("JOBSCAN_PROXY_COUNTRIES", "").split(",") if c.strip()]
 BLOCK_STATUSES = (403, 429, 503)
-CHROME = os.environ.get("JOBSCAN_CHROME") or None
-CHROMEDRIVER = os.environ.get("JOBSCAN_CHROMEDRIVER") or None
-OWN_CHROME = os.environ.get("JOBSCAN_OWN_CHROME") == "1"
-MAX_FAILURES = 2             # Chrome start/crash failures per run before falling back to plain HTTP
+MAX_FAILURES = 2             # Chrome start/crash failures per session before plain HTTP takes over
 PAGE_TIMEOUT = 60
 CHALLENGE_WAIT = 30          # seconds to sit on a Cloudflare "Just a moment" page
 CHALLENGE_RE = re.compile(r"just a moment|attention required|access denied|checking your browser|"
@@ -88,6 +59,33 @@ fetch(url, {method, body: body === null ? undefined : body, headers, credentials
   .then(r => r.text().then(t => done([r.status, t])))
   .catch(e => done([0, 'fetch error: ' + e]));
 """
+
+# The log of the operation in progress (set by Session.__enter__), so adapters' progress lines
+# land in the same run log without being handed a logger explicitly.
+_current_log = contextvars.ContextVar("jobscan_log", default=None)
+
+
+def log(msg):
+    (_current_log.get() or _stderr)(msg)
+
+
+def _stderr(msg):
+    print(msg, file=sys.stderr)
+
+
+class Config:
+    """All environment-derived settings, read once per Session (tests build one by hand)."""
+
+    def __init__(self, env=None):
+        env = os.environ if env is None else env
+        self.enabled = env.get("JOBSCAN_BROWSER", "1") != "0"
+        self.proxy = env.get("JOBSCAN_PROXY") or None
+        self.proxy_tries = int(env.get("JOBSCAN_PROXY_TRIES", "3") or 0)
+        self.countries = [c.strip().lower() for c in env.get("JOBSCAN_PROXY_COUNTRIES", "").split(",") if c.strip()]
+        self.chrome = env.get("JOBSCAN_CHROME") or None
+        self.chromedriver = env.get("JOBSCAN_CHROMEDRIVER") or None
+        self.own_chrome = env.get("JOBSCAN_OWN_CHROME") == "1"
+        self.browser_dir = env.get("JOBSCAN_BROWSER_DIR") or None
 
 
 class UnsafeURL(ValueError):
@@ -229,7 +227,8 @@ class _ImpersonatingPool:
         with self._lock:
             sess = self._sessions.get(proxy)
             if sess is None:
-                sess = self._sessions[proxy] = cr.Session(impersonate="chrome", proxies={"https": proxy, "http": proxy} if proxy else None,
+                sess = self._sessions[proxy] = cr.Session(impersonate="chrome",
+                                                          proxies={"https": proxy, "http": proxy} if proxy else None,
                                                           timeout=40)
             r = sess.request(method, url, data=body, headers=h)
             return r.status_code, r.text
@@ -244,20 +243,13 @@ class _ImpersonatingPool:
             self._sessions.clear()
 
 
-def _make_pool():
+def HttpPool():
+    """Plain-HTTP transport: Chrome-impersonating when curl_cffi is installed, else http.client."""
     try:
         import curl_cffi  # noqa: F401
         return _ImpersonatingPool()
     except ImportError:
         return _Pool()
-
-
-POOL = _make_pool()
-
-
-def urllib_request(url, method="GET", data=None, headers=None, accept=None, proxy=None):
-    """Plain HTTP (no browser) through the keep-alive pool. (status, body)."""
-    return POOL.request(url, method, data, headers, accept, proxy)
 
 
 def with_country(url, cc):
@@ -333,10 +325,10 @@ class ProxyPool:
 
 
 class Access:
-    """Per-host escalation state for one run: level 0 (direct) -> 1..tries (proxy sessions) ->
-    blocked. Shared by the browser and the plain-HTTP path."""
+    """Per-host escalation state for ONE operation: level 0 (direct) -> 1..tries (proxy sessions)
+    -> blocked. Created by the Session and discarded with it."""
 
-    def __init__(self, pool):
+    def __init__(self, pool, log=_stderr):
         self.pool = pool
         self._level = {}
         self.blocked = set()
@@ -346,8 +338,11 @@ class Access:
     def host(url):
         return (urllib.parse.urlsplit(url).hostname or "").lower()
 
+    def level(self, url):
+        return self._level.get(self.host(url), 0)
+
     def proxy_for(self, url):
-        return self.pool.url(self._level.get(self.host(url), 0))
+        return self.pool.url(self.level(url))
 
     def escalate(self, url, why):
         """Move the host one level up. False when it just got blocked (no levels left)."""
@@ -356,19 +351,11 @@ class Access:
         if lvl >= self.pool.tries:
             self.blocked.add(host)
             self.log(f"  ! {host}: {why} on {self.pool.label(self.pool.url(lvl))}; "
-                     f"blocked for this run after {lvl} proxy session(s)")
+                     f"blocked for this operation after {lvl} proxy session(s)")
             return False
         self._level[host] = lvl + 1
         self.log(f"  ! {host}: {why} on {self.pool.label(self.pool.url(lvl))} -> {self.pool.label(self.pool.url(lvl + 1))}")
         return True
-
-    def reset(self):
-        self._level.clear()
-        self.blocked.clear()
-        self.pool._urls.clear()
-
-
-ACCESS = Access(ProxyPool(PROXY, PROXY_TRIES, PROXY_COUNTRIES))
 
 
 def looks_blocked(status, body):
@@ -461,41 +448,40 @@ class ProxyRelay:
             pass
 
 
-def kill_stray_chrome():
-    """Kill Chromium/chromedriver processes left behind by a crashed or hung session (Linux /proc
-    scan; a no-op elsewhere). Without JOBSCAN_OWN_CHROME only processes started with one of our
-    profile dirs are touched. Returns the number killed."""
+def _proc_cmdline(pid):
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return f.read().replace(b"\0", b" ")
+    except OSError:
+        return b""
+
+
+def _proc_stat(pid):
+    """(ppid, pgid) from /proc/<pid>/stat, or (0, 0)."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            fields = f.read().rsplit(")", 1)[1].split()
+            return int(fields[1]), int(fields[2])
+    except (OSError, ValueError, IndexError):
+        return 0, 0
+
+
+def _kill(pids):
     import signal
-    if not os.path.isdir("/proc"):
-        return 0
-    victims = []
-    for pid in os.listdir("/proc"):
-        if not pid.isdigit() or int(pid) == os.getpid():
-            continue
-        try:
-            with open(f"/proc/{pid}/cmdline", "rb") as f:
-                cmd = f.read().replace(b"\0", b" ")
-        except OSError:
-            continue
-        exe = cmd.split(b" ", 1)[0]
-        is_chrome = any(k in exe for k in (b"chromium", b"chrome", b"chromedriver"))
-        if is_chrome and (OWN_CHROME or b"jobscan-chrome-" in cmd):
-            victims.append(int(pid))
-    for pid in victims:
+    for pid in pids:
         try:
             os.kill(pid, signal.SIGKILL)
         except OSError:
             pass
-    for _ in range(10):                          # reap what gets re-parented to us, so no zombies linger
+    for _ in range(10):                          # reap what gets re-parented to us
         try:
             while os.waitpid(-1, os.WNOHANG) != (0, 0):
                 pass
         except ChildProcessError:
             pass
-        if not any(os.path.exists(f"/proc/{p}") and "Z" not in _state(p) for p in victims):
+        if not any(os.path.exists(f"/proc/{p}") and _state(p) != "Z" for p in pids):
             break
         time.sleep(0.1)
-    return len(victims)
 
 
 def _state(pid):
@@ -504,6 +490,47 @@ def _state(pid):
             return f.read().split(") ")[-1][:1]
     except OSError:
         return "X"
+
+
+def _chrome_pids():
+    if not os.path.isdir("/proc"):
+        return {}
+    out = {}
+    for pid in os.listdir("/proc"):
+        if pid.isdigit() and int(pid) != os.getpid():
+            cmd = _proc_cmdline(pid)
+            exe = cmd.split(b" ", 1)[0]
+            if any(k in exe for k in (b"chromium", b"chrome", b"chromedriver")):
+                out[int(pid)] = cmd
+    return out
+
+
+def kill_chrome_tree(profile_dir):
+    """Kill the Chromium/chromedriver processes launched for one session (their command line
+    names the session's scratch dir) and every descendant of theirs. Returns the count."""
+    procs = _chrome_pids()
+    if not procs:
+        return 0
+    tag = profile_dir.encode()
+    roots = {p for p, cmd in procs.items() if tag in cmd}
+    stats = {p: _proc_stat(p) for p in procs}
+    groups = {stats[p][1] for p in roots} - {0, os.getpgid(0)}
+    victims = set(roots) | {p for p in procs if stats[p][1] in groups}   # same process group as a root
+    changed = True
+    while changed:                                # plus descendants (renderers carry neither dir nor group)
+        changed = False
+        for p in procs:
+            if p not in victims and stats[p][0] in victims:
+                victims.add(p); changed = True
+    _kill(victims)
+    return len(victims)
+
+
+def kill_all_chrome():
+    """Startup sweep for the container (JOBSCAN_OWN_CHROME): every Chromium here is a leftover."""
+    pids = list(_chrome_pids())
+    _kill(pids)
+    return len(pids)
 
 
 def chrome_major(binary):
@@ -516,43 +543,38 @@ def chrome_major(binary):
         return None
 
 
-class Browser:
-    """One Chrome shared by the process; every call is serialized. Started on first use,
-    closed by close() (the scan runner does that at the end of a run)."""
+class Chrome:
+    """Headless Chromium for one Session. Started on first use, restarted when the proxy changes,
+    disabled after MAX_FAILURES start/crash failures; close() kills its own process tree."""
 
-    def __init__(self):
+    def __init__(self, cfg, log=_stderr):
+        self.cfg = cfg
+        self.log = log
         self._lock = threading.RLock()
         self._drv = None
         self._dir = None
         self._proxy = None            # proxy URL the running Chrome was started with
         self._relay = None
         self._disabled_reason = None
-        self._failures = 0            # start/crash failures this run (reset by close(final=True))
-        self.log = log
+        self._failures = 0
 
     # ------------------------------------------------------------- lifecycle
     def available(self):
-        if not ENABLED:
-            return False
-        if self._disabled_reason:
+        if not self.cfg.enabled or self._disabled_reason:
             return False
         try:
             import undetected_chromedriver  # noqa: F401
             import selenium  # noqa: F401
         except ImportError as e:
-            self._disabled_reason = f"browser packages missing ({e}); using urllib"
+            self._disabled_reason = f"browser packages missing ({e}); using plain HTTP"
             self.log(f"  ! {self._disabled_reason}")
             return False
         return True
 
     def _start(self, proxy=None):
         import undetected_chromedriver as uc
-        n = kill_stray_chrome()
-        if n:
-            self.log(f"  browser: killed {n} stray chromium process(es)")
         self._proxy = proxy
-        self._dir = os.environ.get("JOBSCAN_BROWSER_DIR") or tempfile.mkdtemp(prefix="jobscan-chrome-")
-        os.makedirs(self._dir, exist_ok=True)
+        self._dir = tempfile.mkdtemp(prefix="jobscan-chrome-", dir=self.cfg.browser_dir)
         # The library patches the driver binary in place and keeps its profile under $HOME:
         # in the read-only container both must live on the tmpfs scratch dir.
         os.environ.setdefault("HOME", self._dir)
@@ -565,7 +587,7 @@ class Browser:
                   "--disable-component-update", "--js-flags=--max-old-space-size=192",
                   "--disable-breakpad", "--disable-crash-reporter", "--mute-audio"):
             opts.add_argument(a)
-        binary = CHROME or uc.find_chrome_executable()
+        binary = self.cfg.chrome or uc.find_chrome_executable()
         major = chrome_major(binary) if binary else None   # the driver must match the browser's major
         # Headless Chrome announces itself as "HeadlessChrome", which some career sites answer with 403.
         platform = "Macintosh; Intel Mac OS X 10_15_7" if sys.platform == "darwin" else "X11; Linux x86_64"
@@ -583,12 +605,11 @@ class Browser:
                 opts.add_argument(f"--proxy-server={scheme}://{host}:{port}")
             opts.add_argument("--proxy-bypass-list=<-loopback>")
         driver_path = None
-        if CHROMEDRIVER:
+        if self.cfg.chromedriver:
             # copy so the patcher can write to it (the system binary is read-only in the image)
             driver_path = os.path.join(self._dir, "chromedriver")
-            if not os.path.exists(driver_path):
-                shutil.copy2(CHROMEDRIVER, driver_path)
-                os.chmod(driver_path, 0o755)
+            shutil.copy2(self.cfg.chromedriver, driver_path)
+            os.chmod(driver_path, 0o755)
         kw = dict(options=opts, user_data_dir=os.path.join(self._dir, "profile"),
                   browser_executable_path=binary, driver_executable_path=driver_path,
                   use_subprocess=True, suppress_welcome=True)
@@ -615,18 +636,18 @@ class Browser:
         return self._drv
 
     def _failed(self, why):
-        """A start failure or crash. After MAX_FAILURES in one run the browser is left off and
-        fetch() uses plain HTTP, instead of restarting Chrome over and over on a starved host."""
+        """A start failure or crash. After MAX_FAILURES the browser stays off for this session and
+        the plain-HTTP transport takes over, instead of restarting Chrome over and over."""
         self._failures += 1
         self.log(f"  ! browser: {why} ({self._failures}/{MAX_FAILURES})")
         self.close()
         if self._failures >= MAX_FAILURES:
-            self._disabled_reason = f"chrome failed {self._failures} times this run; plain HTTP for the rest"
+            self._disabled_reason = f"chrome failed {self._failures} times; plain HTTP for the rest of this operation"
             self.log(f"  ! browser: {self._disabled_reason}")
 
-    def close(self, final=False):
-        """Quit Chrome and kill whatever it left behind. final=True (end of a run) also clears the
-        failure count and re-enables the browser for the next run."""
+    def close(self):
+        """Quit Chrome and kill whatever of its own process tree is left; drop the relay and the
+        scratch dir. Other sessions' browsers are not touched."""
         with self._lock:
             if self._drv is not None:
                 try:
@@ -634,17 +655,15 @@ class Browser:
                 except Exception:  # noqa: BLE001
                     pass
                 self._drv = None
-            kill_stray_chrome()
+            if self._dir:
+                n = kill_chrome_tree(self._dir)
+                self.log(f"  browser: closed ({n} process(es) killed)")
             if self._relay is not None:
                 self._relay.close()
                 self._relay = None
-            if self._dir and not os.environ.get("JOBSCAN_BROWSER_DIR"):
+            if self._dir:
                 shutil.rmtree(self._dir, ignore_errors=True)
                 self._dir = None
-            if final:
-                self._failures = 0
-                if self._disabled_reason and self._disabled_reason.startswith("chrome failed"):
-                    self._disabled_reason = None
 
     # ------------------------------------------------------------- requests
     @staticmethod
@@ -733,62 +752,84 @@ class Browser:
                         raise
 
 
-BROWSER = Browser()
+class Session:
+    """One top-level operation's outbound access. Use as a context manager:
 
+        with browser.Session(log) as s:
+            status, body = s.fetch(url, accept="application/json")
 
-def _transport(url, method, data, headers, accept, proxy):
-    if BROWSER.available():
-        status, body = BROWSER.request(url, method, data, headers, accept, proxy)
-        if status == 0 and body.startswith("origin unreachable"):
-            log(f"  ! browser: {body}; plain HTTP for {url[:80]}")
-            status, body = urllib_request(url, method, data, headers, accept, proxy)
-        return status, body
-    return urllib_request(url, method, data, headers, accept, proxy)
+    fetch(url, accept=None, data=None, headers=None, method=None, retries=2, delay=0.4):
+    (status, body). data (dict/list -> JSON, or str/bytes) makes it a POST; 404/410 come back as
+    (code, ""); a host blocked at every level returns (403, "") at once; network failures retry
+    and finally return (0, ""). Every request to a career site goes through here, so the
+    escalation policy is the same for scans, board registration and refreshes."""
 
+    def __init__(self, log=None, cfg=None):
+        self.cfg = cfg or Config()
+        self.log = log or _stderr
+        self.pool = ProxyPool(self.cfg.proxy, self.cfg.proxy_tries, self.cfg.countries)
+        self.access = Access(self.pool, self.log)
+        self.chrome = Chrome(self.cfg, self.log)
+        self.http = HttpPool()
+        self._token = None
 
-def fetch(url, retries=2, delay=0.4, accept=None, data=None, headers=None, method=None, transport=None):
-    """The adapters' fetch: (status, body). Browser when available, plain HTTP otherwise, both
-    behind the per-host proxy escalation in ACCESS. data (dict/list -> JSON, or str/bytes) makes
-    it a POST. 404/410 are returned as (code, ""); a blocked host returns (403, "") at once;
-    other failures retry and finally return (0, "")."""
-    method = method or ("POST" if data is not None else "GET")
-    transport = transport or _transport
-    try:
-        check_url(url)
-    except UnsafeURL as e:
-        log(f"  ! {e}")
-        return 0, ""
-    if ACCESS.host(url) in ACCESS.blocked:
-        return 403, ""
-    last = None
-    for attempt in range(retries + 1 + ACCESS.pool.tries):
-        proxy = ACCESS.proxy_for(url)
+    def __enter__(self):
+        self._token = _current_log.set(self.log)
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+    def close(self):
+        """Tear everything down: Chrome and its process tree, pooled connections, escalation state."""
+        self.chrome.close()
+        self.http.close()
+        self.access = Access(self.pool, self.log)
+        if self._token is not None:
+            _current_log.reset(self._token)
+            self._token = None
+
+    def transport(self, url, method, data, headers, accept, proxy):
+        if self.chrome.available():
+            status, body = self.chrome.request(url, method, data, headers, accept, proxy)
+            if status == 0 and body.startswith("origin unreachable"):
+                self.log(f"  ! browser: {body}; plain HTTP for {url[:80]}")
+                status, body = self.http.request(url, method, data, headers, accept, proxy)
+            return status, body
+        return self.http.request(url, method, data, headers, accept, proxy)
+
+    def fetch(self, url, retries=2, delay=0.4, accept=None, data=None, headers=None, method=None, transport=None):
+        method = method or ("POST" if data is not None else "GET")
+        transport = transport or self.transport
         try:
-            status, body = transport(url, method, data, headers, accept, proxy)
-            if status in (404, 410):
-                return status, ""
-            if status == 0 and body.startswith("net::ERR_") and proxy:
-                if ACCESS.escalate(url, f"proxy refused ({body[5:]})"):
-                    continue
-                return 403, ""
-            if looks_blocked(status, body):
-                if ACCESS.escalate(url, f"blocked (HTTP {status})"):
-                    continue
-                return 403, ""
-            if status and status < 500:
-                time.sleep(delay)
-                return status, body
-            last = f"HTTP {status}"
-        except Exception as e:  # noqa: BLE001
-            last = e
-        time.sleep(1.5 * (attempt + 1))
-    log(f"  ! fetch failed {url}: {last}")
-    return 0, ""
-
-
-def close():
-    """End of a run: quit Chrome (and kill strays), drop pooled connections, forget blocks,
-    sessions and browser failures so the next run starts clean and direct."""
-    BROWSER.close(final=True)
-    POOL.close()
-    ACCESS.reset()
+            check_url(url)
+        except UnsafeURL as e:
+            self.log(f"  ! {e}")
+            return 0, ""
+        if self.access.host(url) in self.access.blocked:
+            return 403, ""
+        last = None
+        for attempt in range(retries + 1 + self.pool.tries):
+            proxy = self.access.proxy_for(url)
+            try:
+                status, body = transport(url, method, data, headers, accept, proxy)
+                if status in (404, 410):
+                    return status, ""
+                if status == 0 and body.startswith("net::ERR_") and proxy:
+                    if self.access.escalate(url, f"proxy refused ({body[5:]})"):
+                        continue
+                    return 403, ""
+                if looks_blocked(status, body):
+                    if self.access.escalate(url, f"blocked (HTTP {status})"):
+                        continue
+                    return 403, ""
+                if status and status < 500:
+                    time.sleep(delay)
+                    return status, body
+                last = f"HTTP {status}"
+            except Exception as e:  # noqa: BLE001
+                last = e
+            time.sleep(1.5 * (attempt + 1))
+        self.log(f"  ! fetch failed {url}: {last}")
+        return 0, ""

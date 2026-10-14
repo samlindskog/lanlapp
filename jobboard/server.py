@@ -293,23 +293,23 @@ def add_boards(items):
     conn = J.db()
     out = []
     try:
-        for it in items:
-            it = {"url": it} if isinstance(it, str) else dict(it or {})
-            url = (it.get("url") or "").strip()
-            if not url:
-                out.append({"url": url, "error": "missing url"})
-                continue
-            try:
-                b = J.add_board(conn, url, name=it.get("name"), include=it.get("include"), exclude=it.get("exclude"),
-                                adapter=it.get("adapter"))
-                out.append({"url": url, "board": b})
-                log_event("info", f"board added: [{b['id']}] {b['name']} ({b['adapter']}) {b['url']}")
-            except Exception as e:  # noqa: BLE001
-                conn.rollback()
-                out.append({"url": url, "error": f"{e.__class__.__name__}: {e}"})
-                log_event("warn", f"board not added {url}: {e}")
+        with J.browser.Session(lambda m: log_event("info", m.strip())) as s:   # one session per request
+            for it in items:
+                it = {"url": it} if isinstance(it, str) else dict(it or {})
+                url = (it.get("url") or "").strip()
+                if not url:
+                    out.append({"url": url, "error": "missing url"})
+                    continue
+                try:
+                    b = J.add_board(conn, url, name=it.get("name"), include=it.get("include"), exclude=it.get("exclude"),
+                                    adapter=it.get("adapter"), session=s)
+                    out.append({"url": url, "board": b})
+                    log_event("info", f"board added: [{b['id']}] {b['name']} ({b['adapter']}) {b['url']}")
+                except Exception as e:  # noqa: BLE001
+                    conn.rollback()
+                    out.append({"url": url, "error": f"{e.__class__.__name__}: {e}"})
+                    log_event("warn", f"board not added {url}: {e}")
     finally:
-        J.close_browser()
         conn.close()
     return out
 
@@ -722,15 +722,13 @@ class Handler(SimpleHTTPRequestHandler):
 
                 def work(conn, log):
                     out = []
-                    try:
+                    with J.browser.Session(log) as s:          # one session for the batch
                         for i in ids:
                             try:
-                                out.append(J.refresh_job(conn, i, log=log, embed=False))
+                                out.append(J.refresh_job(conn, i, log=log, embed=False, session=s))
                             except Exception as e:  # noqa: BLE001
                                 conn.rollback()
                                 log(f"[{i}] failed: {e}")
-                    finally:
-                        J.close_browser()
                     emb = J.embed_if_possible(conn, [r["id"] for r in out], log)
                     return {"refreshed": len(out), "ids": ids, "embedded": emb.get("embedded", 0)}
                 rid = _start_run("refresh", {"ids": ids}, work, persist=False)
@@ -769,10 +767,7 @@ class Handler(SimpleHTTPRequestHandler):
                         conn.close()
                         return self._json({"error": "a run is active; the browser is busy (queue it with POST /api/refresh)",
                                            "run": _active_run()}, 409)
-                    try:
-                        r = J.refresh_job(conn, jid, log=lambda m: None)
-                    finally:
-                        J.close_browser()
+                    r = J.refresh_job(conn, jid, log=lambda m: None)
                     d = J.job_detail(conn, jid, with_text=False)
                     conn.close()
                     return self._json({"refresh": r, "job": d["job"]})
@@ -871,6 +866,21 @@ if __name__ == "__main__":
     c.execute("UPDATE runs SET status='failed', finished_at=%s WHERE status='running'", (J.now(),))
     c.commit()
     c.close()
+    if J.browser.Config().own_chrome:
+        n = J.browser.kill_all_chrome()           # leftovers of a crashed previous process
+        if n:
+            log_event("warn", f"startup: killed {n} leftover chromium process(es)")
+    # In the container this process is PID 1: orphaned Chrome helpers re-parent to it and stay
+    # zombies unless something waits for them. Popen tolerates the stolen exit statuses.
+    def _reap():
+        while True:
+            try:
+                while os.waitpid(-1, os.WNOHANG)[0] > 0:
+                    pass
+            except ChildProcessError:
+                pass
+            time.sleep(1)
+    threading.Thread(target=_reap, name="reaper", daemon=True).start()
     print(f"jobboard: http://0.0.0.0:{PORT}  db={J.DSN.split('@')[-1]}  api=/api  embeddings={'on' if os.environ.get('OPENAI_API_KEY') else 'off (no OPENAI_API_KEY)'}")
     if MCP_PORT:
         threading.Thread(target=mcp_mod.serve, args=(J, _Api, MCP_BIND, MCP_PORT), name="mcp", daemon=True).start()

@@ -218,7 +218,12 @@ def _migrate_boards(conn):
     conn.commit()
 
 
-from browser import fetch, close as close_browser  # noqa: E402  (the adapters' fetch; imported after sys.path)
+import browser  # noqa: E402  (imported after sys.path: Session = one operation's outbound access)
+
+
+def _session(session, log=None):
+    """(session, owned): reuse the caller's Session or open one for this call."""
+    return (session, False) if session is not None else (browser.Session(log).__enter__(), True)
 
 
 def pack_html(raw):
@@ -317,18 +322,24 @@ def get_board(conn, ref):
     return _board_row(r) if r else None
 
 
-def add_board(conn, url, name=None, include=None, exclude=None, adapter=None, params=None):
+def add_board(conn, url, name=None, include=None, exclude=None, adapter=None, params=None, session=None):
     """Register a job board by URL. The adapter is detected (URL pattern, then a page probe);
     an already-registered board (same key) is returned unchanged except for the fields given.
-    include/exclude: regexes on posting titles applied at scan time (None = no filter)."""
+    include/exclude: regexes on posting titles applied at scan time (None = no filter).
+    session: the caller's browser.Session (one per add_boards request); opened here if absent."""
     import sources as S
-    hit = S.detect(url, fetch, adapter=adapter)
-    if not hit:
-        raise ValueError(f"no adapter recognises {url} (adapters: {', '.join(list_sources())})")
-    adapter_name, board = hit
-    mod = load_source(adapter_name)
-    if hasattr(mod, "verify"):
-        board = mod.verify(board, fetch)       # confirms the endpoint answers; may fix tenant/site ids
+    s, owned = _session(session)
+    try:
+        hit = S.detect(url, s.fetch, adapter=adapter)
+        if not hit:
+            raise ValueError(f"no adapter recognises {url} (adapters: {', '.join(list_sources())})")
+        adapter_name, board = hit
+        mod = load_source(adapter_name)
+        if hasattr(mod, "verify"):
+            board = mod.verify(board, s.fetch)   # confirms the endpoint answers; may fix tenant/site ids
+    finally:
+        if owned:
+            s.close()
     p = dict(board.get("params") or {})
     p.update(params or {})
     if include is not None:
@@ -457,12 +468,14 @@ def _update_fields(conn, job_id, fields, age_days=None):
                   age_days, now(), job_id))
 
 
-def scan_board(conn, board, days=7, all_=False, limit=None, refetch=False,
+def scan_board(conn, board, session, days=7, all_=False, limit=None, refetch=False,
                max_pages=100, log=print, embed=True):
-    """Fetch new postings from one board. Incremental: known (board, source_id) pairs are
-    not re-fetched unless refetch=True. A new job whose announcement number was already
-    judged under another id inherits that verdict. New/changed jobs are embedded afterwards
-    when an API key is available. Titles are filtered by the board's include/exclude regexes."""
+    """Fetch new postings from one board through the run's Session. Incremental: known
+    (board, source_id) pairs are not re-fetched unless refetch=True. A new job whose announcement
+    number was already judged under another id inherits that verdict. New/changed jobs are
+    embedded afterwards when an API key is available. Titles are filtered by the board's
+    include/exclude regexes."""
+    fetch = session.fetch
     src = load_source(board["adapter"])
     conn.execute("""INSERT INTO sources VALUES (%s,%s,%s)
         ON CONFLICT (name) DO UPDATE SET display_name=EXCLUDED.display_name, board_url=EXCLUDED.board_url""",
@@ -538,22 +551,18 @@ def scan_board(conn, board, days=7, all_=False, limit=None, refetch=False,
 
 def scan_boards(conn, boards, days=7, all_=False, limit=None, refetch=False, max_pages=100,
                 log=print, embed=True):
-    """Scan several boards in one run (the browser is shared and closed at the end).
-    A board that fails is logged and skipped so the others still run."""
+    """Scan several boards in one run: one browser.Session (one Chrome, one proxy escalation
+    state, one log) for the whole run, torn down at the end. A board that fails is logged and
+    skipped so the others still run."""
     results, failed = [], []
-    import browser
-    browser.LOG = log                    # browser/adapter messages go to the run log
-    try:
+    with browser.Session(log) as s:
         for b in boards:
             try:
-                results.append(scan_board(conn, b, days, all_, limit, refetch, max_pages, log, embed))
+                results.append(scan_board(conn, b, s, days, all_, limit, refetch, max_pages, log, embed))
             except Exception as e:  # noqa: BLE001
                 conn.rollback()
                 failed.append({"board": b["name"], "board_id": b["id"], "error": f"{e.__class__.__name__}: {e}"})
                 log(f"! {b['name']} failed: {e.__class__.__name__}: {e}")
-    finally:
-        close_browser()
-        browser.LOG = browser._stderr
     need = [j for r in results for j in r["need_judgment"]]
     tot = {k: sum(r[k] for r in results) for k in ("cards", "new", "known", "carried", "embedded")}
     log(f"done: {tot['new']} new, {tot['known']} already known, {tot['carried']} verdicts carried over"
@@ -577,12 +586,23 @@ def scan_source(conn, source_name, days=7, all_=False, limit=None, refetch=False
     return scan_boards(conn, boards, days, all_, limit, refetch, max_pages, log, embed)
 
 
-def refresh_job(conn, job_id, log=print, embed=True):
+def refresh_job(conn, job_id, log=print, embed=True, session=None):
     """Re-fetch a stored job's pages; replaces the stored document of each kind and
-    re-embeds the job if its text changed (embed=False lets a bulk caller batch that)."""
+    re-embeds the job if its text changed (embed=False lets a bulk caller batch that).
+    session: the caller's browser.Session (one per refresh batch); opened here if absent."""
     j = conn.execute("SELECT * FROM jobs WHERE id=%s", (job_id,)).fetchone()
     if not j:
         raise KeyError(job_id)
+    s, owned = _session(session, log)
+    try:
+        return _refresh_job(conn, j, s.fetch, log, embed)
+    finally:
+        if owned:
+            s.close()
+
+
+def _refresh_job(conn, j, fetch, log, embed):
+    job_id = j["id"]
     if j["source"] == "manual" or not j["board_url"]:
         if not j["external_url"]:
             return {"id": job_id, "refetched": 0}
@@ -782,7 +802,7 @@ def record_action(conn, job_id, action, date=None, resume_dir=None, note=None):
 def add_job(conn, title, source="manual", source_id=None, location=None, announcement=None,
             url=None, series=None, pay_plan=None, grade_low=None, grade_high=None,
             salary=None, open_date=None, close_date=None, first_seen=None, text=None,
-            kind="posting", fetch_url=False):
+            kind="posting", fetch_url=False, session=None):
     conn.execute("INSERT INTO sources VALUES (%s,%s,%s) ON CONFLICT (name) DO NOTHING", (source, source, None))
     sid = source_id or hashlib.sha1((title + (url or "")).encode()).hexdigest()[:16]
     job_id = conn.execute("""INSERT INTO jobs (source, source_id, title, location,
@@ -795,7 +815,12 @@ def add_job(conn, title, source="manual", source_id=None, location=None, announc
     if text:
         _store_documents(conn, job_id, [{"kind": kind, "url": url, "raw_html": None, "text": text}])
     elif fetch_url and url:
-        st, body = fetch(url)
+        s, owned = _session(session)
+        try:
+            st, body = s.fetch(url)
+        finally:
+            if owned:
+                s.close()
         if body:
             _store_documents(conn, job_id, [{"kind": kind, "url": url, "raw_html": body,
                                              "text": html_to_text(body)}])

@@ -12,7 +12,7 @@ from jobscan import html_to_text, generic_sections  # noqa: E402,F401
 
 def log(msg):
     import browser
-    browser.LOG(msg)
+    browser.log(msg)          # the log of the operation in progress (Session), else stderr
 
 
 def split_url(url):
