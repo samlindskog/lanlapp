@@ -7,7 +7,8 @@ Agent API  : JSON over HTTP, documented at GET /api  (also in .claude/skills/job
   GET  /api                       this API description
   GET  /api/stats                 counts, db path, available sources
   GET  /api/jobs/<id>/resumes     resume files stored for a job (newest version per filename)
-  GET  /files/<resume_id>/<name>  a stored resume file (raw); /view.html?f=<resume_id>/<name> renders a PDF in-page
+  GET  /files/job/<job_id>/<name> newest version of that file for the job (stable URL; never cached)
+  GET  /files/<resume_id>/<name>  one exact stored version;  /view.html?f=<either path> renders a PDF in-page
                                   (uploads happen only through the MCP tool upload_resume)
   GET  /api/sources               scan workflows available: name, display_name, board_url, last_scan
   GET  /api/jobs?verdict=yes,maybe&action=none&open=1&source=&days=&q=&pending=1
@@ -650,14 +651,20 @@ class Handler(SimpleHTTPRequestHandler):
             return self._json({"error": str(e), "trace": traceback.format_exc()}, 500)
 
     def _serve_resume(self, rel):
+        """/files/job/<job_id>/<filename>: newest version (stable URL, what the page links to).
+        /files/<id>/<filename>: one exact version. Never cached, so a reload always shows the current file."""
         from urllib.parse import unquote
-        try:
-            rid = int(unquote(rel).split("/", 1)[0])
-        except ValueError:
-            return self._json({"error": "not found"}, 404)
+        parts = unquote(rel).split("/")
         conn = J.db()
-        r = J.get_resume(conn, rid)
-        conn.close()
+        try:
+            if parts[0] == "job" and len(parts) >= 3:
+                r = J.get_resume_latest(conn, int(parts[1]), parts[-1])
+            else:
+                r = J.get_resume(conn, int(parts[0]))
+        except ValueError:
+            r = None
+        finally:
+            conn.close()
         if not r:
             return self._json({"error": "not found"}, 404)
         ctype = {"pdf": "application/pdf", "tex": "text/plain; charset=utf-8"}.get(r["kind"], "application/octet-stream")
@@ -666,7 +673,8 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Content-Disposition", f'inline; filename="{r["filename"]}"')
-        self.send_header("Cache-Control", "private, max-age=3600")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Resume-Id", str(r["id"]))
         self.end_headers()
         self.wfile.write(data)
 

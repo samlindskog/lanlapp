@@ -71,4 +71,21 @@ RID=$(curl -sf -X POST "$MCP/mcp" "${AUTH[@]}" "${JSON[@]}" \
   | python3 -c 'import sys,json; r=json.load(sys.stdin)["result"]; assert not r["isError"], r; print(json.loads(r["content"][0]["text"])["id"])')
 expect 302 "$WEB/files/$RID/smoke.pdf"
 curl -sf "$WEB/files/$RID/smoke.pdf" "${AUTH[@]}" | grep -q 'PDF-1.4 smoke test' && echo "ok resume round trip (file $RID)"
+
+echo "== stable URL serves the newest version, uncached"
+upload() {  # upload <filename> <marker> -> resume id
+  local b64; b64=$(printf '%%PDF-1.4 %s' "$2" | base64 | tr -d '\n')
+  curl -sf -X POST "$MCP/mcp" "${AUTH[@]}" "${JSON[@]}" \
+    -d "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"upload_resume\",\"arguments\":{\"job_id\":$JID,\"filename\":\"$1\",\"content_base64\":\"$b64\",\"label\":\"smoke\"}}}" \
+    | python3 -c 'import sys,json; r=json.load(sys.stdin)["result"]; assert not r["isError"], r; d=json.loads(r["content"][0]["text"]); assert d["url"].startswith("/files/job/"), d; print(d["id"])'
+}
+MARK="version $(date +%s)"
+V1=$(upload latest.pdf "$MARK v1"); V2=$(upload latest.pdf "$MARK v2")
+[ "$V2" != "$V1" ] || { echo "FAIL: changed bytes did not create a new version"; exit 1; }
+STABLE="$WEB/files/job/$JID/latest.pdf"
+curl -sf "$STABLE" "${AUTH[@]}" | grep -q "$MARK v2" || { echo "FAIL: stable URL did not serve the newest version"; exit 1; }
+curl -sf "$WEB/files/$V1/latest.pdf" "${AUTH[@]}" | grep -q "$MARK v1" || { echo "FAIL: permalink did not serve its own version"; exit 1; }
+curl -sf -D - -o /dev/null "$STABLE" "${AUTH[@]}" | grep -qi '^cache-control: no-store' || { echo "FAIL: resume response is cacheable"; exit 1; }
+curl -sf "$WEB/api/jobs/$JID/resumes" "${AUTH[@]}" | jq '[r["url"] for r in d["resumes"] if r["filename"]=="latest.pdf"][0]' | grep -qx "/files/job/$JID/latest.pdf" || { echo "FAIL: list_resumes url"; exit 1; }
+echo "ok stable url /files/job/$JID/latest.pdf -> version $V2 (permalink $V1 still serves v1, Cache-Control: no-store)"
 echo "smoke ok"

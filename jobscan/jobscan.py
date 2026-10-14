@@ -655,7 +655,8 @@ def list_jobs(conn, verdict=None, action=None, open_only=False, source=None, day
     files = {}
     for f in list_resumes(conn):
         files.setdefault(f["job_id"], []).append({"id": f["id"], "name": f["filename"], "kind": f["kind"],
-                                                  "label": f["label"], "uploaded_at": f["uploaded_at"]})
+                                                  "label": f["label"], "uploaded_at": f["uploaded_at"],
+                                                  "url": f["url"], "permalink": f["permalink"]})
     for r in rows:
         r["resume_files"] = files.get(r["id"], [])
     return rows
@@ -714,12 +715,26 @@ def list_resumes(conn, job_id=None, latest_only=True):
             if k not in seen:
                 seen.add(k); out.append(r)
         rows = out
+    for r in rows:
+        r.update(resume_urls(r["job_id"], r["filename"], r["id"]))
     return rows
 
 
 def get_resume(conn, resume_id):
     r = conn.execute("SELECT * FROM resumes WHERE id=%s", (resume_id,)).fetchone()
     return dict(r) if r else None
+
+
+def get_resume_latest(conn, job_id, filename):
+    """Newest version of a (job, filename): what the stable URL /files/job/<job_id>/<filename> serves."""
+    r = conn.execute("SELECT * FROM resumes WHERE job_id=%s AND filename=%s ORDER BY id DESC LIMIT 1",
+                     (job_id, os.path.basename(filename))).fetchone()
+    return dict(r) if r else None
+
+
+def resume_urls(job_id, filename, resume_id):
+    """url: stable per (job, filename), always the newest version. permalink: this exact version."""
+    return {"url": f"/files/job/{job_id}/{filename}", "permalink": f"/files/{resume_id}/{filename}"}
 
 
 # ----------------------------------------------------------------- sections
