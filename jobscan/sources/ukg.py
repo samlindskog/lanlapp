@@ -7,8 +7,8 @@ Detail     GET  .../OpportunityDetail?opportunityId={id}   (HTML; the descriptio
 import json
 import re
 
-from sources._util import (base_fields, days_since, iso_date, split_url, doc, paginate, json_body,
-                           html_to_text, generic_sections, strip_tags, div_block)
+from sources._util import (base_fields, days_since, iso_date, split_url, paginate, json_body, posting_document,
+                           generic_sections, strip_tags, div_block)
 
 DISPLAY_NAME = "UKG Pro Recruiting (UltiPro)"
 KIND = "family"
@@ -110,14 +110,10 @@ def fetch_job(fetch, board, card):
         if m and not card.get(dst):
             card[dst] = iso_date(m.group(1)) if dst == "open_date" else m.group(1)
     body = _description(html)
-    m = body is not None
-    body = body if m else html
     title = card.get("title") or strip_tags(TITLE_RE.search(html).group(1) if TITLE_RE.search(html) else "")
-    head = "".join(f"<p><b>{k}:</b> {v}</p>" for k, v in (("Title", title), ("Location", card.get("location")),
-                                                        ("Posted", card.get("open_date")),
-                                                        ("Requisition", card.get("req_id"))) if v)
-    raw = f"<h1>{title}</h1>{head}<hr>{body}"
-    return [doc("posting", card["board_url"], raw if m else html, html_to_text(raw if m else html))]
+    return posting_document(card["board_url"], title, (
+        ("Title", title), ("Location", card.get("location")), ("Posted", card.get("open_date")),
+        ("Requisition", card.get("req_id"))), body if body is not None else html)
 
 
 def parse_fields(board, card, docs):

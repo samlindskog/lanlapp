@@ -18,7 +18,7 @@ Agent API  : JSON over HTTP, documented at GET /api  (also in .claude/skills/job
   POST /api/boards/<id>/delete    remove a board (its jobs stay, detached)
   GET  /api/adapters              adapters available: name, display_name, kind (family | site)
   GET  /api/sources               adapters with their last scan (older name for /api/adapters)
-  GET  /api/jobs?verdict=yes,maybe&action=none&open=1&source=&board=&days=&q=&pending=1
+  GET  /api/jobs?verdict=yes,maybe&action=none&closing=open|closed|week&source=&board=&days=&q=&pending=1
                                   (each job carries board_id, board_name, board_platform e.g. "Workday",
                                    board_adapter, board_source_url: the board it was scanned from)
   GET  /api/jobs/<id>?text=0      job + documents + verdict/action history
@@ -49,13 +49,17 @@ MCP (JOBBOARD_MCP_PORT, JOBBOARD_MCP_BIND): JSON-RPC at /mcp, bearer token requi
 Everything except the four login paths needs a session cookie or Bearer token, enforced here and
 again in nginx (deploy/nginx-jobboard.conf), which drops credential-less requests before proxying.
 
+Every route and every MCP tool is one operation of service.py (the same table); server.py only
+maps HTTP paths and query/body fields onto it. Errors: 400 bad input, 404 not found, 409 the
+browser slot is busy (capacity.py), 500 otherwise.
+
 Env: JOBSCAN_DIR (default ../jobscan), PORT (8080), JOBBOARD_RELOAD=1 (dev
 auto-restart on .py changes; static files always fresh), OPENAI_API_KEY.
 CLI: python3 server.py hash-password        (prints a JOBBOARD_PASSWORD_HASH value)
      python3 server.py issue-token <name>   (admin: mint a bearer token directly in the DB)
 """
-import collections
 import json
+import re
 import os
 import sys
 import threading
@@ -70,7 +74,11 @@ sys.path.insert(0, JOBSCAN_DIR)
 import jobscan as J  # noqa: E402
 sys.path.insert(0, HERE)
 import auth  # noqa: E402
+import capacity  # noqa: E402
 import mcp as mcp_mod  # noqa: E402
+import runs  # noqa: E402
+import service  # noqa: E402
+from logbuf import log_event  # noqa: E402
 
 STATIC = os.path.join(HERE, "static")
 PORT = int(os.environ.get("PORT", "8080"))
@@ -78,43 +86,6 @@ MCP_PORT = int(os.environ.get("JOBBOARD_MCP_PORT", "0") or 0)
 MCP_BIND = os.environ.get("JOBBOARD_MCP_BIND", "127.0.0.1")
 
 API_DOC = __doc__
-
-# ------------------------------------------------------------ log ring buffer
-# Everything the server prints also lands here so it can be read over the API/MCP.
-# Bounded three ways: line count, bytes per line (long tracebacks keep head and tail), and total bytes.
-_LOG = collections.deque(maxlen=int(os.environ.get("JOBBOARD_LOG_LINES", "3000")))
-_LOG_LOCK = threading.Lock()
-_LOG_MAX_LINE = int(os.environ.get("JOBBOARD_LOG_MAX_LINE", "4000"))          # chars per entry
-_LOG_MAX_BYTES = int(os.environ.get("JOBBOARD_LOG_MAX_BYTES", str(2 * 1024 * 1024)))  # ~2 MB total
-_LOG_BYTES = 0
-
-
-def log_event(level, msg):
-    global _LOG_BYTES
-    msg = str(msg).rstrip()
-    if len(msg) > _LOG_MAX_LINE:
-        keep = _LOG_MAX_LINE // 2
-        msg = msg[:keep] + f"\n… [{len(msg) - 2 * keep} chars truncated] …\n" + msg[-keep:]
-    line = {"t": J.now(), "level": level, "msg": msg}
-    size = len(msg) + 40
-    with _LOG_LOCK:
-        if len(_LOG) == _LOG.maxlen:
-            _LOG_BYTES -= len(_LOG[0]["msg"]) + 40
-        _LOG.append(line)
-        _LOG_BYTES += size
-        while _LOG_BYTES > _LOG_MAX_BYTES and len(_LOG) > 1:
-            _LOG_BYTES -= len(_LOG.popleft()["msg"]) + 40
-    sys.stderr.write(f"{line['t']} {level.upper():5} {msg}\n")
-    sys.stderr.flush()
-
-
-def read_log(lines=200, level="all", q=None):
-    rank = {"debug": 0, "info": 1, "warn": 2, "error": 3}
-    minimum = {"all": 0, "info": 1, "warn": 2, "error": 3}.get(level, 0)
-    with _LOG_LOCK:
-        rows = list(_LOG)
-    rows = [r for r in rows if rank.get(r["level"], 1) >= minimum and (not q or q.lower() in r["msg"].lower())]
-    return rows[-max(1, min(int(lines), 1000)):]
 
 # ------------------------------------------------------------ login throttling
 # Per client IP: after LOGIN_MAX failures within LOGIN_WINDOW seconds, refuse for LOGIN_WINDOW.
@@ -143,243 +114,6 @@ def _login_ok(ip):
         _login_fail.pop(ip, None)
 
 
-# ------------------------------------------------------------ background runs
-# Scans are recorded in the runs table (the Scan dialog shows the last one per
-# board). Refreshes are transient: tracked in memory only while they run, with
-# nothing persisted and no run numbers.
-_run_lock = threading.Lock()
-_transient = {}          # id -> dict(kind, status, started_at, finished_at, log, summary)
-_transient_seq = 0
-
-
-def _start_run(kind, args, target, persist=True):
-    global _transient_seq
-    if persist:
-        conn = J.db()
-        cur = conn.execute("INSERT INTO runs (kind, args, status, started_at, log) VALUES (%s,%s,%s,%s,%s) RETURNING id",
-                           (kind, json.dumps(args), "running", J.now(), ""))
-        run_id = cur.fetchone()["id"]
-        conn.commit()
-        conn.close()
-    else:
-        with _run_lock:
-            _transient_seq += 1
-            run_id = f"t{_transient_seq}"
-            _transient[run_id] = {"id": run_id, "kind": kind, "args": json.dumps(args), "status": "running",
-                                  "started_at": J.now(), "finished_at": None, "log": "", "summary": None}
-
-    def worker():
-        rconn = J.db()
-        lines = []
-
-        def log(msg):
-            lines.append(str(msg))
-            if persist:
-                rconn.execute("UPDATE runs SET log=%s WHERE id=%s", ("\n".join(lines), run_id))
-                rconn.commit()
-            else:
-                _transient[run_id]["log"] = "\n".join(lines)
-
-        def finish(status, summary=None):
-            if persist:
-                rconn.execute("UPDATE runs SET status=%s, finished_at=%s, summary=%s WHERE id=%s",
-                              (status, J.now(), json.dumps(summary) if summary is not None else None, run_id))
-                rconn.commit()
-            else:
-                _transient[run_id].update(status=status, finished_at=J.now(),
-                                          summary=json.dumps(summary) if summary is not None else None)
-
-        try:
-            summary = target(rconn, log)
-            finish("done", summary)
-            log_event("info", f"run {run_id} ({kind}) done: {json.dumps(summary, default=str)[:300]}")
-        except Exception:  # noqa: BLE001
-            tb = traceback.format_exc()
-            log(tb)
-            finish("failed")
-            log_event("error", f"run {run_id} ({kind}) failed:\n{tb}")
-        rconn.close()
-
-    threading.Thread(target=worker, name=f"run-{run_id}", daemon=True).start()
-    return run_id
-
-
-def _active_run():
-    for r in _transient.values():
-        if r["status"] == "running":
-            return {"id": r["id"], "kind": r["kind"]}
-    conn = J.db()
-    r = conn.execute("SELECT id, kind FROM runs WHERE status='running' ORDER BY id DESC LIMIT 1").fetchone()
-    conn.close()
-    return dict(r) if r else None
-
-
-def _get_run(rid):
-    if rid in _transient:
-        return dict(_transient[rid])
-    try:
-        rid = int(rid)
-    except ValueError:
-        return None
-    conn = J.db()
-    r = conn.execute("SELECT * FROM runs WHERE id=%s", (rid,)).fetchone()
-    conn.close()
-    return dict(r) if r else None
-
-
-def adapters_info():
-    out = []
-    for name in J.list_sources():
-        mod = J.load_source(name)
-        out.append({"name": name, "display_name": getattr(mod, "DISPLAY_NAME", name),
-                    "kind": getattr(mod, "KIND", "site"), "board_url": getattr(mod, "BOARD_URL", None)})
-    return out
-
-
-def _last_scans(conn, limit=300):
-    """board_id -> {started_at, status, cards, new, known, error?} from the most recent scan that
-    covered the board (summary.boards / summary.failed carry one entry per board)."""
-    out = {}
-    for r in conn.execute("SELECT id, started_at, status, summary FROM runs WHERE kind='scan' "
-                          "ORDER BY id DESC LIMIT %s", (limit,)):
-        try:
-            sm = json.loads(r["summary"]) if r["summary"] else {}
-        except ValueError:
-            sm = {}
-        for b in sm.get("boards") or []:
-            out.setdefault(b.get("board_id"), {"run_id": r["id"], "started_at": r["started_at"], "status": r["status"],
-                                               "cards": b.get("cards"), "new": b.get("new"), "known": b.get("known")})
-        for b in sm.get("failed") or []:
-            out.setdefault(b.get("board_id"), {"run_id": r["id"], "started_at": r["started_at"], "status": "failed",
-                                               "error": b.get("error")})
-    return out
-
-
-def boards_info():
-    conn = J.db()
-    counts = {r["board_id"]: r["n"] for r in conn.execute(
-        "SELECT board_id, COUNT(*) AS n FROM jobs WHERE board_id IS NOT NULL GROUP BY board_id")}
-    last = _last_scans(conn)
-    out = []
-    for b in J.list_boards(conn):
-        b["jobs"] = counts.get(b["id"], 0)
-        b["last_scan"] = last.get(b["id"])
-        out.append(b)
-    conn.close()
-    return out
-
-
-def sources_info():
-    """Adapters with the last scan run that used each (kept for older clients)."""
-    conn = J.db()
-    boards = J.list_boards(conn)
-    last = _last_scans(conn)
-    by_adapter = {}
-    for b in boards:
-        ls = last.get(b["id"])
-        if ls and (b["adapter"] not in by_adapter or ls["started_at"] > by_adapter[b["adapter"]]["started_at"]):
-            by_adapter[b["adapter"]] = ls
-    conn.close()
-    out = []
-    for a in adapters_info():
-        a["boards"] = sum(1 for b in boards if b["adapter"] == a["name"])
-        a["last_scan"] = by_adapter.get(a["name"])
-        out.append(a)
-    return out
-
-
-def add_boards(items):
-    """items: [url | {url, name?, include?, exclude?}] -> [{url, board} | {url, error}]."""
-    conn = J.db()
-    out = []
-    try:
-        with J.browser.Session(lambda m: log_event("info", m.strip())) as s:   # one session per request
-            for it in items:
-                it = {"url": it} if isinstance(it, str) else dict(it or {})
-                url = (it.get("url") or "").strip()
-                if not url:
-                    out.append({"url": url, "error": "missing url"})
-                    continue
-                try:
-                    b = J.add_board(conn, url, name=it.get("name"), include=it.get("include"), exclude=it.get("exclude"),
-                                    adapter=it.get("adapter"), session=s)
-                    out.append({"url": url, "board": b})
-                    log_event("info", f"board added: [{b['id']}] {b['name']} ({b['adapter']}) {b['url']}")
-                except Exception as e:  # noqa: BLE001
-                    conn.rollback()
-                    out.append({"url": url, "error": f"{e.__class__.__name__}: {e}"})
-                    log_event("warn", f"board not added {url}: {e}")
-    finally:
-        conn.close()
-    return out
-
-
-def stats_info():
-    conn = J.db()
-    tot = conn.execute("SELECT COUNT(*) AS n FROM jobs").fetchone()["n"]
-    v = J.latest_verdicts(conn)
-    by = {}
-    for r in v.values():
-        by[r["verdict"]] = by.get(r["verdict"], 0) + 1
-    acts = J.latest_actions(conn)
-    docs = conn.execute("SELECT COUNT(*) AS n FROM documents").fetchone()["n"]
-    emb = conn.execute("SELECT COUNT(*) AS n FROM embeddings").fetchone()["n"]
-    srcs = [dict(r) for r in conn.execute("SELECT * FROM sources")]
-    conn.close()
-    return {"jobs": tot, "pending": tot - len(v), "verdicts": by, "actioned": len(acts),
-            "documents": docs, "embedded": emb, "embeddings_enabled": bool(os.environ.get("OPENAI_API_KEY")),
-            "dsn": J.DSN.split("@")[-1], "sources": srcs, "adapters": J.list_sources(),
-            "active_run": _active_run(), "auth": auth.AUTH_ON,
-            "resumes": resume_count()}
-
-
-def resume_count():
-    c = J.db()
-    n = c.execute("SELECT COUNT(*) AS n FROM resumes").fetchone()["n"]
-    c.close()
-    return n
-
-
-def start_scan(source=None, days=7, all_=False, refetch=False, boards=None):
-    """boards: list of board ids; source: every enabled board of one adapter; neither: all enabled."""
-    conn = J.db()
-    try:
-        if boards:
-            sel = [b for b in (J.get_board(conn, x) for x in boards) if b]
-            if len(sel) != len(boards):
-                return {"error": f"unknown board(s) in {boards}"}
-        elif source:
-            if source not in J.list_sources():
-                return {"error": f"unknown source; available: {J.list_sources()}"}
-            sel = J.list_boards(conn, adapter=source, enabled_only=True)
-            if not sel and getattr(J.load_source(source), "BOARD_URL", None):
-                sel = [J.add_board(conn, J.load_source(source).BOARD_URL)]
-        else:
-            sel = J.list_boards(conn, enabled_only=True)
-    finally:
-        conn.close()
-    if not sel:
-        return {"error": "no boards to scan; register one with POST /api/boards {urls:[...]}"}
-    active = _active_run()
-    if active:
-        return {"error": "a run is already active", "run": active}
-    ids = [b["id"] for b in sel]
-    rid = _start_run("scan", {"boards": ids, "names": [b["name"] for b in sel], "source": source,
-                              "days": days, "all": all_, "refetch": refetch},
-                     lambda conn, log: J.scan_boards(conn, [J.get_board(conn, i) for i in ids], days=days,
-                                                     all_=all_, refetch=refetch, log=log))
-    return {"run_id": rid, "status": "running", "boards": ids}
-
-
-def list_runs(limit=20):
-    conn = J.db()
-    rows = [dict(r) for r in conn.execute(
-        "SELECT id, kind, args, status, started_at, finished_at, summary FROM runs ORDER BY id DESC LIMIT %s", (limit,))]
-    conn.close()
-    transient = [{k: v for k, v in r.items() if k != "log"} for r in _transient.values()]
-    return sorted(transient + rows, key=lambda r: r.get("started_at") or "", reverse=True)[:limit]
-
-
 def bearer_ok(header):
     """True when auth is off, or the Authorization header carries a valid token."""
     if not auth.AUTH_ON:
@@ -391,20 +125,66 @@ def bearer_ok(header):
         conn.close()
 
 
+
+# ------------------------------------------------------------ routes
+# (method, path regex, operation, args builder, success status). Path groups are passed to the
+# builder as m; qs is the query dict, body the JSON body. Auth, files and the API doc stay here.
+def _q(qs, body, **fixed):
+    out = dict(qs); out.update(body); out.update(fixed); return out
+
+
+ROUTES = [
+    ("GET", r"/api/stats", "stats", lambda m, qs, b: {}, 200),
+    ("GET", r"/api/sources", "sources", lambda m, qs, b: {}, 200),
+    ("GET", r"/api/adapters", "adapters", lambda m, qs, b: {}, 200),
+    ("GET", r"/api/boards", "boards", lambda m, qs, b: {}, 200),
+    ("GET", r"/api/jobs", "list_jobs", lambda m, qs, b: _q(qs, b, fields="full"), 200),
+    ("GET", r"/api/jobs/(\d+)", "get_job", lambda m, qs, b: _q(qs, b, id=m[0], full_text=qs.get("text", "1")), 200),
+    ("GET", r"/api/jobs/(\d+)/section", "get_section", lambda m, qs, b: _q(qs, b, id=m[0]), 200),
+    ("GET", r"/api/jobs/(\d+)/sections", "sections", lambda m, qs, b: {"id": m[0]}, 200),
+    ("GET", r"/api/jobs/(\d+)/resumes", "list_resumes", lambda m, qs, b: {"job_id": m[0]}, 200),
+    ("GET", r"/api/search", "search", lambda m, qs, b: _q(qs, b), 200),
+    ("GET", r"/api/logs", "logs", lambda m, qs, b: _q(qs, b, lines=qs.get("lines", 200)), 200),
+    ("GET", r"/api/runs", "runs", lambda m, qs, b: _q(qs, b), 200),
+    ("GET", r"/api/runs/([^/]+)", "run_status", lambda m, qs, b: {"run_id": m[0]}, 200),
+    ("POST", r"/api/scan", "scan", lambda m, qs, b: b, 202),
+    ("POST", r"/api/boards", "add_boards", lambda m, qs, b: b, 201),
+    ("POST", r"/api/boards/(\d+)", "update_board", lambda m, qs, b: _q(qs, b, id=m[0]), 200),
+    ("POST", r"/api/boards/(\d+)/delete", "delete_board", lambda m, qs, b: {"id": m[0]}, 200),
+    ("POST", r"/api/refresh", "refresh_run", lambda m, qs, b: b, 202),
+    ("POST", r"/api/jobs", "add_job", lambda m, qs, b: b, 201),
+    ("POST", r"/api/jobs/(\d+)/verdict", "set_verdict", lambda m, qs, b: _q(qs, b, id=m[0]), 201),
+    ("POST", r"/api/jobs/(\d+)/action", "set_status", lambda m, qs, b: _q(qs, b, id=m[0]), 201),
+    ("POST", r"/api/jobs/(\d+)/refresh", "refresh", lambda m, qs, b: {"ids": [m[0]]}, 200),
+]
+_ROUTES = [(meth, re.compile("^" + pat + "$"), op, build, st) for meth, pat, op, build, st in ROUTES]
+
+
+def route(method, path, qs, body):
+    """(status, result) for an API path, or None when no route matches."""
+    for meth, rx, op, build, status in _ROUTES:
+        m = rx.match(path)
+        if meth == method and m:
+            try:
+                out = service.call(op, build(m.groups(), qs, body))
+            except capacity.Busy as e:
+                return 409, {"error": str(e), "run": e.holder}
+            except KeyError as e:
+                return 404, {"error": f"not found / missing field: {e}"}
+            except (ValueError, IndexError) as e:
+                return 400, {"error": str(e)}
+            except RuntimeError as e:
+                return 503, {"error": str(e)}
+            if op == "add_boards" and not out.get("added"):
+                status = 400
+            return status, out
+    return None
+
+
 class _Api:
-    """Facade handed to the MCP server."""
-    stats = staticmethod(stats_info)
-    sources = staticmethod(sources_info)
-    adapters = staticmethod(adapters_info)
-    boards = staticmethod(boards_info)
-    add_boards = staticmethod(add_boards)
-    start_scan = staticmethod(start_scan)
-    get_run = staticmethod(lambda rid: _get_run(rid))
-    read_log = staticmethod(lambda lines, level, q: read_log(lines, level, q))
-    log_event = staticmethod(lambda level, msg: log_event(level, msg))
-    list_runs = staticmethod(lambda: list_runs())
-    active_run = staticmethod(_active_run)
+    """What the MCP server needs from here."""
     authorized_bearer = staticmethod(bearer_ok)
+    log_event = staticmethod(log_event)
 
 
 # ------------------------------------------------------------ handler
@@ -512,274 +292,147 @@ class Handler(SimpleHTTPRequestHandler):
             self.end_headers()
         return False
 
-    # GET
+    # ------------------------------------------------------------ dispatch
+    # One table for everything: service operations (ROUTES) and the HTTP-specific handlers below
+    # (auth, the API doc, stored files). Login paths skip the gate; every other path needs a session
+    # cookie or bearer token; cookie-authenticated POSTs must come from this site.
+    RAW = [
+        ("GET", r"/login", "r_login_page"),
+        ("GET", r"/api", "r_api_doc"),
+        ("GET", r"/api/auth/me", "r_me"),
+        ("GET", r"/api/auth/tokens", "r_tokens"),
+        ("GET", r"/files/(.+)", "r_file"),
+        ("POST", r"/api/auth/login", "r_login"),
+        ("POST", r"/api/auth/logout", "r_logout"),
+        ("POST", r"/api/auth/token", "r_token"),
+        ("POST", r"/api/auth/tokens/(\d+)/revoke", "r_revoke"),
+    ]
+    _RAW = [(meth, re.compile("^" + pat + "$"), name) for meth, pat, name in RAW]
+
     def do_GET(self):
+        self._dispatch("GET")
+
+    def do_POST(self):
+        self._dispatch("POST")
+
+    def do_HEAD(self):            # static files only, behind the gate
+        if self._gate(urlparse(self.path).path):
+            super().do_HEAD()
+
+    def _dispatch(self, method):
         u = urlparse(self.path)
         path, qs = u.path, {k: v[0] for k, v in parse_qs(u.query).items()}
-        if path == "/login":
-            self.path = "/login.html"
-            return super().do_GET()
+        body = {}
+        if method == "POST":
+            body = self._body()
+            if body is None:
+                return self._json({"error": "body must be JSON"}, 400)
         if not self._gate(path):
             return
+        if method == "POST" and path not in self.LOGIN_PATHS and auth.AUTH_ON \
+                and not self.headers.get("Authorization") and self._cross_site():
+            return self._json({"error": "cross-site request rejected"}, 403)
         try:
-            if path == "/api/auth/me":
-                return self._json(self._who() or {"via": None})
-            if path == "/api/auth/tokens":
-                conn = J.db()
-                out = auth.list_tokens(conn)
-                conn.close()
-                return self._json({"tokens": out})
-            if path == "/api":
-                self.send_response(200)
-                self.send_header("Content-Type", "text/plain; charset=utf-8")
-                self.end_headers()
-                self.wfile.write(API_DOC.encode())
-                return
-            if path == "/api/stats":
-                return self._json(stats_info())
-            if path == "/api/sources":
-                return self._json({"sources": sources_info()})
-            if path == "/api/adapters":
-                return self._json({"adapters": adapters_info()})
-            if path == "/api/boards":
-                return self._json({"boards": boards_info()})
-            if path == "/api/jobs":
-                conn = J.db()
-                rows = J.list_jobs(conn, verdict=qs.get("verdict"), action=qs.get("action"),
-                                   open_only=qs.get("open") in ("1", "true"),
-                                   source=qs.get("source") or None, board=qs.get("board") or None,
-                                   days=int(qs["days"]) if qs.get("days") else None,
-                                   pending_only=qs.get("pending") in ("1", "true"),
-                                   q=qs.get("q") or None)
-                conn.close()
-                return self._json({"jobs": rows, "count": len(rows), "active_run": _active_run()})
-            if path.startswith("/api/jobs/"):
-                parts = path.split("/")
-                jid = int(parts[3])
-                conn = J.db()
-                if len(parts) == 4:
-                    d = J.job_detail(conn, jid, with_text=qs.get("text") not in ("0", "false"))
-                    conn.close()
-                    return self._json(d)
-                if parts[4] == "section":
-                    d, text = J.get_section(conn, jid, qs.get("name"), qs.get("kind"))
-                    conn.close()
-                    if text is None:
-                        return self._json({"job_id": jid, "sections": [], "error": "section not found"}, 404)
-                    return self._json({"job_id": jid, "sections": [{"doc_id": d["id"], "kind": d["kind"],
-                                                                     "section": qs.get("name") or "key", "text": text}]})
-                if parts[4] == "resumes":
-                    out = J.list_resumes(conn, jid)
-                    conn.close()
-                    return self._json({"job_id": jid, "resumes": out})
-                if parts[4] == "sections":
-                    d, source, key = J.primary_document(conn, jid)
-                    conn.close()
-                    if not d:
-                        return self._json({"job_id": jid, "sections": {}})
-                    return self._json({"job_id": jid, "doc_id": d["id"], "kind": d["kind"], "key_section": key,
-                                       "sections": J.document_sections(source, d["text"], d["kind"])})
-            if path == "/api/search":
-                conn = J.db()
-                if qs.get("mode") == "semantic":
-                    if not os.environ.get("OPENAI_API_KEY"):
-                        conn.close()
-                        return self._json({"error": "semantic search needs OPENAI_API_KEY in the server environment"}, 503)
-                    try:
-                        hits = J.semantic_search(conn, qs.get("q", ""), int(qs.get("limit", 50)))
-                    finally:
-                        conn.close()
-                    return self._json({"query": qs.get("q", ""), "mode": "semantic", "hits": hits})
-                kinds = [qs["kind"]] if qs.get("kind") else None
-                hits = J.search_documents(conn, qs.get("q", ""), kinds, int(qs.get("limit", 50)))
-                conn.close()
-                return self._json({"query": qs.get("q", ""), "mode": "keyword", "hits": hits})
-            if path == "/api/logs":
-                return self._json({"lines": read_log(int(qs.get("lines", 200)), qs.get("level", "all"), qs.get("q")),
-                                   "buffer": {"entries": len(_LOG), "bytes": _LOG_BYTES, "max_entries": _LOG.maxlen,
-                                              "max_bytes": _LOG_MAX_BYTES}})
-            if path == "/api/runs":
-                return self._json({"runs": list_runs(int(qs.get("limit", 20)))})
-            if path.startswith("/api/runs/"):
-                r = _get_run(path.rsplit("/", 1)[1])
-                return self._json(r if r else {"error": "not found"}, 200 if r else 404)
+            for meth, rx, name in self._RAW:
+                m = rx.match(path)
+                if meth == method and m:
+                    return getattr(self, name)(m.groups(), qs, body)
+            r = route(method, path, qs, body)
+            if r:
+                return self._json(r[1], r[0])
             if path.startswith("/api/"):
                 return self._json({"error": "unknown endpoint", "see": "/api"}, 404)
-            if path.startswith("/files/"):
-                return self._serve_resume(path[len("/files/"):])
-        except KeyError as e:
-            return self._json({"error": f"not found: {e}"}, 404)
-        except (ValueError, IndexError) as e:
-            return self._json({"error": str(e)}, 400)
         except Exception as e:  # noqa: BLE001
-            log_event("error", f"GET {path} failed: {e}\n{traceback.format_exc()}")
+            log_event("error", f"{method} {path} failed: {e}\n{traceback.format_exc()}")
             return self._json({"error": str(e), "trace": traceback.format_exc()}, 500)
+        if method != "GET":
+            return self._json({"error": "unknown endpoint", "see": "/api"}, 404)
         if path == "/":
             self.path = "/index.html"
         return super().do_GET()
 
-    # HEAD: SimpleHTTPRequestHandler answers these from the static directory; keep them behind the gate.
-    def do_HEAD(self):
-        if self._gate(urlparse(self.path).path):
-            return super().do_HEAD()
+    # ------------------------------------------------------------ raw handlers (auth, doc, files)
+    def _cookie_reply(self, cookie):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Set-Cookie", cookie)
+        self.end_headers()
+        self.wfile.write(b'{"ok": true}')
 
-    # POST
-    def do_POST(self):
-        path = urlparse(self.path).path
-        body = self._body()
-        if body is None:
-            return self._json({"error": "body must be JSON"}, 400)
-        if path == "/api/auth/login":
-            if not auth.AUTH_ON:
-                return self._json({"ok": True, "auth": "off"})
-            ip = self._client_ip()
-            if _login_throttled(ip):
-                log_event("warn", f"login throttled for {ip}")
-                return self._json({"error": "too many failed attempts; try again in 10 minutes"}, 429)
-            if not auth.check_password(body.get("password", "")):
-                _login_failed(ip)
-                log_event("warn", f"failed login from {ip}")
-                time.sleep(0.5)
-                return self._json({"error": "wrong password"}, 401)
-            _login_ok(ip)
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Set-Cookie", auth.new_session_cookie(self._secure()))
-            self.end_headers()
-            self.wfile.write(b'{"ok": true}')
-            return
-        if not self._gate(path):
-            return
-        # Cookie-authenticated browsers must not be driven by another site (bearer callers are exempt).
-        if auth.AUTH_ON and not self.headers.get("Authorization") and self._cross_site():
-            return self._json({"error": "cross-site request rejected"}, 403)
+    def _password_check(self, body, what):
+        """Shared by the login page and token issue, throttled per client IP:
+        'ok', 'wrong', or 'throttled' (the 429 reply already sent)."""
+        ip = self._client_ip()
+        if _login_throttled(ip):
+            log_event("warn", f"{what} throttled for {ip}")
+            self._json({"error": "too many failed attempts; try again in 10 minutes"}, 429)
+            return "throttled"
+        if not auth.check_password(body.get("password", "")):
+            _login_failed(ip)
+            log_event("warn", f"failed {what} from {ip}")
+            time.sleep(0.5)
+            return "wrong"
+        _login_ok(ip)
+        return "ok"
+
+    def r_login_page(self, m, qs, body):
+        self.path = "/login.html"
+        return super().do_GET()
+
+    def r_api_doc(self, m, qs, body):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(API_DOC.encode())
+
+    def r_me(self, m, qs, body):
+        return self._json(self._who() or {"via": None})
+
+    def r_tokens(self, m, qs, body):
+        conn = J.db()
         try:
-            if path == "/api/auth/logout":
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Set-Cookie", auth.clear_session_cookie())
-                self.end_headers()
-                self.wfile.write(b'{"ok": true}')
-                return
-            if path == "/api/auth/token":
-                who = self._who() or {}
-                if auth.AUTH_ON and who.get("via") != "session":
-                    # Password path: same throttle as the login page, so this is not a second guessing surface.
-                    ip = self._client_ip()
-                    if _login_throttled(ip):
-                        log_event("warn", f"token issue throttled for {ip}")
-                        return self._json({"error": "too many failed attempts; try again in 10 minutes"}, 429)
-                    if not auth.check_password(body.get("password", "")):
-                        _login_failed(ip)
-                        log_event("warn", f"failed token issue (wrong password) from {ip}")
-                        time.sleep(0.5)
-                        return self._json({"error": "a session or the password is required to issue tokens"}, 403)
-                    _login_ok(ip)
-                conn = J.db()
-                tid, token = auth.issue_token(conn, body.get("name") or "unnamed", J.now())
-                conn.close()
-                return self._json({"id": tid, "name": body.get("name") or "unnamed", "token": token,
-                                   "note": "shown once; send as Authorization: Bearer <token>"}, 201)
-            if path.startswith("/api/auth/tokens/") and path.endswith("/revoke"):
-                conn = J.db()
-                n = auth.revoke_token(conn, int(path.split("/")[4]), J.now())
-                conn.close()
-                return self._json({"revoked": n})
-            if path == "/api/scan":
-                r = start_scan(body.get("source") or None, int(body.get("days", 7)),
-                               bool(body.get("all")), bool(body.get("refetch")),
-                               boards=[int(x) for x in body.get("boards") or []] or None)
-                return self._json(r, 202 if "run_id" in r else (409 if "run" in r else 400))
-            if path == "/api/boards":
-                items = body.get("urls") if isinstance(body.get("urls"), list) else [body]
-                res = add_boards(items)
-                return self._json({"results": res, "added": sum(1 for r in res if "board" in r)},
-                                  201 if any("board" in r for r in res) else 400)
-            if path.startswith("/api/boards/"):
-                parts = path.split("/")
-                bid = int(parts[3])
-                conn = J.db()
-                try:
-                    if len(parts) > 4 and parts[4] == "delete":
-                        n = J.delete_board(conn, bid)
-                        return self._json({"deleted": n}, 200 if n else 404)
-                    b = J.update_board(conn, bid, name=body.get("name"), enabled=body.get("enabled"),
-                                       include=body.get("include"), exclude=body.get("exclude"))
-                    return self._json({"board": b})
-                finally:
-                    conn.close()
-            if path == "/api/refresh":
-                conn = J.db()
-                if body.get("ids"):
-                    ids = [int(i) for i in body["ids"]]
-                else:
-                    rows = J.list_jobs(conn, verdict="yes,maybe", open_only=True)
-                    ids = [r["id"] for r in rows if r["source"] != "manual"]
-                conn.close()
-                active = _active_run()
-                if active:
-                    return self._json({"error": "a run is already active", "run": active}, 409)
+            return self._json({"tokens": auth.list_tokens(conn)})
+        finally:
+            conn.close()
 
-                def work(conn, log):
-                    out = []
-                    with J.browser.Session(log) as s:          # one session for the batch
-                        for i in ids:
-                            try:
-                                out.append(J.refresh_job(conn, i, log=log, embed=False, session=s))
-                            except Exception as e:  # noqa: BLE001
-                                conn.rollback()
-                                log(f"[{i}] failed: {e}")
-                    emb = J.embed_if_possible(conn, [r["id"] for r in out], log)
-                    return {"refreshed": len(out), "ids": ids, "embedded": emb.get("embedded", 0)}
-                rid = _start_run("refresh", {"ids": ids}, work, persist=False)
-                return self._json({"run_id": rid, "status": "running", "count": len(ids)}, 202)
-            if path == "/api/jobs":
-                conn = J.db()
-                jid = J.add_job(conn, body["title"], body.get("source", "manual"), body.get("source_id"),
-                                body.get("location"), body.get("announcement"), body.get("url"),
-                                body.get("series"), body.get("pay_plan"), body.get("grade_low"),
-                                body.get("grade_high"), body.get("salary"), body.get("open_date"),
-                                body.get("close_date"), None, body.get("text"), body.get("kind", "posting"),
-                                fetch_url=bool(body.get("fetch")))
-                d = J.job_detail(conn, jid, with_text=False)
-                conn.close()
-                return self._json(d, 201)
-            if path.startswith("/api/jobs/"):
-                parts = path.split("/")
-                jid = int(parts[3])
-                sub = parts[4] if len(parts) > 4 else ""
-                conn = J.db()
-                if sub == "verdict":
-                    vid = J.record_verdict(conn, jid, body.get("verdict"), body.get("grades"),
-                                           body.get("reason"), body.get("profile_hash"),
-                                           body.get("author", "claude"))
-                    d = J.job_detail(conn, jid, with_text=False)
-                    conn.close()
-                    return self._json({"verdict_id": vid, "job": d["job"]}, 201)
-                if sub == "action":
-                    aid = J.record_action(conn, jid, body.get("action"), body.get("date"),
-                                          body.get("resume_dir"), body.get("note"))
-                    d = J.job_detail(conn, jid, with_text=False)
-                    conn.close()
-                    return self._json({"action_id": aid, "job": d["job"]}, 201)
-                if sub == "refresh":
-                    if _active_run():
-                        conn.close()
-                        return self._json({"error": "a run is active; the browser is busy (queue it with POST /api/refresh)",
-                                           "run": _active_run()}, 409)
-                    r = J.refresh_job(conn, jid, log=lambda m: None)
-                    d = J.job_detail(conn, jid, with_text=False)
-                    conn.close()
-                    return self._json({"refresh": r, "job": d["job"]})
-                conn.close()
-            return self._json({"error": "unknown endpoint", "see": "/api"}, 404)
-        except KeyError as e:
-            return self._json({"error": f"not found / missing field: {e}"}, 404)
-        except ValueError as e:
-            return self._json({"error": str(e)}, 400)
-        except Exception as e:  # noqa: BLE001
-            log_event("error", f"POST {path} failed: {e}\n{traceback.format_exc()}")
-            return self._json({"error": str(e), "trace": traceback.format_exc()}, 500)
+    def r_file(self, m, qs, body):
+        return self._serve_resume(m[0])
+
+    def r_login(self, m, qs, body):
+        if not auth.AUTH_ON:
+            return self._json({"ok": True, "auth": "off"})
+        r = self._password_check(body, "login")
+        if r == "wrong":
+            return self._json({"error": "wrong password"}, 401)
+        if r == "ok":
+            return self._cookie_reply(auth.new_session_cookie(self._secure()))
+
+    def r_logout(self, m, qs, body):
+        return self._cookie_reply(auth.clear_session_cookie())
+
+    def r_token(self, m, qs, body):
+        who = self._who() or {}
+        if auth.AUTH_ON and who.get("via") != "session":
+            # Password path: same throttle as the login page, so this is not a second guessing surface.
+            r = self._password_check(body, "token issue")
+            if r == "wrong":
+                return self._json({"error": "a session or the password is required to issue tokens"}, 403)
+            if r == "throttled":
+                return
+        conn = J.db()
+        try:
+            tid, token = auth.issue_token(conn, body.get("name") or "unnamed", J.now())
+        finally:
+            conn.close()
+        return self._json({"id": tid, "name": body.get("name") or "unnamed", "token": token,
+                           "note": "shown once; send as Authorization: Bearer <token>"}, 201)
+
+    def r_revoke(self, m, qs, body):
+        conn = J.db()
+        try:
+            return self._json({"revoked": auth.revoke_token(conn, int(m[0]), J.now())})
+        finally:
+            conn.close()
 
     def _serve_resume(self, rel):
         """/files/job/<job_id>/<filename>: the one stored file of that name for the job. Never cached,
@@ -803,8 +456,7 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Content-Disposition", f'inline; filename="{r["filename"]}"')
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
+        self.end_headers()                       # end_headers adds Cache-Control: no-store for non-API paths
         self.wfile.write(data)
 
 
@@ -833,9 +485,9 @@ def _watch_and_reexec(paths, interval=1.0):
             if cur != base:
                 changed = [p for p in cur if cur.get(p) != base.get(p)] or ["(removed file)"]
                 print(f"jobboard: {os.path.relpath(changed[0])} changed, restarting", flush=True)
-                if _active_run():
+                if capacity.busy():
                     print("jobboard: a run is active; waiting for it before restarting", flush=True)
-                    while _active_run():
+                    while capacity.busy():
                         time.sleep(1)
                 os.execv(sys.executable, [sys.executable] + sys.argv)
     threading.Thread(target=loop, name="reloader", daemon=True).start()
@@ -860,12 +512,13 @@ if __name__ == "__main__":
         sys.exit("JOBBOARD_AUTH=1 needs JOBBOARD_PASSWORD_HASH and JOBBOARD_SECRET")
     if os.environ.get("JOBBOARD_RELOAD") == "1":
         _watch_and_reexec([HERE, JOBSCAN_DIR])
-    # Mark any run left 'running' by a previous process as failed; create auth tables.
     c = J.db()
     c.execute(auth.SCHEMA)
-    c.execute("UPDATE runs SET status='failed', finished_at=%s WHERE status='running'", (J.now(),))
     c.commit()
+    n = runs.fail_stale(c)                        # runs the previous process never finished
     c.close()
+    if n:
+        log_event("warn", f"startup: marked {n} interrupted run(s) failed")
     if J.browser.Config().own_chrome:
         n = J.browser.kill_all_chrome()           # leftovers of a crashed previous process
         if n:

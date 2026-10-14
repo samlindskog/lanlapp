@@ -4,8 +4,8 @@
 Each job's data carries the full description, so no detail fetch is needed; apply_url
 points at the iCIMS portal. The URL alone does not reveal Jibe, so probe() checks /api/jobs.
 """
-from sources._util import (base_fields, days_since, iso_date, origin, split_url, doc, paginate,
-                           json_body, html_to_text, generic_sections)
+from sources._util import (base_fields, days_since, iso_date, origin, split_url, doc, paginate, json_body,
+                           posting_document, generic_sections)
 
 DISPLAY_NAME = "iCIMS (Jibe career site)"
 KIND = "family"
@@ -85,16 +85,13 @@ def fetch_job(fetch, board, card):
             status, text = fetch(card["board_url"])
             return [doc("posting", card["board_url"], text)] if text else []
         card.update({k: v for k, v in _card(board, {"data": d}).items() if not card.get(k)})   # fresh listing data for parse_fields
-    head = "".join(f"<p><b>{k}:</b> {v}</p>" for k, v in (
+    extra = [("Qualifications", d.get("qualifications"))]
+    if d.get("responsibilities") and d["responsibilities"] not in (d.get("description") or ""):
+        extra.append(("Responsibilities", d["responsibilities"]))
+    return posting_document(card["board_url"], d.get("title"), (
         ("Title", d.get("title")), ("Location", d.get("full_location")), ("Employer", d.get("hiring_organization")),
         ("Posted", iso_date(d.get("posted_date"))), ("Req id", d.get("req_id")), ("Category", d.get("category")),
-        ("Employment type", d.get("employment_type"))) if v)
-    raw = f"<h1>{d.get('title') or ''}</h1>{head}<hr>{d.get('description') or ''}"
-    if d.get("qualifications"):
-        raw += f"<h2>Qualifications</h2>{d['qualifications']}"
-    if d.get("responsibilities") and d["responsibilities"] not in (d.get("description") or ""):
-        raw += f"<h2>Responsibilities</h2>{d['responsibilities']}"
-    return [doc("posting", card["board_url"], raw, html_to_text(raw))]
+        ("Employment type", d.get("employment_type"))), d.get("description"), sections=extra)
 
 
 def parse_fields(board, card, docs):

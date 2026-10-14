@@ -1,0 +1,399 @@
+"""The operations of the job board, each a function taking a plain dict and returning a plain
+dict, used unchanged by both front doors (HTTP routes in server.py, MCP tools in mcp.py).
+OPERATIONS lists them with the MCP description and input schema, so a tool and a route are
+one line each and cannot drift apart.
+
+Errors: KeyError = not found / missing field (404), ValueError = bad input (400),
+capacity.Busy = the browser slot is taken (409). Everything else is a server error."""
+import base64
+import contextlib
+import json
+import os
+
+import jobscan as J
+import auth
+import capacity
+import runs
+from logbuf import log_event, read_log, status as log_status
+
+SUMMARY_FIELDS = ("id", "title", "location", "series", "pay_plan", "grade_low", "grade_high", "salary",
+                  "open_date", "close_date", "external_url", "board_url", "announcement_no", "source",
+                  "board_id", "board_name", "board_platform", "board_source_url",
+                  "verdict", "eligible_grades", "verdict_reason", "verdict_author", "claude_verdict",
+                  "action", "action_date", "resume_dir", "last_fetched", "embedded")
+
+
+@contextlib.contextmanager
+def db():
+    conn = J.db()
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def _bool(v):
+    return v if isinstance(v, bool) else str(v).lower() in ("1", "true", "yes")
+
+
+def _int(v, default=None):
+    return default if v in (None, "") else int(v)
+
+
+def _ints(v):
+    return [int(x) for x in (v or [])]
+
+
+# ------------------------------------------------------------------ info
+def stats(args):
+    with db() as conn:
+        tot = conn.execute("SELECT COUNT(*) AS n FROM jobs").fetchone()["n"]
+        v = J.latest_verdicts(conn)
+        by = {}
+        for r in v.values():
+            by[r["verdict"]] = by.get(r["verdict"], 0) + 1
+        acts = J.latest_actions(conn)
+        docs = conn.execute("SELECT COUNT(*) AS n FROM documents").fetchone()["n"]
+        emb = conn.execute("SELECT COUNT(*) AS n FROM embeddings").fetchone()["n"]
+        srcs = [dict(r) for r in conn.execute("SELECT * FROM sources")]
+        res = conn.execute("SELECT COUNT(*) AS n FROM resumes").fetchone()["n"]
+    return {"jobs": tot, "pending": tot - len(v), "verdicts": by, "actioned": len(acts),
+            "documents": docs, "embedded": emb, "embeddings_enabled": bool(os.environ.get("OPENAI_API_KEY")),
+            "dsn": J.DSN.split("@")[-1], "sources": srcs, "adapters": J.list_sources(),
+            "active_run": capacity.busy(), "auth": auth.AUTH_ON, "resumes": res}
+
+
+def adapters(args):
+    out = []
+    for name in J.list_sources():
+        mod = J.load_source(name)
+        out.append({"name": name, "display_name": getattr(mod, "DISPLAY_NAME", name),
+                    "kind": getattr(mod, "KIND", "site"), "board_url": getattr(mod, "BOARD_URL", None)})
+    return {"adapters": out}
+
+
+def _last_scans(conn, limit=300):
+    """board_id -> {run_id, started_at, status, cards, new, known | error} from the most recent
+    scan that covered the board (summary.boards / summary.failed carry one entry per board)."""
+    out = {}
+    for r in conn.execute("SELECT id, started_at, status, summary FROM runs WHERE kind='scan' "
+                          "ORDER BY id DESC LIMIT %s", (limit,)):
+        try:
+            sm = json.loads(r["summary"]) if r["summary"] else {}
+        except ValueError:
+            sm = {}
+        for b in sm.get("boards") or []:
+            out.setdefault(b.get("board_id"), {"run_id": r["id"], "started_at": r["started_at"], "status": r["status"],
+                                               "cards": b.get("cards"), "new": b.get("new"), "known": b.get("known")})
+        for b in sm.get("failed") or []:
+            out.setdefault(b.get("board_id"), {"run_id": r["id"], "started_at": r["started_at"], "status": "failed",
+                                               "error": b.get("error")})
+    return out
+
+
+def boards(args):
+    with db() as conn:
+        counts = {r["board_id"]: r["n"] for r in conn.execute(
+            "SELECT board_id, COUNT(*) AS n FROM jobs WHERE board_id IS NOT NULL GROUP BY board_id")}
+        last = _last_scans(conn)
+        out = []
+        for b in J.list_boards(conn):
+            b["jobs"] = counts.get(b["id"], 0)
+            b["last_scan"] = last.get(b["id"])
+            out.append(b)
+    return {"boards": out}
+
+
+def sources(args):
+    """Adapters with the last scan run that used each (kept for older clients)."""
+    with db() as conn:
+        bs = J.list_boards(conn)
+        last = _last_scans(conn)
+    by_adapter = {}
+    for b in bs:
+        ls = last.get(b["id"])
+        if ls and (b["adapter"] not in by_adapter or ls["started_at"] > by_adapter[b["adapter"]]["started_at"]):
+            by_adapter[b["adapter"]] = ls
+    out = []
+    for a in adapters({})["adapters"]:
+        a["boards"] = sum(1 for b in bs if b["adapter"] == a["name"])
+        a["last_scan"] = by_adapter.get(a["name"])
+        out.append(a)
+    return {"sources": out}
+
+
+# ------------------------------------------------------------------ boards
+def add_boards(args):
+    """items: [url | {url, name?, include?, exclude?, adapter?}] -> per URL the board or the error.
+    One browser Session for the whole request; holds the browser slot."""
+    items = args.get("urls")
+    if not isinstance(items, list):
+        items = [args]
+    out = []
+    with capacity.hold("add_boards"), db() as conn, J.browser.Session(lambda m: log_event("info", m.strip())) as s:
+        for it in items:
+            it = {"url": it} if isinstance(it, str) else dict(it or {})
+            url = (it.get("url") or "").strip()
+            if not url:
+                out.append({"url": url, "error": "missing url"})
+                continue
+            try:
+                b = J.add_board(conn, url, name=it.get("name"), include=it.get("include"), exclude=it.get("exclude"),
+                                adapter=it.get("adapter"), session=s)
+                out.append({"url": url, "board": b})
+                log_event("info", f"board added: [{b['id']}] {b['name']} ({b['adapter']}) {b['url']}")
+            except Exception as e:  # noqa: BLE001
+                conn.rollback()
+                out.append({"url": url, "error": f"{e.__class__.__name__}: {e}"})
+                log_event("warn", f"board not added {url}: {e}")
+    return {"results": out, "added": sum(1 for r in out if "board" in r)}
+
+
+def update_board(args):
+    with db() as conn:
+        return {"board": J.update_board(conn, int(args["id"]), name=args.get("name"), enabled=args.get("enabled"),
+                                        include=args.get("include"), exclude=args.get("exclude"))}
+
+
+def delete_board(args):
+    with db() as conn:
+        n = J.delete_board(conn, int(args["id"]))
+    if not n:
+        raise KeyError(f"board {args['id']}")
+    return {"deleted": n}
+
+
+# ------------------------------------------------------------------ jobs
+def list_jobs(args):
+    """fields: 'summary' (MCP default, limited) or 'full' (the page)."""
+    with db() as conn:
+        rows = J.list_jobs(conn, verdict=args.get("verdict"), action=args.get("action"),
+                           open_only=_bool(args.get("open_only") or args.get("open")), closing=args.get("closing"),
+                           source=args.get("source") or None, board=args.get("board") or None,
+                           days=_int(args.get("days")), pending_only=_bool(args.get("pending_only") or args.get("pending")),
+                           q=args.get("q") or None)
+        if args.get("fields") == "full":
+            total = conn.execute("SELECT COUNT(*) AS n FROM jobs").fetchone()["n"]
+            return {"jobs": rows, "count": len(rows), "total": total, "active_run": capacity.busy()}
+    limit = _int(args.get("limit"), 100)
+    return {"count": len(rows), "jobs": [{k: r.get(k) for k in SUMMARY_FIELDS} for r in rows[:limit]]}
+
+
+def get_job(args):
+    with db() as conn:
+        return J.job_detail(conn, int(args["id"]), with_text=_bool(args.get("full_text", args.get("text", True))))
+
+
+def get_section(args):
+    with db() as conn:
+        doc, text = J.get_section(conn, int(args["id"]), args.get("name"), args.get("kind"))
+    if text is None:
+        raise KeyError(f"section {args.get('name') or 'key'} of job {args['id']}")
+    return {"job_id": int(args["id"]), "kind": doc["kind"], "doc_id": doc["id"],
+            "section": args.get("name") or "key", "text": text}
+
+
+def sections(args):
+    with db() as conn:
+        d, source, key = J.primary_document(conn, int(args["id"]))
+        if not d:
+            return {"job_id": int(args["id"]), "sections": {}}
+        return {"job_id": int(args["id"]), "doc_id": d["id"], "kind": d["kind"], "key_section": key,
+                "sections": J.document_sections(source, d["text"], d["kind"])}
+
+
+def search(args):
+    q, limit = args.get("q") or "", _int(args.get("limit"), 50)
+    with db() as conn:
+        if args.get("mode") == "semantic":
+            if not os.environ.get("OPENAI_API_KEY"):
+                raise RuntimeError("semantic search needs OPENAI_API_KEY in the server environment")
+            return {"query": q, "mode": "semantic", "hits": J.semantic_search(conn, q, limit)}
+        kinds = [args["kind"]] if args.get("kind") else None
+        return {"query": q, "mode": "keyword", "hits": J.search_documents(conn, q, kinds, limit)}
+
+
+def add_job(args):
+    with db() as conn:
+        jid = J.add_job(conn, args["title"], args.get("source") or "manual", args.get("source_id"),
+                        args.get("location"), args.get("announcement"), args.get("url"),
+                        args.get("series"), args.get("pay_plan"), args.get("grade_low"), args.get("grade_high"),
+                        args.get("salary"), args.get("open_date"), args.get("close_date"), None,
+                        args.get("text"), args.get("kind") or "posting",
+                        fetch_url=_bool(args.get("fetch")) or (bool(args.get("url")) and not args.get("text")))
+        return J.job_detail(conn, jid, with_text=False)
+
+
+def set_verdict(args):
+    with db() as conn:
+        vid = J.record_verdict(conn, int(args["id"]), args["verdict"], args.get("grades"), args.get("reason"),
+                               args.get("profile_hash"), args.get("author") or "claude")
+        return {"verdict_id": vid, "job": J.job_detail(conn, int(args["id"]), with_text=False)["job"]}
+
+
+def set_status(args):
+    with db() as conn:
+        aid = J.record_action(conn, int(args["id"]), args.get("status") or args.get("action"), args.get("date"),
+                              args.get("resume_dir"), args.get("note"))
+        return {"status_id": aid, "action_id": aid, "job": J.job_detail(conn, int(args["id"]), with_text=False)["job"]}
+
+
+# ------------------------------------------------------------------ fetching
+def scan(args):
+    """boards: ids; source: every enabled board of one adapter; neither: all enabled boards."""
+    ids, source = _ints(args.get("boards")), args.get("source") or None
+    with db() as conn:
+        if ids:
+            sel = [b for b in (J.get_board(conn, x) for x in ids) if b]
+            if len(sel) != len(ids):
+                raise KeyError(f"board(s) in {ids}")
+        elif source:
+            if source not in J.list_sources():
+                raise ValueError(f"unknown source; available: {J.list_sources()}")
+            sel = J.list_boards(conn, adapter=source, enabled_only=True)
+            if not sel and getattr(J.load_source(source), "BOARD_URL", None):
+                sel = [J.add_board(conn, J.load_source(source).BOARD_URL)]
+        else:
+            sel = J.list_boards(conn, enabled_only=True)
+    if not sel:
+        raise ValueError("no boards to scan; register one with add_boards first")
+    capacity.check()
+    days, all_, refetch = _int(args.get("days"), 7), _bool(args.get("all")), _bool(args.get("refetch"))
+    bids = [b["id"] for b in sel]
+    rid = runs.start("scan", {"boards": bids, "names": [b["name"] for b in sel], "source": source,
+                              "days": days, "all": all_, "refetch": refetch},
+                     lambda conn, log: J.scan_boards(conn, [J.get_board(conn, i) for i in bids], days=days,
+                                                     all_=all_, refetch=refetch, log=log))
+    return {"run_id": rid, "status": "running", "boards": bids}
+
+
+def refresh(args):
+    """Synchronous re-fetch of up to 20 jobs (ids); holds the browser slot."""
+    ids = _ints(args.get("ids"))[:20]
+    if not ids:
+        raise ValueError("ids required")
+    with capacity.hold("refresh"), db() as conn, J.browser.Session(lambda m: None) as s:
+        out = [J.refresh_job(conn, i, log=lambda m: None, session=s) for i in ids]
+        job = J.job_detail(conn, ids[-1], with_text=False)["job"]
+    return {"refreshed": out, "refresh": out[-1], "job": job}
+
+
+def refresh_run(args):
+    """Background re-fetch: ids, or every open yes/maybe job."""
+    with db() as conn:
+        if args.get("ids"):
+            ids = _ints(args["ids"])
+        else:
+            ids = [r["id"] for r in J.list_jobs(conn, verdict="yes,maybe", open_only=True) if r["source"] != "manual"]
+    capacity.check()
+
+    def work(conn, log):
+        out = []
+        with J.browser.Session(log) as s:
+            for i in ids:
+                try:
+                    out.append(J.refresh_job(conn, i, log=log, embed=False, session=s))
+                except Exception as e:  # noqa: BLE001
+                    conn.rollback()
+                    log(f"[{i}] failed: {e}")
+        emb = J.embed_if_possible(conn, [r["id"] for r in out], log)
+        return {"refreshed": len(out), "ids": ids, "embedded": emb.get("embedded", 0)}
+    rid = runs.start("refresh", {"ids": ids}, work, persist=False)
+    return {"run_id": rid, "status": "running", "count": len(ids)}
+
+
+def run_status(args):
+    r = runs.get(str(args["run_id"]))
+    if not r:
+        raise KeyError(f"run {args['run_id']}")
+    return r
+
+
+def recent_runs(args):
+    return {"runs": runs.recent(_int(args.get("limit"), 20))}
+
+
+def logs(args):
+    return {"lines": read_log(_int(args.get("lines"), 100), args.get("level") or "all", args.get("q")),
+            "buffer": log_status()}
+
+
+# ------------------------------------------------------------------ resumes
+def upload_resume(args):
+    data = base64.b64decode(args["content_base64"])
+    if len(data) > 15 * 1024 * 1024:
+        raise ValueError("file too large (15 MB max)")
+    with db() as conn:
+        return J.store_resume(conn, int(args["job_id"]), args["filename"], data, args.get("label"))
+
+
+def list_resumes(args):
+    with db() as conn:
+        return {"job_id": int(args["job_id"]), "resumes": J.list_resumes(conn, int(args["job_id"]))}
+
+
+# ------------------------------------------------------------------ the table
+# name -> (function, MCP description or None when HTTP-only, MCP input schema)
+_S = lambda **props: {"type": "object", "properties": props}  # noqa: E731
+_str, _intt, _boolt = {"type": "string"}, {"type": "integer"}, {"type": "boolean"}
+FILTER = r"include/exclude are title regexes applied at scan time (e.g. include 'analyst|account')"
+
+OPERATIONS = {
+    "stats": (stats, "Counts of jobs, verdicts, embeddings; available adapters; active run.", _S()),
+    "adapters": (adapters, "Adapters (hosting platforms) available: name, display_name, kind (family = many employers, site = one board).", _S()),
+    "sources": (sources, "Adapters with boards registered and last scan (older name for adapters).", _S()),
+    "boards": (boards, "Registered job boards: id, adapter, name, url, enabled, params (incl. include/exclude title regexes), jobs stored, last scan.", _S()),
+    "add_boards": (add_boards, "Register job boards by URL (many at once). The backend picks the adapter for each URL (Workday, Oracle HCM, iCIMS, UKG, NEOGOV, Greenhouse, Eightfold, Yello/USACE ...), verifies the endpoint answers, and stores the board. Each item is a URL or {url, name, include, exclude}; " + FILTER + ". Returns per URL the board or the error.",
+                   {"type": "object", "properties": {"urls": {"type": "array", "items": {"anyOf": [_str, {"type": "object", "properties": {"url": _str, "name": _str, "include": _str, "exclude": _str, "adapter": _str}, "required": ["url"]}]}}}, "required": ["urls"]}),
+    "update_board": (update_board, "Rename, enable/disable, or change the title filters of a board.",
+                     {"type": "object", "properties": {"id": _intt, "name": _str, "enabled": _boolt, "include": _str, "exclude": _str}, "required": ["id"]}),
+    "delete_board": (delete_board, "Remove a board; its jobs stay (detached from the board).", {"type": "object", "properties": {"id": _intt}, "required": ["id"]}),
+    "list_jobs": (list_jobs, "List jobs with latest verdict and action. Filters are ANDed.",
+                  _S(verdict={"type": "string", "description": "comma list of yes,maybe,no,none"},
+                     action={"type": "string", "description": "comma list of applied,drafted,none"},
+                     open_only=_boolt, source={"type": "string", "description": "adapter name"},
+                     board={"type": "string", "description": "board id or name"}, days=_intt, pending_only=_boolt,
+                     closing={"type": "string", "enum": ["open", "closed", "week"], "description": "by close date"},
+                     q={"type": "string", "description": "substring over title/location/board/series/reason"},
+                     limit={"type": "integer", "default": 100})),
+    "get_job": (get_job, "One job: fields, verdict/action history, and its primary document split into sections.",
+                {"type": "object", "properties": {"id": _intt, "full_text": {"type": "boolean", "default": False}}, "required": ["id"]}),
+    "get_section": (get_section, "One named section of a job's primary document (default: the board's key section, e.g. Qualifications).",
+                    {"type": "object", "properties": {"id": _intt, "name": _str}, "required": ["id"]}),
+    "sections": (sections, None, _S()),
+    "search": (search, "Search stored postings. mode=keyword (AND terms, quotes for phrases, snippets) or mode=semantic (embedding similarity).",
+               {"type": "object", "properties": {"q": _str, "mode": {"type": "string", "enum": ["keyword", "semantic"], "default": "keyword"}, "limit": {"type": "integer", "default": 20}}, "required": ["q"]}),
+    "scan": (scan, "Start a background scan: boards = list of board ids, or source = every board of one adapter, or neither = every enabled board. New/changed postings are embedded automatically. Returns a run id to poll with run_status.",
+             _S(boards={"type": "array", "items": _intt}, source=_str, days={"type": "integer", "default": 7},
+                all={"type": "boolean", "default": False}, refetch={"type": "boolean", "default": False})),
+    "run_status": (run_status, "Status, log and summary of a background run (scan/refresh).", {"type": "object", "properties": {"run_id": _str}, "required": ["run_id"]}),
+    "refresh": (refresh, "Re-fetch postings now (synchronous, up to 20 ids). Refused while a scan holds the browser.",
+                {"type": "object", "properties": {"ids": {"type": "array", "items": _intt}}, "required": ["ids"]}),
+    "refresh_run": (refresh_run, None, _S()),
+    "set_verdict": (set_verdict, "Record a qualification verdict for a job.",
+                    {"type": "object", "properties": {"id": _intt, "verdict": {"type": "string", "enum": ["yes", "maybe", "no"]}, "grades": _str, "reason": _str, "profile_hash": _str, "author": {"type": "string", "enum": ["claude", "user"], "default": "claude"}}, "required": ["id", "verdict", "reason"]}),
+    "set_status": (set_status, "Set a job's application status (what the page calls Status): drafted when a resume exists, applied when submitted. Appends to the history; the latest status wins.",
+                   {"type": "object", "properties": {"id": _intt, "status": {"type": "string", "enum": ["applied", "drafted"]}, "date": {"type": "string", "description": "YYYY-MM-DD, default today"}, "resume_dir": {"type": "string", "description": "e.g. applications/resumeX_oct12"}, "note": _str}, "required": ["id", "status"]}),
+    "add_job": (add_job, "Add a posting found outside any board, fetching the page verbatim (embedded automatically).",
+                {"type": "object", "properties": {"title": _str, "url": _str, "location": _str, "open_date": _str, "close_date": _str, "text": _str}, "required": ["title"]}),
+    "upload_resume": (upload_resume, "Store a resume or cover letter file (PDF or .tex) for a job; this is the only upload path. One file per job + filename: changed bytes replace the stored file in place (same url), identical bytes are a no-op. Returns stored (new|replaced|unchanged) and url.",
+                      {"type": "object", "properties": {"job_id": _intt, "filename": _str, "content_base64": _str, "label": {"type": "string", "description": "workspace directory name, e.g. resumeRedstone1102_oct12"}}, "required": ["job_id", "filename", "content_base64"]}),
+    "list_resumes": (list_resumes, "Resume files stored for a job (one per filename), each with its url (/files/job/<job_id>/<filename>).",
+                     {"type": "object", "properties": {"job_id": _intt}, "required": ["job_id"]}),
+    "logs": (logs, "Server log (in-memory ring buffer since the last restart): request lines, 4xx/5xx, tracebacks, run outcomes, embedding results. Use level=error to see only failures.",
+             _S(lines={"type": "integer", "default": 100}, level={"type": "string", "enum": ["all", "info", "warn", "error"], "default": "warn"}, q={"type": "string", "description": "substring filter"})),
+    "runs": (recent_runs, "Recent background runs (scans persisted, refreshes transient) with status and summary; use run_status for a run's full log.",
+             _S(limit={"type": "integer", "default": 20})),
+}
+
+
+def call(name, args):
+    """Run one operation by name."""
+    if name not in OPERATIONS:
+        raise KeyError(f"unknown operation {name}")
+    return OPERATIONS[name][0](dict(args or {}))
+
+
+def mcp_tools():
+    """The MCP tool list, straight from the table."""
+    return [{"name": n, "description": d, "inputSchema": s} for n, (f, d, s) in OPERATIONS.items() if d]

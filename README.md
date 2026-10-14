@@ -7,20 +7,30 @@ is synced through this repo.
 
 ```
 jobscan/             job posting tracker (PostgreSQL + pgvector, runs in the compose stack)
-  jobscan.py           CLI + library: scan boards, judge, report, record applications, embed, search
+  jobscan.py           facade: re-exports core/ so callers write `import jobscan as J`; also the CLI entry
+  core/                db (schema, migrations), text (extraction, sections), adapters (registry), boards,
+                       scan (scans + refreshes), jobs (verdicts, actions, listing, search, resumes), embed, cli
   browser.py           fetch layer: Chrome via Selenium + undetected-chromedriver, optional proxy; urllib fallback
   sources/             one adapter per hosting platform: families (workday, oracle_hcm, icims, icims_jibe,
                        ukg, neogov, greenhouse, eightfold) and single sites (usace_yellogov); __init__.py
                        detects the adapter for a board URL; _util.py shared helpers
 jobboard/            shared research service over the database
-  server.py            web page for the human, JSON API for Claude (GET /api lists it)
-  auth.py, mcp.py      password/session/token auth; MCP server (JSON-RPC over HTTP) for Claude Code
-  static/              index.html (the board), view.html (one job), login.html
+  service.py           every operation once (plain dict in, plain dict out) + the table that defines
+                       the MCP tools; both front doors below are one line per operation
+  server.py            HTTP front door: auth, static pages, file serving, a route table over service.py
+  mcp.py               MCP front door (JSON-RPC over HTTP) for Claude Code, tools straight from the table
+  runs.py              background runs (scans persisted, refreshes transient) with their logs
+  capacity.py          the one browser slot: a scan, a refresh or a registration at a time (409 otherwise)
+  logbuf.py            in-memory log ring buffer read by /api/logs and the logs tool
+  auth.py              password/session/token auth
+  static/              index.html + app.js (the board; filtering is the server's, the page sorts),
+                       view.html (one job), login.html
   Dockerfile           the production image: python:3.13-slim + psycopg + jobscan/ + jobboard/, nothing else
   compose.yaml         dev stack;  compose.auth.yaml: overlay with auth + nginx;  compose.prod.yaml: VPS
   dev.sh               up | up-auth | smoke | token | logs | ps | down
 deploy/              VPS: bootstrap.sh, deploy.sh, compose-up.sh, nginx/ (site + rule snippets shared with dev)
-tests/               test_adapters.py (board adapters), smoke.sh (end-to-end against a running auth stack)
+tests/               test_adapters.py (adapters), test_browser.py (fetch layer, guards), test_service.py
+                       (operation table vs both doors), smoke.sh (end-to-end against a running auth stack)
 ```
 
 ## Development (local Docker)

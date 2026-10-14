@@ -14,9 +14,9 @@ jobs:
         with: { python-version: "3.13" }
       - run: pip install "psycopg[binary]>=3.2"     # jobscan imports the driver; the adapter test is offline (JOBSCAN_BROWSER=0)
       - name: syntax
-        run: python -m py_compile jobscan/jobscan.py jobscan/browser.py jobscan/sources/*.py jobboard/server.py jobboard/auth.py jobboard/mcp.py
+        run: python -m py_compile jobscan/jobscan.py jobscan/browser.py jobscan/core/*.py jobscan/sources/*.py jobboard/server.py jobboard/auth.py jobboard/mcp.py jobboard/service.py jobboard/runs.py jobboard/capacity.py jobboard/logbuf.py
       - name: adapter contract + stubbed scan (offline)
-        run: JOBSCAN_BROWSER=0 python tests/test_adapters.py
+        run: JOBSCAN_BROWSER=0 python tests/test_adapters.py && JOBSCAN_BROWSER=0 python tests/test_browser.py && JOBSCAN_BROWSER=0 python tests/test_service.py
       - name: dev stack with auth + nginx (production image and nginx rules)
         run: cd jobboard && ./dev.sh up-auth
       - name: smoke test through nginx (gate, cookies, tokens, MCP, job + resume round trip)

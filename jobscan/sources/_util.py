@@ -64,21 +64,38 @@ def epoch_days(ts, today=None):
     return max(0, (today - d).days)
 
 
-def posted_text_days(s):
-    """Workday-style text: 'Posted Today', 'Posted Yesterday', 'Posted 9 Days Ago',
-    'Posted 30+ Days Ago' -> days (30+ becomes 31)."""
-    t = (s or "").lower()
-    if "today" in t or "just posted" in t:
+MONTHS = {m: i for i, m in enumerate(["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug",
+                                      "sep", "oct", "nov", "dec"], 1)}
+_UNIT_DAYS = {"h": 0, "hour": 0, "d": 1, "day": 1, "w": 7, "week": 7, "mo": 30, "m": 30, "month": 30, "y": 365, "year": 365}
+
+
+def posted_text_days(s, today=None):
+    """Posting-age text as boards show it -> whole days, or None when unreadable.
+    Handles 'Posted Today', 'Yesterday', 'NEW', 'Posted 9 Days Ago', '30+ Days Ago',
+    '3 weeks ago', the short forms '2d', '1w', '2mo', '3h', and bare dates 'Sep 3' /
+    'Sep 3, 2025' (a yearless date ahead of today is last year's)."""
+    t = (s or "").strip().lower()
+    if not t:
+        return None
+    if t == "new" or "today" in t or "just posted" in t:
         return 0
     if "yesterday" in t:
         return 1
-    m = re.search(r"(\d+)\s*\+?\s*(day|hour|week|month)", t)
-    if not m:
-        return None
-    n, unit = int(m.group(1)), m.group(2)
-    plus = "+" in t
-    days = {"hour": 0, "day": n, "week": n * 7, "month": n * 30}[unit]
-    return days + 1 if plus else days
+    m = re.search(r"(\d+)\s*(\+?)\s*(months?|hours?|weeks?|days?|years?|mo|[hdwmy])\b", t)
+    if m:
+        return int(m.group(1)) * _UNIT_DAYS[m.group(3).rstrip("s") if len(m.group(3)) > 2 else m.group(3)] + (1 if m.group(2) else 0)
+    m = re.match(r"([a-z]{3})[a-z]*\.?\s+(\d{1,2})(?:,?\s*(\d{4}))?$", t)
+    if m and m.group(1) in MONTHS:
+        today = today or dt.date.today()
+        year = int(m.group(3)) if m.group(3) else today.year
+        try:
+            d = dt.date(year, MONTHS[m.group(1)], int(m.group(2)))
+        except ValueError:
+            return None
+        if not m.group(3) and d > today:
+            d = d.replace(year=year - 1)
+        return (today - d).days
+    return None
 
 
 def strip_tags(s):
@@ -100,6 +117,48 @@ def json_body(body):
         return json.loads(body) if body else None
     except json.JSONDecodeError:
         return None
+
+
+SALARY_RE = re.compile(r"\$\s?\d[\d,]*(?:\.\d+)?(?:\s*(?:-|–|to)\s*\$\s?\d[\d,]*(?:\.\d+)?)?"
+                       r"(?:\s*(?:per|/)\s*(?:year|yr|hour|hr|annum))?", re.I)
+
+
+def find_salary(text):
+    """A salary range ("$47,445.00 - $74,901.00") or a rate with a unit ("$20.19/Hr") in posting
+    text; a lone dollar amount is not one."""
+    m = SALARY_RE.search(text or "")
+    if m and ("-" in m.group(0) or "–" in m.group(0) or " to " in m.group(0) or re.search(r"per|/", m.group(0), re.I)):
+        return m.group(0).strip()
+    return None
+
+
+def posting_document(url, title, fields, body_html, sections=(), raw_json=None, raw_page=None):
+    """The stored documents for one posting: a 'posting' document whose HTML is a header of the
+    labelled fields (empty ones dropped), a rule, the body, then optional (heading, html)
+    sections; plus the raw JSON ('posting_json') or page ('posting_page') it came from, kept
+    verbatim so parsers can be replayed without refetching."""
+    head = "".join(f"<p><b>{k}:</b> {v}</p>" for k, v in fields if v)
+    raw = f"<h1>{title or ''}</h1>{head}<hr>{body_html or ''}" + "".join(f"<h2>{h}</h2>{b}" for h, b in sections if b)
+    docs = [doc("posting", url, raw, html_to_text(raw))]
+    if raw_json is not None:
+        docs.append({"kind": "posting_json", "url": url, "raw_html": raw_json, "text": None})
+    if raw_page is not None:
+        docs.append({"kind": "posting_page", "url": url, "raw_html": raw_page, "text": None})
+    return docs
+
+
+def json_document(docs):
+    """The parsed 'posting_json' document of a posting, or {}."""
+    return next((json_body(d["raw_html"]) for d in docs if d["kind"] == "posting_json"), None) or {}
+
+
+def page_document(docs):
+    """The raw HTML of the 'posting_page' document, or ''."""
+    return next((d["raw_html"] for d in docs if d["kind"] == "posting_page"), None) or ""
+
+
+def posting_text(docs):
+    return next((d["text"] for d in docs if d["kind"] == "posting"), None) or ""
 
 
 def base_fields(card):
@@ -149,22 +208,25 @@ def all_older(cards, since_days):
         all(c.get("age_days") is not None and c["age_days"] > since_days for c in cards)
 
 
-def html_sections(text, headings):
-    """Split extracted text on known heading lines (exact, case-insensitive); falls back to
-    generic_sections when none is found."""
+def html_sections(text, headings, longest=False, ordered=False, fallback=True):
+    """Split extracted text on known heading lines (exact, case-insensitive). A heading that
+    appears more than once (USAJOBS repeats them in its side navigation) keeps its first
+    occurrence, or the one with the longest body when longest=True. ordered=True returns the
+    sections in the headings' order rather than the page's. With no heading found, falls back
+    to generic_sections unless fallback=False."""
     lines = (text or "").split("\n")
     heads = {h.lower(): h for h in headings}
     occ = [(i, heads[ln.strip().rstrip(':').lower()]) for i, ln in enumerate(lines)
            if ln.strip().rstrip(':').lower() in heads]
     if not occ:
-        return generic_sections(text)
+        return generic_sections(text) if fallback else {}
     out = {}
     for n, (i, name) in enumerate(occ):
         j = occ[n + 1][0] if n + 1 < len(occ) else len(lines)
         body = "\n".join(lines[i + 1:j]).strip()
-        if body and name not in out:
+        if body and (name not in out or (longest and len(body) > len(out[name]))):
             out[name] = body
-    return out
+    return {h: out[h] for h in headings if h in out} if ordered else out
 
 
 def div_block(html, class_name):

@@ -9,8 +9,8 @@ siteNumber the API wants (CX_1001); verify() tries the common ones and keeps the
 """
 import re
 
-from sources._util import (base_fields, days_since, iso_date, split_url, doc, paginate, json_body,
-                           html_to_text, html_sections)
+from sources._util import (base_fields, days_since, iso_date, split_url, paginate, json_body, posting_document,
+                           json_document, posting_text, find_salary, html_sections)
 
 DISPLAY_NAME = "Oracle Cloud HCM"
 KIND = "family"
@@ -100,28 +100,22 @@ def fetch_job(fetch, board, card):
     it = (d.get("items") or [None])[0]
     if not it:
         return []
-    head = "".join(f"<p><b>{k}:</b> {v}</p>" for k, v in (
+    return posting_document(card["board_url"], it.get("Title"), (
         ("Title", it.get("Title")), ("Location", it.get("PrimaryLocation")),
         ("Other locations", ", ".join(x.get("Name", "") for x in it.get("secondaryLocations") or []) or None),
         ("Posted", it.get("ExternalPostedStartDate")), ("Closes", it.get("ExternalPostedEndDate")),
         ("Requisition", it.get("RequisitionId")), ("Category", it.get("Category")),
         ("Job grade", it.get("JobGrade")), ("Schedule", it.get("JobSchedule")), ("Workplace", it.get("WorkplaceType")),
-        ("Employer", it.get("LegalEmployer")), ("Organization", it.get("Organization"))) if v)
-    raw = (f"<h1>{it.get('Title') or ''}</h1>{head}<hr><h2>Description</h2>{it.get('ExternalDescriptionStr') or ''}"
-           + (f"<h2>Responsibilities</h2>{it['ExternalResponsibilitiesStr']}" if it.get("ExternalResponsibilitiesStr") else "")
-           + (f"<h2>Qualifications</h2>{it['ExternalQualificationsStr']}" if it.get("ExternalQualificationsStr") else "")
-           + (f"<h2>About the organization</h2>{it['OrganizationDescriptionStr']}" if it.get("OrganizationDescriptionStr") else ""))
-    return [doc("posting", card["board_url"], raw, html_to_text(raw)),
-            {"kind": "posting_json", "url": _detail_url(board, card["source_id"]), "raw_html": text, "text": None}]
-
-
-SALARY_RE = re.compile(r"\$\s?\d[\d,]*(?:\.\d+)?\s*(?:-|–|to)\s*\$\s?\d[\d,]*(?:\.\d+)?", re.I)
+        ("Employer", it.get("LegalEmployer")), ("Organization", it.get("Organization"))),
+        "", sections=(("Description", it.get("ExternalDescriptionStr")),
+                      ("Responsibilities", it.get("ExternalResponsibilitiesStr")),
+                      ("Qualifications", it.get("ExternalQualificationsStr")),
+                      ("About the organization", it.get("OrganizationDescriptionStr"))), raw_json=text)
 
 
 def parse_fields(board, card, docs):
     f = base_fields(card)
-    meta = next((json_body(d["raw_html"]) for d in docs if d["kind"] == "posting_json"), None) or {}
-    it = ((meta.get("items") or [None])[0]) or {}
+    it = ((json_document(docs).get("items") or [None])[0]) or {}
     if it:
         f["title"] = it.get("Title") or f["title"]
         f["location"] = it.get("PrimaryLocation") or f["location"]
@@ -129,11 +123,7 @@ def parse_fields(board, card, docs):
         f["open_date"] = iso_date(it.get("ExternalPostedStartDate")) or f["open_date"]
         f["close_date"] = iso_date(it.get("ExternalPostedEndDate")) or f["close_date"]
         f["external_url"] = card["board_url"]
-    post = next((d for d in docs if d["kind"] == "posting"), None)
-    if post and post["text"]:
-        m = SALARY_RE.search(post["text"])
-        if m:
-            f["salary"] = m.group(0).strip()
+    f["salary"] = find_salary(posting_text(docs))
     return f
 
 

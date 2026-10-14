@@ -1,0 +1,172 @@
+"""Scans and refreshes: walk boards through one Session, store documents, carry verdicts, embed."""
+import browser
+from core.adapters import load_source
+from core.boards import _session, _title_filter, add_board, get_board, list_boards
+from core.db import _store_documents, _update_fields, now
+from core.embed import embed_if_possible
+from core.text import html_to_text
+
+
+def scan_board(conn, board, session, days=7, all_=False, limit=None, refetch=False,
+               max_pages=100, log=print, embed=True):
+    """Fetch new postings from one board through the run's Session. Incremental: known
+    (board, source_id) pairs are not re-fetched unless refetch=True. A new job whose announcement
+    number was already judged under another id inherits that verdict. New/changed jobs are
+    embedded afterwards when an API key is available. Titles are filtered by the board's
+    include/exclude regexes."""
+    fetch = session.fetch
+    src = load_source(board["adapter"])
+    conn.execute("""INSERT INTO sources VALUES (%s,%s,%s)
+        ON CONFLICT (name) DO UPDATE SET display_name=EXCLUDED.display_name, board_url=EXCLUDED.board_url""",
+                 (board["adapter"], src.DISPLAY_NAME, board["url"]))
+    conn.commit()
+    cards = src.list_jobs(fetch, board, since_days=None if all_ else days, max_pages=max_pages)
+    keep = _title_filter(board)
+    skipped = [c for c in cards if not keep(c.get("title"))]
+    cards = [c for c in cards if keep(c.get("title"))]
+    log(f"{board['name']} ({board['adapter']}): {len(cards)} cards"
+        + (f", {len(skipped)} dropped by title filter" if skipped else ""))
+    new = updated = carried = 0
+    need_judgment, touched = [], []
+    for i, card in enumerate(cards):
+        if limit and new >= limit:
+            break
+        row = conn.execute("SELECT id FROM jobs WHERE source=%s AND board_id=%s AND source_id=%s",
+                           (board["adapter"], board["id"], card["source_id"])).fetchone()
+        if row and not refetch:
+            conn.execute("UPDATE jobs SET last_seen=%s, posted_age_days=%s WHERE id=%s",
+                         (now(), card.get("age_days"), row["id"]))
+            updated += 1
+            continue
+        log(f"[{i+1}/{len(cards)}] {card['title']} — {card.get('location','')}")
+        docs = src.fetch_job(fetch, board, card)
+        if not docs:                                   # nothing fetched: leave it for the next scan
+            log(f"  ! no document fetched for {card['source_id']}; skipped")
+            continue
+        fields = src.parse_fields(board, card, docs)
+        for k in ("announcement_no", "salary", "location", "title"):   # adapters may hand back numbers
+            if fields.get(k) is not None and not isinstance(fields[k], str):
+                fields[k] = str(fields[k])
+        if row:
+            job_id = row["id"]
+            _update_fields(conn, job_id, fields, card.get("age_days"))
+        else:
+            job_id = conn.execute("""INSERT INTO jobs (source, source_id, board_id, title, location,
+                announcement_no, external_url, board_url, series, pay_plan, grade_low,
+                grade_high, salary, open_date, close_date, posted_age_days, first_seen,
+                last_seen) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                                  (board["adapter"], card["source_id"], board["id"], fields.get("title"),
+                                   fields.get("location"), fields.get("announcement_no"),
+                                   fields.get("external_url"), fields.get("board_url"),
+                                   fields.get("series"), fields.get("pay_plan"),
+                                   fields.get("grade_low"), fields.get("grade_high"),
+                                   fields.get("salary"), fields.get("open_date"),
+                                   fields.get("close_date"), card.get("age_days"),
+                                   now(), now())).fetchone()["id"]
+            new += 1
+            prior = None
+            if fields.get("announcement_no"):
+                prior = conn.execute("""
+                    SELECT v.*, j.id AS other_id FROM verdicts v JOIN jobs j ON j.id = v.job_id
+                    WHERE j.announcement_no = %s AND j.id != %s ORDER BY v.id DESC LIMIT 1""",
+                                     (fields["announcement_no"], job_id)).fetchone()
+            if prior:
+                conn.execute("""INSERT INTO verdicts (job_id, verdict, eligible_grades, reason,
+                    assessed_at, profile_hash, author) VALUES (%s,%s,%s,%s,%s,%s,%s)""",
+                             (job_id, prior["verdict"], prior["eligible_grades"],
+                              f"same announcement as job {prior['other_id']}: {prior['reason']}",
+                              now(), prior["profile_hash"], prior["author"]))
+                carried += 1
+            else:
+                need_judgment.append({"id": job_id, "title": fields.get("title"), "board": board["name"]})
+        _store_documents(conn, job_id, docs, replace=bool(row))
+        touched.append(job_id)
+        conn.commit()
+    log(f"{board['name']}: {new} new, {updated} already known, {carried} verdicts carried over")
+    embedded = embed_if_possible(conn, touched, log)["embedded"] if embed else 0
+    return {"board": board["name"], "board_id": board["id"], "cards": len(cards), "new": new,
+            "known": updated, "carried": carried, "need_judgment": need_judgment, "embedded": embedded}
+
+def scan_boards(conn, boards, days=7, all_=False, limit=None, refetch=False, max_pages=100,
+                log=print, embed=True):
+    """Scan several boards in one run: one browser.Session (one Chrome, one proxy escalation
+    state, one log) for the whole run, torn down at the end. A board that fails is logged and
+    skipped so the others still run."""
+    results, failed = [], []
+    with browser.Session(log) as s:
+        for b in boards:
+            try:
+                results.append(scan_board(conn, b, s, days, all_, limit, refetch, max_pages, log, embed))
+            except Exception as e:  # noqa: BLE001
+                conn.rollback()
+                failed.append({"board": b["name"], "board_id": b["id"], "error": f"{e.__class__.__name__}: {e}"})
+                log(f"! {b['name']} failed: {e.__class__.__name__}: {e}")
+    need = [j for r in results for j in r["need_judgment"]]
+    tot = {k: sum(r[k] for r in results) for k in ("cards", "new", "known", "carried", "embedded")}
+    log(f"done: {tot['new']} new, {tot['known']} already known, {tot['carried']} verdicts carried over"
+        f" across {len(results)} board(s)" + (f", {len(failed)} failed" if failed else ""))
+    if need:
+        log(f"{len(need)} new jobs need judgment (run: pending):")
+        for j in need:
+            log(f"  [{j['id']}] {j['title']} ({j['board']})")
+    return {**tot, "boards": results, "failed": failed, "need_judgment": need}
+
+def scan_source(conn, source_name, days=7, all_=False, limit=None, refetch=False,
+                max_pages=100, log=print, embed=True):
+    """Scan every enabled board of one adapter (CLI and older callers)."""
+    boards = list_boards(conn, adapter=source_name, enabled_only=True)
+    if not boards:
+        url = getattr(load_source(source_name), "BOARD_URL", None)
+        if not url:
+            raise ValueError(f"no boards registered for adapter {source_name}; add one by URL first")
+        boards = [add_board(conn, url)]
+    return scan_boards(conn, boards, days, all_, limit, refetch, max_pages, log, embed)
+
+def refresh_job(conn, job_id, log=print, embed=True, session=None):
+    """Re-fetch a stored job's pages; replaces the stored document of each kind and
+    re-embeds the job if its text changed (embed=False lets a bulk caller batch that).
+    session: the caller's browser.Session (one per refresh batch); opened here if absent."""
+    j = conn.execute("SELECT * FROM jobs WHERE id=%s", (job_id,)).fetchone()
+    if not j:
+        raise KeyError(job_id)
+    s, owned = _session(session, log)
+    try:
+        return _refresh_job(conn, j, s.fetch, log, embed)
+    finally:
+        if owned:
+            s.close()
+
+def _refresh_job(conn, j, fetch, log, embed):
+    job_id = j["id"]
+    if j["source"] == "manual" or not j["board_url"]:
+        if not j["external_url"]:
+            return {"id": job_id, "refetched": 0}
+        st, body = fetch(j["external_url"])
+        if body:
+            _store_documents(conn, job_id, [{"kind": "posting", "url": j["external_url"],
+                                             "raw_html": body, "text": html_to_text(body)}], replace=True)
+            conn.execute("UPDATE jobs SET last_seen=%s WHERE id=%s", (now(), job_id))
+            conn.commit()
+            if embed:
+                embed_if_possible(conn, [job_id], log)
+        return {"id": job_id, "refetched": 1 if body else 0}
+    src = load_source(j["source"])
+    board = get_board(conn, j["board_id"]) if j["board_id"] else None
+    if board is None:
+        boards = list_boards(conn, adapter=j["source"])
+        board = boards[0] if boards else {"id": None, "adapter": j["source"], "name": j["source"],
+                                          "url": j["board_url"], "params": {}, "enabled": True}
+    card = {"source_id": j["source_id"], "title": j["title"], "location": j["location"],
+            "board_url": j["board_url"], "card_html": "", "age_days": None}
+    docs = [d for d in src.fetch_job(fetch, board, card) if d["kind"] != "board_card"]
+    if not docs:                                   # fetch failed: keep what we have
+        log(f"refresh [{job_id}] {j['title']}: nothing fetched, stored data kept")
+        return {"id": job_id, "refetched": 0, "close_date": j["close_date"]}
+    fields = src.parse_fields(board, card, docs)
+    _update_fields(conn, job_id, fields)
+    _store_documents(conn, job_id, docs, replace=True)
+    conn.commit()
+    log(f"refreshed [{job_id}] {fields.get('title')} closes {fields.get('close_date')}")
+    if embed:
+        embed_if_possible(conn, [job_id], log)
+    return {"id": job_id, "refetched": len(docs), "close_date": fields.get("close_date")}

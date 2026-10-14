@@ -8,8 +8,8 @@ Detail     GET  https://www.governmentjobs.com/careers/{agency}/jobs/{id}/{slug}
 import html as _html
 import re
 
-from sources._util import (base_fields, iso_date, days_since, posted_text_days, split_url, doc, paginate,
-                           html_to_text, html_sections, strip_tags)
+from sources._util import (base_fields, iso_date, days_since, posted_text_days, split_url, paginate,
+                           posting_document, posting_text, html_sections, strip_tags)
 
 DISPLAY_NAME = "NEOGOV (governmentjobs.com)"
 KIND = "family"
@@ -103,19 +103,15 @@ def fetch_job(fetch, board, card):
             or re.search(r"<dt[^>]*>\s*" + lab + r"\s*</dt>\s*<dd[^>]*>(.*?)</dd>", html, re.S)
         if mm:
             terms[lab] = re.sub(r"\s+", " ", strip_tags(mm.group(1))).strip()
-    head = f"<h1>{card.get('title') or ''}</h1>" + "".join(f"<p><b>{k}:</b> {v}</p>" for k, v in terms.items())
     body = (m.group(1) if m else html)
     body = re.sub(r"<dt[^>]*>\s*<h\d[^>]*>(.*?)</h\d>\s*</dt>", r"<h2>\1</h2>", body, flags=re.S)
     body = re.sub(r"<h4[^>]*>(.*?)</h4>", r"<h2>\1</h2>", body, flags=re.S)
-    raw = head + "<hr>" + body
-    return [doc("posting", card["board_url"], raw, html_to_text(raw)),
-            {"kind": "posting_page", "url": card["board_url"], "raw_html": html, "text": None}]
+    return posting_document(card["board_url"], card.get("title"), list(terms.items()), body, raw_page=html)
 
 
 def parse_fields(board, card, docs):
     f = base_fields(card)
-    post = next((d for d in docs if d["kind"] == "posting"), None)
-    t = post["text"] if post else ""
+    t = posting_text(docs)
     for lab, key in (("Salary", "salary"), ("Location", "location"), ("Job Number", "announcement_no"),
                      ("Opening Date", "open_date"), ("Closing Date", "close_date")):
         mm = re.search(r"^" + lab + r":\s*(.+)$", t, re.M)

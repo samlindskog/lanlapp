@@ -9,8 +9,8 @@ gives open_date. Jibe-fronted iCIMS sites (careers.<company>.com with /api/jobs)
 import html as _html
 import re
 
-from sources._util import (base_fields, iso_date, split_url, doc, paginate, html_to_text, html_sections,
-                           strip_tags, generic_sections)
+from sources._util import (base_fields, iso_date, split_url, paginate, posting_document, posting_text, page_document,
+                           html_sections, strip_tags, generic_sections)
 
 DISPLAY_NAME = "iCIMS (portal)"
 KIND = "family"
@@ -102,26 +102,20 @@ def fetch_job(fetch, board, card):
         key = strip_tags(re.sub(r'<span class="glyphicons[^>]*></span>', "", k)).replace("Location/Org Data : ", "").replace("Location : ", "")
         fields[key] = re.sub(r"\s+", " ", strip_tags(v)).strip()
     blocks = [(strip_tags(h), b) for h, b in BLOCK_RE.findall(html)]
-    head = f"<h1>{card.get('title') or ''}</h1>" + "".join(f"<p><b>{k}:</b> {v}</p>" for k, v in fields.items() if v)
-    raw = head + "<hr>" + "".join(f"<h2>{h}</h2><div>{b}</div>" for h, b in blocks)
-    if not blocks:
-        raw = head + "<hr>" + html
-    return [doc("posting", card["board_url"], raw, html_to_text(raw)),
-            {"kind": "posting_page", "url": url, "raw_html": html, "text": None}]
+    return posting_document(card["board_url"], card.get("title"), list(fields.items()),
+                            "" if blocks else html, sections=[(h, f"<div>{b}</div>") for h, b in blocks], raw_page=html)
 
 
 def parse_fields(board, card, docs):
     f = base_fields(card)
     f["external_url"] = card["board_url"]
-    post = next((d for d in docs if d["kind"] == "posting"), None)
-    t = post["text"] if post else ""
-    page = next((d for d in docs if d["kind"] == "posting_page"), None)
-    m = re.search(r'"datePosted"\s*:\s*"([^"]+)"', (page or {}).get("raw_html") or "")   # JobPosting JSON-LD
+    t, page = posting_text(docs), page_document(docs)
+    m = re.search(r'"datePosted"\s*:\s*"([^"]+)"', page)   # JobPosting JSON-LD
     if not m:
         m = re.search(r"Posted Date\s*\n+\s*(\d{1,2}/\d{1,2}/\d{4}|\d{4}-\d{2}-\d{2})", t)
     if m:
         f["open_date"] = iso_date(m.group(1).strip())
-    m = re.search(r'"validThrough"\s*:\s*"([^"]+)"', (page or {}).get("raw_html") or "")
+    m = re.search(r'"validThrough"\s*:\s*"([^"]+)"', page)
     if m:
         f["close_date"] = iso_date(m.group(1).strip())
     m = re.search(r"^ID:\s*(.+)$", t, re.M)

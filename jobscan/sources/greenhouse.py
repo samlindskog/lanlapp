@@ -4,8 +4,8 @@
 """
 import html as _html
 
-from sources._util import (base_fields, days_since, iso_date, split_url, doc, within, json_body,
-                           html_to_text, generic_sections, log)
+from sources._util import (base_fields, days_since, iso_date, split_url, within, json_body, posting_document,
+                           generic_sections, log)
 
 DISPLAY_NAME = "Greenhouse"
 KIND = "family"
@@ -80,13 +80,13 @@ def fetch_job(fetch, board, card):
             card["data"] = j
             card["req_id"] = j.get("requisition_id")
             card["open_date"] = iso_date(j.get("first_published") or j.get("updated_at"))
-    content = _html.unescape(j.get("content") or "")
-    head = "".join(f"<p><b>{k}:</b> {v}</p>" for k, v in (
+    if not j:
+        return []
+    return posting_document(card["board_url"], j.get("title"), (
         ("Title", j.get("title")), ("Location", (j.get("location") or {}).get("name")),
         ("Employer", j.get("company_name")), ("Posted", iso_date(j.get("first_published"))),
-        ("Departments", ", ".join(x.get("name", "") for x in j.get("departments") or []) or None)) if v)
-    raw = f"<h1>{j.get('title') or ''}</h1>{head}<hr>{content}"
-    return [doc("posting", card["board_url"], raw, html_to_text(raw))] if j else []
+        ("Departments", ", ".join(x.get("name", "") for x in j.get("departments") or []) or None)),
+        _html.unescape(j.get("content") or ""))
 
 
 def parse_fields(board, card, docs):

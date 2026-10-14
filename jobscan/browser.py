@@ -246,7 +246,7 @@ class _ImpersonatingPool:
 def HttpPool():
     """Plain-HTTP transport: Chrome-impersonating when curl_cffi is installed, else http.client."""
     try:
-        import curl_cffi  # noqa: F401
+        import curl_cffi  # noqa: F401  (availability probe)
         return _ImpersonatingPool()
     except ImportError:
         return _Pool()
@@ -411,7 +411,6 @@ class ProxyRelay:
                 lines.insert(1, f"Proxy-Authorization: {self.auth}".encode())
             up = socket.create_connection((self.host, self.port), timeout=PAGE_TIMEOUT)
             if self.scheme == "https":
-                import ssl
                 up = SSL_CTX.wrap_socket(up, server_hostname=self.host)
             up.sendall(b"\r\n".join(lines) + b"\r\n\r\n" + rest)
             self._pipe(client, up)

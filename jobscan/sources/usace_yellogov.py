@@ -7,15 +7,13 @@ URL, where the real duties/qualifications live. match() accepts any
 too, but the USAJOBS hand-off is what this adapter is built around.
 See sources/__init__.py for the adapter contract.
 """
-import datetime as dt
 import html
 import json
 import re
 import sys
 
 sys.path.insert(0, __file__.rsplit("/sources/", 1)[0])
-from jobscan import html_to_text  # noqa: E402
-from sources._util import split_url  # noqa: E402
+from sources._util import split_url, posted_text_days, html_sections, doc  # noqa: E402
 
 BOARD_ID = "rHrorPQ_B8HbgbWJDca8Ng"
 BASE = "https://usace.yellogov.com"
@@ -57,20 +55,10 @@ YELLOGOV_HEADINGS = ["Announcement Type", "Position Type", "USACE Organization",
 
 
 def sections(text, kind="usajobs_announcement"):
-    """Split a stored document into an ordered {heading: text} dict. USAJOBS
-    repeats heading names in its side navigation, so for each heading the
-    occurrence with the longest following body is taken as the real section."""
+    """USAJOBS repeats heading names in its side navigation: the occurrence with the longest
+    body is the real section, presented in the page's canonical order."""
     heads = USAJOBS_HEADINGS if kind == "usajobs_announcement" else YELLOGOV_HEADINGS
-    lines = (text or "").split("\n")
-    occ = [(i, ln.strip()) for i, ln in enumerate(lines) if ln.strip() in heads]
-    best = {}
-    for n, (i, name) in enumerate(occ):
-        j = occ[n + 1][0] if n + 1 < len(occ) else len(lines)
-        body = "\n".join(lines[i + 1:j]).strip()
-        if body and len(body) > len(best.get(name, (0, ""))[1]):
-            best[name] = (i, body)
-    # Present in the page's canonical order (Summary, Duties, Requirements, ...).
-    return {name: best[name][1] for name in heads if name in best}
+    return html_sections(text, heads, longest=True, ordered=True, fallback=False)
 
 
 CARD_RE = re.compile(
@@ -78,33 +66,7 @@ CARD_RE = re.compile(
     r'(?P<title>.*?)</a>.*?<span>(?P<loc>[^<]+)</span><span>(?P<type>[^<]*)</span>.*?'
     r'search-results__post-time[^>]*>(?P<age>[^<]*)<', re.S)
 
-AGE_UNITS = {"h": 1 / 24, "d": 1, "w": 7, "mo": 30, "m": 30, "y": 365}
-MONTHS = {m: i for i, m in enumerate(["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug",
-                                      "sep", "oct", "nov", "dec"], 1)}
-
-
-def age_to_days(s, today=None):
-    """Card post-time text -> whole days. Yello shows "NEW" for the newest postings
-    (about the first four days), then "4d", "1w", "2mo", and a bare "Sep 3" date
-    once a posting is more than a few weeks old."""
-    s = (s or "").strip()
-    if s.upper() == "NEW":
-        return 0
-    m = re.match(r"(\d+)\s*(mo|[hdwmy])", s)
-    if m:
-        return int(round(int(m.group(1)) * AGE_UNITS[m.group(2)]))
-    m = re.match(r"([A-Za-z]{3})[a-z]*\.?\s+(\d{1,2})(?:,?\s*(\d{4}))?$", s)
-    if m and m.group(1).lower() in MONTHS:
-        today = today or dt.date.today()
-        year = int(m.group(3)) if m.group(3) else today.year
-        try:
-            d = dt.date(year, MONTHS[m.group(1).lower()], int(m.group(2)))
-        except ValueError:
-            return None
-        if not m.group(3) and d > today:  # no year shown and the date is ahead: last year's
-            d = d.replace(year=year - 1)
-        return (today - d).days
-    return None
+age_to_days = posted_text_days      # Yello shows NEW, 2d, 1w, 2mo or a bare 'Sep 3'
 
 
 def list_jobs(fetch, board, since_days=None, max_pages=100):
@@ -158,19 +120,16 @@ USAJOBS_RE = re.compile(r'href="(https://www\.usajobs\.gov(?::443)?/job/(\d+)[^"
 
 
 def fetch_job(fetch, board, card):
-    docs = [{"kind": "board_card", "url": card["board_url"],
-             "raw_html": card["card_html"], "text": html_to_text(card["card_html"])}]
+    docs = [doc("board_card", card["board_url"], card["card_html"])]
     status, body = fetch(card["board_url"])
     if body:
-        docs.append({"kind": "board_posting", "url": card["board_url"],
-                     "raw_html": body, "text": html_to_text(body)})
+        docs.append(doc("board_posting", card["board_url"], body))
         m = USAJOBS_RE.search(body)
         if m:
             uj_url = f"https://www.usajobs.gov/job/{m.group(2)}"
             st2, body2 = fetch(uj_url)
             if body2:
-                docs.append({"kind": "usajobs_announcement", "url": uj_url,
-                             "raw_html": body2, "text": html_to_text(body2)})
+                docs.append(doc("usajobs_announcement", uj_url, body2))
     return docs
 
 

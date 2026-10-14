@@ -10,8 +10,8 @@ label; when it is not (osv-enterprise -> osv_enterprise) verify() finds the vari
 """
 import re
 
-from sources._util import (base_fields, posted_text_days, qs, split_url, doc, paginate, json_body,
-                           html_to_text, generic_sections)
+from sources._util import (base_fields, posted_text_days, qs, split_url, paginate, json_body, posting_document,
+                           json_document, posting_text, find_salary, generic_sections)
 
 DISPLAY_NAME = "Workday"
 KIND = "family"
@@ -115,27 +115,18 @@ def fetch_job(fetch, board, card):
     info = d.get("jobPostingInfo") or {}
     if not info:
         return []
-    head = "".join(f"<p><b>{k}:</b> {v}</p>" for k, v in (
+    return posting_document(info.get("externalUrl") or card.get("board_url"), info.get("title"), (
         ("Title", info.get("title")), ("Location", info.get("location")),
         ("Additional locations", ", ".join(info.get("additionalLocations") or []) or None),
         ("Posted", info.get("postedOn")), ("Start date", info.get("startDate")),
         ("End date", info.get("endDate")), ("Time type", info.get("timeType")),
-        ("Job requisition id", info.get("jobReqId")), ("Employer", (d.get("hiringOrganization") or {}).get("name"))
-    ) if v)
-    raw = f"<h1>{info.get('title') or ''}</h1>{head}<hr>{info.get('jobDescription') or ''}"
-    url = info.get("externalUrl") or card.get("board_url")
-    return [doc("posting", url, raw, html_to_text(raw)), {"kind": "posting_json", "url": url,
-                                                           "raw_html": text, "text": None}]
-
-
-SALARY_RE = re.compile(r"\$\s?\d[\d,]*(?:\.\d+)?(?:\s*(?:-|–|to)\s*\$\s?\d[\d,]*(?:\.\d+)?)?(?:\s*(?:per|/)\s*(?:year|yr|hour|hr|annum))?", re.I)
+        ("Job requisition id", info.get("jobReqId")), ("Employer", (d.get("hiringOrganization") or {}).get("name"))),
+        info.get("jobDescription"), raw_json=text)
 
 
 def parse_fields(board, card, docs):
     f = base_fields(card)
-    meta = next((json_body(d["raw_html"]) for d in docs if d["kind"] == "posting_json"), None) or {}
-    info = meta.get("jobPostingInfo") or {}
-    post = next((d for d in docs if d["kind"] == "posting"), None)
+    info = json_document(docs).get("jobPostingInfo") or {}
     if info:
         f["title"] = info.get("title") or f["title"]
         f["location"] = ", ".join([x for x in [info.get("location")] + (info.get("additionalLocations") or []) if x])[:300] or f["location"]
@@ -143,10 +134,7 @@ def parse_fields(board, card, docs):
         f["announcement_no"] = info.get("jobReqId")
         f["open_date"] = info.get("startDate")
         f["close_date"] = info.get("endDate")
-    if post and post["text"]:
-        m = SALARY_RE.search(post["text"])
-        if m and "-" in m.group(0) or (m and re.search(r"per|/", m.group(0), re.I)):
-            f["salary"] = m.group(0).strip()
+    f["salary"] = find_salary(posting_text(docs))
     return f
 
 

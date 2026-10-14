@@ -7,8 +7,8 @@ The company domain the API wants is in the page HTML, so probe() reads it from t
 import datetime as dt
 import re
 
-from sources._util import (base_fields, epoch_days, iso_date, origin, split_url, doc, paginate, json_body,
-                           html_to_text, generic_sections)
+from sources._util import (base_fields, epoch_days, iso_date, origin, split_url, paginate, json_body,
+                           posting_document, json_document, posting_text, find_salary, generic_sections)
 
 DISPLAY_NAME = "Eightfold"
 KIND = "family"
@@ -88,30 +88,21 @@ def fetch_job(fetch, board, card):
     j = json_body(text) or {}
     if not j.get("job_description") and not j.get("name"):
         return []
-    head = "".join(f"<p><b>{k}:</b> {v}</p>" for k, v in (
+    return posting_document(card["board_url"], j.get("name"), (
         ("Title", j.get("name")), ("Location", ", ".join(j.get("locations") or []) or j.get("location")),
         ("Department", j.get("department")), ("Business unit", j.get("business_unit")),
-        ("Job id", j.get("display_job_id")), ("Work location", j.get("work_location_option"))) if v)
-    raw = f"<h1>{j.get('name') or ''}</h1>{head}<hr>{j.get('job_description') or ''}"
-    return [doc("posting", card["board_url"], raw, html_to_text(raw)),
-            {"kind": "posting_json", "url": card["board_url"], "raw_html": text, "text": None}]
-
-
-SALARY_RE = re.compile(r"\$\s?\d[\d,]*(?:\.\d+)?\s*(?:-|–|to)\s*\$\s?\d[\d,]*(?:\.\d+)?", re.I)
+        ("Job id", j.get("display_job_id")), ("Work location", j.get("work_location_option"))),
+        j.get("job_description"), raw_json=text)
 
 
 def parse_fields(board, card, docs):
     f = base_fields(card)
     f["external_url"] = card["board_url"]
-    meta = next((json_body(d["raw_html"]) for d in docs if d["kind"] == "posting_json"), None) or {}
+    meta = json_document(docs)
     f["announcement_no"] = f["announcement_no"] or meta.get("display_job_id")
     f["open_date"] = f["open_date"] or (iso_date(dt.datetime.fromtimestamp(int(meta["t_create"]), dt.timezone.utc).date().isoformat())
                                         if meta.get("t_create") else None)
-    post = next((d for d in docs if d["kind"] == "posting"), None)
-    if post and post["text"]:
-        m = SALARY_RE.search(post["text"])
-        if m:
-            f["salary"] = m.group(0).strip()
+    f["salary"] = find_salary(posting_text(docs))
     return f
 
 

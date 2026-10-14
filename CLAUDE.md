@@ -9,6 +9,11 @@ Layout, API and operations are in README.md. What matters when changing things:
 - **A push to master deploys to production** (GitHub Actions: adapter tests, the same auth stack +
   `tests/smoke.sh`, then ssh deploy). Production is the system of record for the user's job search;
   do not point local tooling at it for experiments.
+- **One operation, two doors.** Features live in `jobboard/service.py` as plain functions listed in
+  `OPERATIONS` (with the MCP description and schema). `server.py` maps a route onto one; `mcp.py`
+  serves the table as tools. Never implement logic in a route or a tool; add an operation and point
+  both at it (`tests/test_service.py` checks the doors agree). Anything that drives Chrome goes
+  through `capacity.py`, so the busy policy and the 409 stay in one place.
 - **Everything except the login paths needs a credential**, enforced in nginx (`deploy/nginx/`) and
   again in the app (`Handler._gate`, MCP `_authorized`). Keep both layers in step when adding a path.
 - **Deploy scripts and nginx are installed by the bootstrap, not by a push.** Changing anything under
