@@ -6,9 +6,9 @@ Agent API  : JSON over HTTP, documented at GET /api  (also in .claude/skills/job
 
   GET  /api                       this API description
   GET  /api/stats                 counts, db path, available sources
-  GET  /api/jobs/<id>/resumes     resume files stored for a job (newest version per filename)
-  GET  /files/job/<job_id>/<name> newest version of that file for the job (stable URL; never cached)
-  GET  /files/<resume_id>/<name>  one exact stored version;  /view.html?f=<either path> renders a PDF in-page
+  GET  /api/jobs/<id>/resumes     resume files stored for a job (one per filename, with url)
+  GET  /files/job/<job_id>/<name> the stored file (re-uploads replace it in place; never cached)
+                                  /view.html?f=job/<job_id>/<name> renders a PDF in-page
                                   (uploads happen only through the MCP tool upload_resume)
   GET  /api/sources               scan workflows available: name, display_name, board_url, last_scan
   GET  /api/jobs?verdict=yes,maybe&action=none&open=1&source=&days=&q=&pending=1
@@ -651,20 +651,19 @@ class Handler(SimpleHTTPRequestHandler):
             return self._json({"error": str(e), "trace": traceback.format_exc()}, 500)
 
     def _serve_resume(self, rel):
-        """/files/job/<job_id>/<filename>: newest version (stable URL, what the page links to).
-        /files/<id>/<filename>: one exact version. Never cached, so a reload always shows the current file."""
+        """/files/job/<job_id>/<filename>: the one stored file of that name for the job. Never cached,
+        so a reload after a re-upload shows the current bytes."""
         from urllib.parse import unquote
         parts = unquote(rel).split("/")
-        conn = J.db()
-        try:
-            if parts[0] == "job" and len(parts) >= 3:
-                r = J.get_resume_latest(conn, int(parts[1]), parts[-1])
-            else:
-                r = J.get_resume(conn, int(parts[0]))
-        except ValueError:
-            r = None
-        finally:
-            conn.close()
+        r = None
+        if parts[0] == "job" and len(parts) >= 3:
+            conn = J.db()
+            try:
+                r = J.get_resume(conn, int(parts[1]), parts[-1])
+            except ValueError:
+                r = None
+            finally:
+                conn.close()
         if not r:
             return self._json({"error": "not found"}, 404)
         ctype = {"pdf": "application/pdf", "tex": "text/plain; charset=utf-8"}.get(r["kind"], "application/octet-stream")
@@ -674,7 +673,6 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Content-Disposition", f'inline; filename="{r["filename"]}"')
         self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Resume-Id", str(r["id"]))
         self.end_headers()
         self.wfile.write(data)
 

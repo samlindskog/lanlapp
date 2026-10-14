@@ -46,9 +46,9 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {"id": {"type": "integer"}, "status": {"type": "string", "enum": ["applied", "drafted"]}, "date": {"type": "string", "description": "YYYY-MM-DD, default today"}, "resume_dir": {"type": "string", "description": "e.g. applications/resumeX_oct12"}, "note": {"type": "string"}}, "required": ["id", "status"]}},
     {"name": "add_job", "description": "Add a posting found outside any board, fetching the page verbatim (embedded automatically).",
      "inputSchema": {"type": "object", "properties": {"title": {"type": "string"}, "url": {"type": "string"}, "location": {"type": "string"}, "open_date": {"type": "string"}, "close_date": {"type": "string"}, "text": {"type": "string"}}, "required": ["title"]}},
-    {"name": "upload_resume", "description": "Store a resume or cover letter file (PDF or .tex) for a job; this is the only upload path. Idempotent: identical bytes are a no-op, changed bytes become a new version. Returns url (stable per job + filename, always the newest version; what the page links to) and permalink (this exact version).",
+    {"name": "upload_resume", "description": "Store a resume or cover letter file (PDF or .tex) for a job; this is the only upload path. One file per job + filename: changed bytes replace the stored file in place (same url), identical bytes are a no-op. Returns stored (new|replaced|unchanged) and url.",
      "inputSchema": {"type": "object", "properties": {"job_id": {"type": "integer"}, "filename": {"type": "string"}, "content_base64": {"type": "string"}, "label": {"type": "string", "description": "workspace directory name, e.g. resumeRedstone1102_oct12"}}, "required": ["job_id", "filename", "content_base64"]}},
-    {"name": "list_resumes", "description": "Resume files stored for a job (newest version per filename), each with url (stable: /files/job/<job_id>/<filename>, newest version) and permalink (/files/<id>/<filename>, that exact version).",
+    {"name": "list_resumes", "description": "Resume files stored for a job (one per filename), each with its url (/files/job/<job_id>/<filename>).",
      "inputSchema": {"type": "object", "properties": {"job_id": {"type": "integer"}}, "required": ["job_id"]}},
     {"name": "logs", "description": "Server log (in-memory ring buffer since the last restart): request lines, 4xx/5xx, tracebacks, run outcomes, embedding results. Use level=error to see only failures.",
      "inputSchema": {"type": "object", "properties": {"lines": {"type": "integer", "default": 100}, "level": {"type": "string", "enum": ["all", "info", "warn", "error"], "default": "warn"}, "q": {"type": "string", "description": "substring filter"}}}},
@@ -113,9 +113,7 @@ def make_handler(J, api):
                 data = base64.b64decode(args["content_base64"])
                 if len(data) > 15 * 1024 * 1024:
                     raise ValueError("file too large (15 MB max)")
-                r = J.store_resume(conn, int(args["job_id"]), args["filename"], data, args.get("label"))
-                r.update(J.resume_urls(int(args["job_id"]), os.path.basename(args["filename"]), r["id"]))
-                return r
+                return J.store_resume(conn, int(args["job_id"]), args["filename"], data, args.get("label"))
             if name == "list_resumes":
                 return {"resumes": J.list_resumes(conn, int(args["job_id"]))}
             if name == "logs":

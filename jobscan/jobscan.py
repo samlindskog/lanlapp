@@ -138,10 +138,14 @@ CREATE TABLE IF NOT EXISTS resumes (
     sha256 TEXT NOT NULL,
     bytes BYTEA NOT NULL,
     size INTEGER NOT NULL,
-    uploaded_at TEXT NOT NULL,
-    UNIQUE(job_id, filename, sha256)
+    uploaded_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS resumes_job ON resumes(job_id);
+-- One row per (job, filename): a re-upload replaces the bytes in place. Migration from the versioned
+-- layout (several rows per filename, UNIQUE(job_id, filename, sha256)): keep the newest row only.
+DELETE FROM resumes r USING resumes n WHERE r.job_id = n.job_id AND r.filename = n.filename AND r.id < n.id;
+ALTER TABLE resumes DROP CONSTRAINT IF EXISTS resumes_job_id_filename_sha256_key;
+CREATE UNIQUE INDEX IF NOT EXISTS resumes_job_file ON resumes(job_id, filename);
 CREATE TABLE IF NOT EXISTS embeddings (
     job_id INTEGER PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
     model TEXT NOT NULL,
@@ -656,7 +660,7 @@ def list_jobs(conn, verdict=None, action=None, open_only=False, source=None, day
     for f in list_resumes(conn):
         files.setdefault(f["job_id"], []).append({"id": f["id"], "name": f["filename"], "kind": f["kind"],
                                                   "label": f["label"], "uploaded_at": f["uploaded_at"],
-                                                  "url": f["url"], "permalink": f["permalink"]})
+                                                  "url": f["url"]})
     for r in rows:
         r["resume_files"] = files.get(r["id"], [])
     return rows
@@ -680,61 +684,52 @@ def job_detail(conn, job_id, with_text=True):
 
 # ----------------------------------------------------------------- resumes
 def store_resume(conn, job_id, filename, data, label=None):
-    """Store a resume/cover-letter file for a job. Idempotent: identical bytes for the
-    same job and filename return the existing row. A changed file becomes a new
-    version; the newest per filename is what the page links to."""
+    """Store a resume/cover-letter file for a job. One row per (job, filename): a re-upload replaces
+    the bytes in place, so the file keeps its id and URL; identical bytes are a no-op."""
     if not conn.execute("SELECT 1 FROM jobs WHERE id=%s", (job_id,)).fetchone():
         raise KeyError(job_id)
     filename = os.path.basename(filename)
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
     kind = ext if ext in ("pdf", "tex") else "other"
     sha = hashlib.sha256(data).hexdigest()
-    row = conn.execute("SELECT id FROM resumes WHERE job_id=%s AND filename=%s AND sha256=%s",
-                       (job_id, filename, sha)).fetchone()
-    if row:
-        return {"id": row["id"], "created": False, "sha256": sha, "size": len(data)}
-    rid = conn.execute("""INSERT INTO resumes (job_id, filename, kind, label, sha256, bytes, size, uploaded_at)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
-                       (job_id, filename, kind, label, sha, data, len(data), now())).fetchone()["id"]
+    row = conn.execute("""INSERT INTO resumes (job_id, filename, kind, label, sha256, bytes, size, uploaded_at)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+        ON CONFLICT (job_id, filename) DO UPDATE SET kind=EXCLUDED.kind, label=EXCLUDED.label,
+            sha256=EXCLUDED.sha256, bytes=EXCLUDED.bytes, size=EXCLUDED.size, uploaded_at=EXCLUDED.uploaded_at
+        WHERE resumes.sha256 <> EXCLUDED.sha256
+        RETURNING id, (xmax = 0) AS inserted""",
+                       (job_id, filename, kind, label, sha, data, len(data), now())).fetchone()
+    if row is None:  # same bytes already stored: the WHERE clause skipped the update
+        rid, stored = conn.execute("SELECT id FROM resumes WHERE job_id=%s AND filename=%s",
+                                   (job_id, filename)).fetchone()["id"], "unchanged"
+    else:
+        rid, stored = row["id"], "new" if row["inserted"] else "replaced"
     conn.commit()
-    return {"id": rid, "created": True, "sha256": sha, "size": len(data)}
+    return {"id": rid, "stored": stored, "sha256": sha, "size": len(data), "url": resume_url(job_id, filename)}
 
 
-def list_resumes(conn, job_id=None, latest_only=True):
-    """Resume files, newest version per (job, filename) unless latest_only=False."""
+def list_resumes(conn, job_id=None):
+    """Resume files (one row per job + filename), with their URLs."""
     sql = "SELECT id, job_id, filename, kind, label, sha256, size, uploaded_at FROM resumes"
     params = []
     if job_id is not None:
         sql += " WHERE job_id=%s"; params.append(job_id)
-    sql += " ORDER BY job_id, filename, id DESC"
+    sql += " ORDER BY job_id, filename"
     rows = [dict(r) for r in conn.execute(sql, params)]
-    if latest_only:
-        seen, out = set(), []
-        for r in rows:
-            k = (r["job_id"], r["filename"])
-            if k not in seen:
-                seen.add(k); out.append(r)
-        rows = out
     for r in rows:
-        r.update(resume_urls(r["job_id"], r["filename"], r["id"]))
+        r["url"] = resume_url(r["job_id"], r["filename"])
     return rows
 
 
-def get_resume(conn, resume_id):
-    r = conn.execute("SELECT * FROM resumes WHERE id=%s", (resume_id,)).fetchone()
-    return dict(r) if r else None
-
-
-def get_resume_latest(conn, job_id, filename):
-    """Newest version of a (job, filename): what the stable URL /files/job/<job_id>/<filename> serves."""
-    r = conn.execute("SELECT * FROM resumes WHERE job_id=%s AND filename=%s ORDER BY id DESC LIMIT 1",
+def get_resume(conn, job_id, filename):
+    r = conn.execute("SELECT * FROM resumes WHERE job_id=%s AND filename=%s",
                      (job_id, os.path.basename(filename))).fetchone()
     return dict(r) if r else None
 
 
-def resume_urls(job_id, filename, resume_id):
-    """url: stable per (job, filename), always the newest version. permalink: this exact version."""
-    return {"url": f"/files/job/{job_id}/{filename}", "permalink": f"/files/{resume_id}/{filename}"}
+def resume_url(job_id, filename):
+    """The one URL of a stored file; it survives re-uploads."""
+    return f"/files/job/{job_id}/{filename}"
 
 
 # ----------------------------------------------------------------- sections
