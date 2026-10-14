@@ -19,6 +19,8 @@ Agent API  : JSON over HTTP, documented at GET /api  (also in .claude/skills/job
   GET  /api/adapters              adapters available: name, display_name, kind (family | site)
   GET  /api/sources               adapters with their last scan (older name for /api/adapters)
   GET  /api/jobs?verdict=yes,maybe&action=none&open=1&source=&board=&days=&q=&pending=1
+                                  (each job carries board_id, board_name, board_platform e.g. "Workday",
+                                   board_adapter, board_source_url: the board it was scanned from)
   GET  /api/jobs/<id>?text=0      job + documents + verdict/action history
   GET  /api/jobs/<id>/sections    primary document split into named sections (board adapter decides)
   GET  /api/jobs/<id>/section?name=<heading>[&kind=<kind>]   one section (default: the board's key section)

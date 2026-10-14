@@ -812,7 +812,7 @@ SELECT j.*, v.verdict, v.eligible_grades, v.reason AS verdict_reason, v.assessed
        a.action, a.action_date, a.resume_dir, a.note AS action_note,
        (SELECT MAX(fetched_at) FROM documents WHERE job_id = j.id) AS last_fetched,
        (e.job_id IS NOT NULL) AS embedded,
-       b.name AS board_name
+       b.name AS board_name, b.url AS board_source_url, b.adapter AS board_adapter
 FROM jobs j
 LEFT JOIN boards b ON b.id = j.board_id
 LEFT JOIN verdicts v ON v.id = (SELECT MAX(id) FROM verdicts WHERE job_id = j.id)
@@ -839,6 +839,8 @@ def list_jobs(conn, verdict=None, action=None, open_only=False, source=None, day
     sql = JOBS_VIEW_SQL + " WHERE " + " AND ".join(where) + \
           " ORDER BY (j.close_date IS NULL), j.close_date, j.id"
     rows = [dict(r) for r in conn.execute(sql, params)]
+    for r in rows:                                   # hosting platform, e.g. "Workday"
+        r["board_platform"] = platform_name(r.get("board_adapter") or r["source"])
     if verdict:
         want = set(verdict.split(","))
         rows = [r for r in rows if (r["verdict"] or "none") in want]
@@ -851,7 +853,7 @@ def list_jobs(conn, verdict=None, action=None, open_only=False, source=None, day
         ql = q.lower()
         rows = [r for r in rows if ql in " ".join(str(r.get(k) or "") for k in
                 ("title", "location", "series", "announcement_no", "verdict_reason",
-                 "action_note", "pay_plan", "board_name")).lower()]
+                 "action_note", "pay_plan", "board_name", "board_platform")).lower()]
     files = {}
     for f in list_resumes(conn):
         files.setdefault(f["job_id"], []).append({"id": f["id"], "name": f["filename"], "kind": f["kind"],
@@ -870,12 +872,14 @@ def job_detail(conn, job_id, with_text=True):
     docs = [dict(r) for r in conn.execute(f"SELECT {cols} FROM documents WHERE job_id=%s ORDER BY id", (job_id,))]
     verdicts = [dict(r) for r in conn.execute("SELECT * FROM verdicts WHERE job_id=%s ORDER BY id", (job_id,))]
     actions = [dict(r) for r in conn.execute("SELECT * FROM actions WHERE job_id=%s ORDER BY id", (job_id,))]
+    j = dict(j)
+    j["board_platform"] = platform_name(j.get("board_adapter") or j["source"])
     pd, source, key = primary_document(conn, job_id)
     primary = None
     if pd:
         primary = {"doc_id": pd["id"], "kind": pd["kind"], "key_section": key,
                    "sections": document_sections(source, pd["text"], pd["kind"])}
-    return {"job": dict(j), "documents": docs, "verdicts": verdicts, "actions": actions, "primary": primary}
+    return {"job": j, "documents": docs, "verdicts": verdicts, "actions": actions, "primary": primary}
 
 
 # ----------------------------------------------------------------- resumes
@@ -945,6 +949,17 @@ def generic_sections(text):
         if body and name not in out:
             out[name] = body
     return out
+
+
+_platforms = {}
+
+
+def platform_name(adapter):
+    """Display name of an adapter's hosting platform ("Workday"), or the adapter name itself."""
+    if adapter not in _platforms:
+        mod, _, _ = source_meta(adapter)
+        _platforms[adapter] = getattr(mod, "DISPLAY_NAME", None) or adapter
+    return _platforms[adapter]
 
 
 def source_meta(source_name):

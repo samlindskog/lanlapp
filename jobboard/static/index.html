@@ -214,6 +214,7 @@
       <th data-sort="action">Status</th>
       <th data-sort="title">Title</th>
       <th data-sort="grade_low" class="hide-sm">Grade</th>
+      <th data-sort="board" class="hide-sm">Board</th>
       <th class="hide-sm">Location</th>
       <th data-sort="last_fetched" class="hide-sm">Fetched</th>
       <th class="hide-sm">Link</th>
@@ -294,6 +295,7 @@
       if (k === "close_date") return j.close_date || "9999-99-99";
       if (k === "grade_low") return j.grade_low ?? 99;
       if (k === "first_seen") return j.first_seen || "";
+      if (k === "board") return (j.board_name || j.source || "").toLowerCase();
       if (k === "last_fetched") return j.last_fetched ? new Date(j.last_fetched).getTime() : 0;
       return (j.title || "").toLowerCase();
     };
@@ -346,7 +348,8 @@
         <td>${statusSelect(j, a)}${j.action_date ? `<br><small>${j.action_date}</small>` : ""}</td>
         <td class="title">${state.semantic ? `<span class="score" title="similarity">${(state.semantic[j.id] * 100).toFixed(0)}% · </span>` : ""}${esc(j.title)}<small>${esc(j.series || "")}${j.announcement_no ? " · " + esc(j.announcement_no) : ""}</small></td>
         <td class="hide-sm">${esc(gradeOf(j))}</td>
-        <td class="hide-sm" title="${esc(j.board_name || j.source)}">${esc((j.location || "").slice(0, 60))}${j.board_name ? `<br><small class="muted">${esc(j.board_name.slice(0, 40))}</small>` : ""}</td>
+        <td class="hide-sm" title="${esc(j.board_platform || j.source)}">${esc((j.board_name || j.source || "").slice(0, 40))}<br><small class="muted">${esc(j.board_platform || j.source)}</small></td>
+        <td class="hide-sm">${esc((j.location || "").slice(0, 60))}</td>
         <td class="hide-sm fetched" title="${esc(fmtLocal(j.last_fetched))}">${esc(fmtAgo(j.last_fetched))}</td>
         <td class="hide-sm">${link ? `<a href="${esc(link)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">open ↗</a>` : ""}</td>
       </tr>` + (state.open === j.id ? detailRow(j) : "");
@@ -354,7 +357,7 @@
   }
 
   function detailRow(j) {
-    return `<tr class="detail"><td colspan="9">
+    return `<tr class="detail"><td colspan="10">
       <div class="detail-grid">
         <div>Verdict: ${verdictSelect(j, verdictOf(j), "big")} ${j.eligible_grades ? `(${esc(j.eligible_grades)})` : ""}${j.verdict_author === "user" ? ` <small>set by you</small>` : ""}</div>
         <div>${overridden(j)
@@ -365,7 +368,8 @@
         <div>Note: <b>${esc(j.action_note || "—")}</b></div>
         <div>Opens / closes: <b>${esc(j.open_date || "?")} / ${esc(j.close_date || "?")}</b></div>
         <div>Salary: <b>${esc(j.salary || "—")}</b></div>
-        <div>Board: <b>${esc(j.board_name || j.source)}</b> <small>(${esc(j.source)})</small> · first seen ${esc(fmtLocal(j.first_seen, true))}</div>
+        <div>Board: <b>${esc(j.board_name || j.source)}</b> on ${esc(j.board_platform || j.source)} <small>(adapter ${esc(j.board_adapter || j.source)})</small>${j.board_source_url ? ` · <a href="${esc(j.board_source_url)}" target="_blank" rel="noopener">${esc(j.board_source_url.replace(/^https?:\/\//, "").slice(0, 60))}</a>` : ""}</div>
+        <div>First seen: <b>${esc(fmtLocal(j.first_seen, true))}</b></div>
         <div>Links: ${j.external_url ? `<a href="${esc(j.external_url)}" target="_blank" rel="noopener">${/usajobs\.gov/.test(j.external_url) ? "USAJOBS" : "posting"}</a>` : ""} ${j.board_url && j.board_url !== j.external_url ? `<a href="${esc(j.board_url)}" target="_blank" rel="noopener">board</a>` : ""}</div>
         <div>Last fetched: <b>${esc(fmtLocal(j.last_fetched) || "—")}</b>
              <button data-act="refresh" data-id="${j.id}" style="margin-left:6px">Refresh posting</button></div>
@@ -634,7 +638,7 @@
   $("#logout").addEventListener("click", async (e) => { e.preventDefault(); await fetch("/api/auth/logout", { method: "POST" }); location.href = "/login.html"; });
   reload().then((d) => {
     if (d.active_run) pollRun(d.active_run.id);
-  }).catch((e) => { $("#rows").innerHTML = `<tr><td colspan="9">failed to load /api/jobs: ${esc(e)}</td></tr>`; });
+  }).catch((e) => { $("#rows").innerHTML = `<tr><td colspan="10">failed to load /api/jobs: ${esc(e)}</td></tr>`; });
 })();
 </script>
 </body>

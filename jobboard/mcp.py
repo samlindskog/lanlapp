@@ -81,7 +81,7 @@ def make_handler(J, api):
                                    q=args.get("q"), board=args.get("board"))
                 keep = ("id", "title", "location", "series", "pay_plan", "grade_low", "grade_high", "salary",
                         "open_date", "close_date", "external_url", "board_url", "announcement_no", "source",
-                        "board_id", "board_name",
+                        "board_id", "board_name", "board_platform", "board_source_url",
                         "verdict", "eligible_grades", "verdict_reason", "verdict_author", "claude_verdict",
                         "action", "action_date", "resume_dir", "last_fetched", "embedded")
                 return {"count": len(rows), "jobs": [{k: r.get(k) for k in keep} for r in rows[: int(args.get("limit") or 100)]]}
