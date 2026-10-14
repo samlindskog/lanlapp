@@ -43,11 +43,11 @@ services:
       - "127.0.0.1:8080:8080"              # web + API: only via nginx (443)
       - "127.0.0.1:8091:8090"              # MCP: only via nginx (10.88.0.1:8090 over WireGuard)
     restart: unless-stopped
-    mem_limit: 2g                            # Chromium (board scans) needs headroom
-    shm_size: 512m
+    mem_limit: 1200m                         # the VPS has 2 GB in all; Chromium runs lean (see browser.py)
+    shm_size: 256m
     user: "65534:65534"                      # nobody: the app writes only to /tmp (browser profile)
     read_only: true
-    tmpfs: [/tmp:size=1g]
+    tmpfs: ["/tmp:size=512m,exec"]           # exec: the patched chromedriver copy runs from here
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
 

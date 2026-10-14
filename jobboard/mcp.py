@@ -113,13 +113,15 @@ def make_handler(J, api):
             if name == "run_status":
                 return api.get_run(str(args["run_id"])) or {"error": "not found"}
             if name == "refresh":
+                if api.active_run():
+                    return {"error": "a run is active; the browser is busy. Retry when run_status shows it done.",
+                            "run": api.active_run()}
                 out = []
                 try:
                     for i in [int(x) for x in args["ids"]][:20]:
                         out.append(J.refresh_job(conn, i, log=lambda m: None))
                 finally:
-                    if not api.active_run():        # a running scan owns the browser
-                        J.close_browser()
+                    J.close_browser()
                 return {"refreshed": out}
             if name == "set_verdict":
                 vid = J.record_verdict(conn, int(args["id"]), args["verdict"], args.get("grades"), args.get("reason"),

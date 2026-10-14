@@ -541,6 +541,8 @@ def scan_boards(conn, boards, days=7, all_=False, limit=None, refetch=False, max
     """Scan several boards in one run (the browser is shared and closed at the end).
     A board that fails is logged and skipped so the others still run."""
     results, failed = [], []
+    import browser
+    browser.LOG = log                    # browser/adapter messages go to the run log
     try:
         for b in boards:
             try:
@@ -551,6 +553,7 @@ def scan_boards(conn, boards, days=7, all_=False, limit=None, refetch=False, max
                 log(f"! {b['name']} failed: {e.__class__.__name__}: {e}")
     finally:
         close_browser()
+        browser.LOG = browser._stderr
     need = [j for r in results for j in r["need_judgment"]]
     tot = {k: sum(r[k] for r in results) for k in ("cards", "new", "known", "carried", "embedded")}
     log(f"done: {tot['new']} new, {tot['known']} already known, {tot['carried']} verdicts carried over"

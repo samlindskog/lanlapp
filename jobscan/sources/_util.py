@@ -11,7 +11,8 @@ from jobscan import html_to_text, generic_sections  # noqa: E402,F401
 
 
 def log(msg):
-    print(msg, file=sys.stderr)
+    import browser
+    browser.LOG(msg)
 
 
 def split_url(url):

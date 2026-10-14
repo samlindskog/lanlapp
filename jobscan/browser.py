@@ -38,6 +38,8 @@ has it), else http.client; the browser path is real Chromium, so its fingerprint
   JOBSCAN_CHROMEDRIVER     chromedriver binary (container: /usr/bin/chromedriver); default: the
                            library downloads one matching the installed Chrome
   JOBSCAN_BROWSER_DIR      scratch dir for the profile and patched driver (default: a temp dir)
+  JOBSCAN_OWN_CHROME=1     every Chromium process on this host is ours (the container): kill them all
+                           before a start and on close, not only the ones we can match by profile dir
 """
 import ipaddress
 import json
@@ -55,6 +57,17 @@ import time
 import urllib.parse
 
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) jobscan/2.0"
+
+
+def _stderr(msg):
+    print(msg, file=sys.stderr)
+
+
+LOG = _stderr          # jobscan points this at the run log during scans/refreshes
+
+
+def log(msg):
+    LOG(msg)
 ENABLED = os.environ.get("JOBSCAN_BROWSER", "1") != "0"
 PROXY = os.environ.get("JOBSCAN_PROXY") or None
 PROXY_TRIES = int(os.environ.get("JOBSCAN_PROXY_TRIES", "3") or 0)
@@ -62,6 +75,8 @@ PROXY_COUNTRIES = [c.strip().lower() for c in os.environ.get("JOBSCAN_PROXY_COUN
 BLOCK_STATUSES = (403, 429, 503)
 CHROME = os.environ.get("JOBSCAN_CHROME") or None
 CHROMEDRIVER = os.environ.get("JOBSCAN_CHROMEDRIVER") or None
+OWN_CHROME = os.environ.get("JOBSCAN_OWN_CHROME") == "1"
+MAX_FAILURES = 2             # Chrome start/crash failures per run before falling back to plain HTTP
 PAGE_TIMEOUT = 60
 CHALLENGE_WAIT = 30          # seconds to sit on a Cloudflare "Just a moment" page
 CHALLENGE_RE = re.compile(r"just a moment|attention required|access denied|checking your browser|"
@@ -325,7 +340,7 @@ class Access:
         self.pool = pool
         self._level = {}
         self.blocked = set()
-        self.log = lambda m: print(m, file=sys.stderr)
+        self.log = log
 
     @staticmethod
     def host(url):
@@ -446,6 +461,51 @@ class ProxyRelay:
             pass
 
 
+def kill_stray_chrome():
+    """Kill Chromium/chromedriver processes left behind by a crashed or hung session (Linux /proc
+    scan; a no-op elsewhere). Without JOBSCAN_OWN_CHROME only processes started with one of our
+    profile dirs are touched. Returns the number killed."""
+    import signal
+    if not os.path.isdir("/proc"):
+        return 0
+    victims = []
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit() or int(pid) == os.getpid():
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                cmd = f.read().replace(b"\0", b" ")
+        except OSError:
+            continue
+        exe = cmd.split(b" ", 1)[0]
+        is_chrome = any(k in exe for k in (b"chromium", b"chrome", b"chromedriver"))
+        if is_chrome and (OWN_CHROME or b"jobscan-chrome-" in cmd):
+            victims.append(int(pid))
+    for pid in victims:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    for _ in range(10):                          # reap what gets re-parented to us, so no zombies linger
+        try:
+            while os.waitpid(-1, os.WNOHANG) != (0, 0):
+                pass
+        except ChildProcessError:
+            pass
+        if not any(os.path.exists(f"/proc/{p}") and "Z" not in _state(p) for p in victims):
+            break
+        time.sleep(0.1)
+    return len(victims)
+
+
+def _state(pid):
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().split(") ")[-1][:1]
+    except OSError:
+        return "X"
+
+
 def chrome_major(binary):
     """Major version of the Chrome binary, or None."""
     try:
@@ -467,7 +527,8 @@ class Browser:
         self._proxy = None            # proxy URL the running Chrome was started with
         self._relay = None
         self._disabled_reason = None
-        self.log = lambda m: print(m, file=sys.stderr)
+        self._failures = 0            # start/crash failures this run (reset by close(final=True))
+        self.log = log
 
     # ------------------------------------------------------------- lifecycle
     def available(self):
@@ -486,6 +547,9 @@ class Browser:
 
     def _start(self, proxy=None):
         import undetected_chromedriver as uc
+        n = kill_stray_chrome()
+        if n:
+            self.log(f"  browser: killed {n} stray chromium process(es)")
         self._proxy = proxy
         self._dir = os.environ.get("JOBSCAN_BROWSER_DIR") or tempfile.mkdtemp(prefix="jobscan-chrome-")
         os.makedirs(self._dir, exist_ok=True)
@@ -494,7 +558,12 @@ class Browser:
         os.environ.setdefault("HOME", self._dir)
         opts = uc.ChromeOptions()
         for a in ("--headless=new", "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
-                  "--window-size=1366,900", "--lang=en-US", "--no-first-run", "--no-default-browser-check"):
+                  "--window-size=1366,900", "--lang=en-US", "--no-first-run", "--no-default-browser-check",
+                  # one small browser: few processes, little memory (the VPS has 2 GB for everything)
+                  "--no-zygote", "--renderer-process-limit=2", "--disable-features=site-per-process,Translate",
+                  "--disable-extensions", "--disable-background-networking", "--disable-sync",
+                  "--disable-component-update", "--js-flags=--max-old-space-size=192",
+                  "--disable-breakpad", "--disable-crash-reporter", "--mute-audio"):
             opts.add_argument(a)
         binary = CHROME or uc.find_chrome_executable()
         major = chrome_major(binary) if binary else None   # the driver must match the browser's major
@@ -538,10 +607,26 @@ class Browser:
         if self._drv is not None and proxy != self._proxy:
             self.close()                 # the proxy is fixed at launch
         if self._drv is None:
-            self._start(proxy)
+            try:
+                self._start(proxy)
+            except Exception as e:  # noqa: BLE001
+                self._failed(f"start failed: {e.__class__.__name__}: {str(e)[:120]}")
+                raise
         return self._drv
 
-    def close(self):
+    def _failed(self, why):
+        """A start failure or crash. After MAX_FAILURES in one run the browser is left off and
+        fetch() uses plain HTTP, instead of restarting Chrome over and over on a starved host."""
+        self._failures += 1
+        self.log(f"  ! browser: {why} ({self._failures}/{MAX_FAILURES})")
+        self.close()
+        if self._failures >= MAX_FAILURES:
+            self._disabled_reason = f"chrome failed {self._failures} times this run; plain HTTP for the rest"
+            self.log(f"  ! browser: {self._disabled_reason}")
+
+    def close(self, final=False):
+        """Quit Chrome and kill whatever it left behind. final=True (end of a run) also clears the
+        failure count and re-enables the browser for the next run."""
         with self._lock:
             if self._drv is not None:
                 try:
@@ -549,12 +634,17 @@ class Browser:
                 except Exception:  # noqa: BLE001
                     pass
                 self._drv = None
+            kill_stray_chrome()
             if self._relay is not None:
                 self._relay.close()
                 self._relay = None
             if self._dir and not os.environ.get("JOBSCAN_BROWSER_DIR"):
                 shutil.rmtree(self._dir, ignore_errors=True)
                 self._dir = None
+            if final:
+                self._failures = 0
+                if self._disabled_reason and self._disabled_reason.startswith("chrome failed"):
+                    self._disabled_reason = None
 
     # ------------------------------------------------------------- requests
     @staticmethod
@@ -638,9 +728,8 @@ class Browser:
                     m = re.search(r"net::(ERR_[A-Z_]+)", str(e))
                     if m and (m.group(1).startswith("ERR_PROXY") or m.group(1).startswith("ERR_TUNNEL")):
                         return 0, f"net::{m.group(1)}"     # the proxy refused: Chrome itself is fine
-                    self.log(f"  ! browser error ({e.__class__.__name__}: {str(e)[:160]}); restarting chrome")
-                    self.close()
-                    if attempt:
+                    self._failed(f"{e.__class__.__name__}: {str(e)[:160]}")
+                    if attempt or not self.available():
                         raise
 
 
@@ -651,7 +740,7 @@ def _transport(url, method, data, headers, accept, proxy):
     if BROWSER.available():
         status, body = BROWSER.request(url, method, data, headers, accept, proxy)
         if status == 0 and body.startswith("origin unreachable"):
-            print(f"  ! browser: {body}; plain HTTP for {url[:80]}", file=sys.stderr)
+            log(f"  ! browser: {body}; plain HTTP for {url[:80]}")
             status, body = urllib_request(url, method, data, headers, accept, proxy)
         return status, body
     return urllib_request(url, method, data, headers, accept, proxy)
@@ -667,7 +756,7 @@ def fetch(url, retries=2, delay=0.4, accept=None, data=None, headers=None, metho
     try:
         check_url(url)
     except UnsafeURL as e:
-        print(f"  ! {e}", file=sys.stderr)
+        log(f"  ! {e}")
         return 0, ""
     if ACCESS.host(url) in ACCESS.blocked:
         return 403, ""
@@ -693,13 +782,13 @@ def fetch(url, retries=2, delay=0.4, accept=None, data=None, headers=None, metho
         except Exception as e:  # noqa: BLE001
             last = e
         time.sleep(1.5 * (attempt + 1))
-    print(f"  ! fetch failed {url}: {last}", file=sys.stderr)
+    log(f"  ! fetch failed {url}: {last}")
     return 0, ""
 
 
 def close():
-    """End of a run: quit Chrome, drop pooled connections, forget blocks and sessions so the
-    next run starts direct again."""
-    BROWSER.close()
+    """End of a run: quit Chrome (and kill strays), drop pooled connections, forget blocks,
+    sessions and browser failures so the next run starts clean and direct."""
+    BROWSER.close(final=True)
     POOL.close()
     ACCESS.reset()

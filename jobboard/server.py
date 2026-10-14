@@ -763,11 +763,14 @@ class Handler(SimpleHTTPRequestHandler):
                     conn.close()
                     return self._json({"action_id": aid, "job": d["job"]}, 201)
                 if sub == "refresh":
+                    if _active_run():
+                        conn.close()
+                        return self._json({"error": "a run is active; the browser is busy (queue it with POST /api/refresh)",
+                                           "run": _active_run()}, 409)
                     try:
                         r = J.refresh_job(conn, jid, log=lambda m: None)
                     finally:
-                        if not _active_run():          # a running scan owns the browser
-                            J.close_browser()
+                        J.close_browser()
                     d = J.job_detail(conn, jid, with_text=False)
                     conn.close()
                     return self._json({"refresh": r, "job": d["job"]})
