@@ -13,6 +13,7 @@ Adapter contract (used by jobscan.py and jobboard/server.py):
     parse_fields(card, docs)                -> dict of common job fields
     sections(text, kind)                    -> ordered {name: text} for a document
 """
+import datetime as dt
 import html
 import json
 import re
@@ -63,13 +64,32 @@ CARD_RE = re.compile(
     r'search-results__post-time[^>]*>(?P<age>[^<]*)<', re.S)
 
 AGE_UNITS = {"h": 1 / 24, "d": 1, "w": 7, "mo": 30, "m": 30, "y": 365}
+MONTHS = {m: i for i, m in enumerate(["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug",
+                                      "sep", "oct", "nov", "dec"], 1)}
 
 
-def age_to_days(s):
-    m = re.match(r"\s*(\d+)\s*(mo|[hdwmy])", s or "")
-    if not m:
-        return None
-    return int(round(int(m.group(1)) * AGE_UNITS[m.group(2)]))
+def age_to_days(s, today=None):
+    """Card post-time text -> whole days. Yello shows "NEW" for the newest postings
+    (about the first four days), then "4d", "1w", "2mo", and a bare "Sep 3" date
+    once a posting is more than a few weeks old."""
+    s = (s or "").strip()
+    if s.upper() == "NEW":
+        return 0
+    m = re.match(r"(\d+)\s*(mo|[hdwmy])", s)
+    if m:
+        return int(round(int(m.group(1)) * AGE_UNITS[m.group(2)]))
+    m = re.match(r"([A-Za-z]{3})[a-z]*\.?\s+(\d{1,2})(?:,?\s*(\d{4}))?$", s)
+    if m and m.group(1).lower() in MONTHS:
+        today = today or dt.date.today()
+        year = int(m.group(3)) if m.group(3) else today.year
+        try:
+            d = dt.date(year, MONTHS[m.group(1).lower()], int(m.group(2)))
+        except ValueError:
+            return None
+        if not m.group(3) and d > today:  # no year shown and the date is ahead: last year's
+            d = d.replace(year=year - 1)
+        return (today - d).days
+    return None
 
 
 def list_jobs(fetch, since_days=None, max_pages=100):
@@ -106,7 +126,14 @@ def list_jobs(fetch, since_days=None, max_pages=100):
         if not d.get("more_requisitions"):
             break
     if since_days is not None:
-        cards = [c for c in cards if c["age_days"] is not None and c["age_days"] <= since_days]
+        # A card whose age text the parser does not understand is kept, not dropped:
+        # missing a new posting is worse than fetching one extra page, and known
+        # jobs are skipped by source_id before any fetch anyway.
+        unknown = [c for c in cards if c["age_days"] is None]
+        if unknown:
+            print(f"  ! {len(unknown)} cards with unreadable post time kept: "
+                  + ", ".join(sorted({repr(c['age_text']) for c in unknown})[:8]), file=sys.stderr)
+        cards = [c for c in cards if c["age_days"] is None or c["age_days"] <= since_days]
     return cards
 
 
