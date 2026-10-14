@@ -35,12 +35,15 @@ services:
       JOBBOARD_RELOAD: "1"                     # dev: auto-restart on .py changes; static files always fresh
       JOBBOARD_MCP_PORT: "8090"
       JOBBOARD_MCP_BIND: "0.0.0.0"             # inside the container; published on loopback below
+      JOBSCAN_PROXY: ${JOBSCAN_PROXY:-}        # optional proxy for board scans (http://user:pass@host:port)
+      JOBSCAN_PROXY_COUNTRIES: ${JOBSCAN_PROXY_COUNTRIES:-us,ca}   # exit countries cycled over the proxies
     volumes:
       - ./:/app/jobboard                       # server.py, auth.py, mcp.py, static/: live
       - ../jobscan:/app/jobscan                # adapters, live
     ports:
       - "127.0.0.1:8080:8080"                # web + API (direct, no nginx)
       - "127.0.0.1:8090:8090"                # MCP (direct); without auth any client on this Mac may call it
+    shm_size: 512m                           # Chromium
     restart: unless-stopped
 
 volumes:

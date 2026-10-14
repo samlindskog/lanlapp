@@ -10,8 +10,15 @@ Agent API  : JSON over HTTP, documented at GET /api  (also in .claude/skills/job
   GET  /files/job/<job_id>/<name> the stored file (re-uploads replace it in place; never cached)
                                   /view.html?f=job/<job_id>/<name> renders a PDF in-page
                                   (uploads happen only through the MCP tool upload_resume)
-  GET  /api/sources               scan workflows available: name, display_name, board_url, last_scan
-  GET  /api/jobs?verdict=yes,maybe&action=none&open=1&source=&days=&q=&pending=1
+  GET  /api/boards                registered job boards: id, adapter, name, url, enabled, params, jobs, last_scan
+  POST /api/boards                {urls: [url | {url, name?, include?, exclude?}]}  -> per URL: board or error
+                                  (the adapter is detected from the URL, then by probing the page;
+                                   include/exclude are title regexes applied at scan time)
+  POST /api/boards/<id>           {name?, enabled?, include?, exclude?}
+  POST /api/boards/<id>/delete    remove a board (its jobs stay, detached)
+  GET  /api/adapters              adapters available: name, display_name, kind (family | site)
+  GET  /api/sources               adapters with their last scan (older name for /api/adapters)
+  GET  /api/jobs?verdict=yes,maybe&action=none&open=1&source=&board=&days=&q=&pending=1
   GET  /api/jobs/<id>?text=0      job + documents + verdict/action history
   GET  /api/jobs/<id>/sections    primary document split into named sections (board adapter decides)
   GET  /api/jobs/<id>/section?name=<heading>[&kind=<kind>]   one section (default: the board's key section)
@@ -22,7 +29,8 @@ Agent API  : JSON over HTTP, documented at GET /api  (also in .claude/skills/job
                                   (author=user marks a human override; Claude's latest verdict is kept as claude_verdict)
   POST /api/jobs/<id>/action      {action: applied|drafted, date?, resume_dir?, note?}
   POST /api/jobs/<id>/refresh     re-fetch the posting now (synchronous)
-  POST /api/scan                  {source, days?:7, all?:false, refetch?:false}  -> {run_id}
+  POST /api/scan                  {boards?:[id..], source?, days?:7, all?:false, refetch?:false} -> {run_id}
+                                  (boards = ids; source = every board of one adapter; neither = all enabled)
   POST /api/refresh               {ids?:[..]} or {filter:"open-qualifying"}       -> {run_id}
   GET  /api/runs  /api/runs/<id>  background run status + log (scans persist; refresh runs are transient, ids like t3)
   GET  /api/logs?lines=200&level=all|warn|error&q=<substring>   server log ring buffer (requests, errors,
@@ -217,21 +225,90 @@ def _get_run(rid):
     return dict(r) if r else None
 
 
-def sources_info():
-    conn = J.db()
-    last = {r["args_source"]: r for r in conn.execute("""
-        SELECT DISTINCT ON (args::json->>'source') args::json->>'source' AS args_source,
-               started_at, status, summary FROM runs WHERE kind='scan'
-        ORDER BY args::json->>'source', id DESC""")}
+def adapters_info():
     out = []
     for name in J.list_sources():
         mod = J.load_source(name)
-        r = last.get(name)
         out.append({"name": name, "display_name": getattr(mod, "DISPLAY_NAME", name),
-                    "board_url": getattr(mod, "BOARD_URL", None),
-                    "last_scan": {"started_at": r["started_at"], "status": r["status"],
-                                  "summary": json.loads(r["summary"]) if r["summary"] else None} if r else None})
+                    "kind": getattr(mod, "KIND", "site"), "board_url": getattr(mod, "BOARD_URL", None)})
+    return out
+
+
+def _last_scans(conn, limit=300):
+    """board_id -> {started_at, status, cards, new, known, error?} from the most recent scan that
+    covered the board (summary.boards / summary.failed carry one entry per board)."""
+    out = {}
+    for r in conn.execute("SELECT id, started_at, status, summary FROM runs WHERE kind='scan' "
+                          "ORDER BY id DESC LIMIT %s", (limit,)):
+        try:
+            sm = json.loads(r["summary"]) if r["summary"] else {}
+        except ValueError:
+            sm = {}
+        for b in sm.get("boards") or []:
+            out.setdefault(b.get("board_id"), {"run_id": r["id"], "started_at": r["started_at"], "status": r["status"],
+                                               "cards": b.get("cards"), "new": b.get("new"), "known": b.get("known")})
+        for b in sm.get("failed") or []:
+            out.setdefault(b.get("board_id"), {"run_id": r["id"], "started_at": r["started_at"], "status": "failed",
+                                               "error": b.get("error")})
+    return out
+
+
+def boards_info():
+    conn = J.db()
+    counts = {r["board_id"]: r["n"] for r in conn.execute(
+        "SELECT board_id, COUNT(*) AS n FROM jobs WHERE board_id IS NOT NULL GROUP BY board_id")}
+    last = _last_scans(conn)
+    out = []
+    for b in J.list_boards(conn):
+        b["jobs"] = counts.get(b["id"], 0)
+        b["last_scan"] = last.get(b["id"])
+        out.append(b)
     conn.close()
+    return out
+
+
+def sources_info():
+    """Adapters with the last scan run that used each (kept for older clients)."""
+    conn = J.db()
+    boards = J.list_boards(conn)
+    last = _last_scans(conn)
+    by_adapter = {}
+    for b in boards:
+        ls = last.get(b["id"])
+        if ls and (b["adapter"] not in by_adapter or ls["started_at"] > by_adapter[b["adapter"]]["started_at"]):
+            by_adapter[b["adapter"]] = ls
+    conn.close()
+    out = []
+    for a in adapters_info():
+        a["boards"] = sum(1 for b in boards if b["adapter"] == a["name"])
+        a["last_scan"] = by_adapter.get(a["name"])
+        out.append(a)
+    return out
+
+
+def add_boards(items):
+    """items: [url | {url, name?, include?, exclude?}] -> [{url, board} | {url, error}]."""
+    conn = J.db()
+    out = []
+    try:
+        for it in items:
+            it = {"url": it} if isinstance(it, str) else dict(it or {})
+            url = (it.get("url") or "").strip()
+            if not url:
+                out.append({"url": url, "error": "missing url"})
+                continue
+            try:
+                b = J.add_board(conn, url, name=it.get("name"), include=it.get("include"), exclude=it.get("exclude"),
+                                adapter=it.get("adapter"))
+                out.append({"url": url, "board": b})
+                log_event("info", f"board added: [{b['id']}] {b['name']} ({b['adapter']}) {b['url']}")
+            except Exception as e:  # noqa: BLE001
+                conn.rollback()
+                out.append({"url": url, "error": f"{e.__class__.__name__}: {e}"})
+                log_event("warn", f"board not added {url}: {e}")
+    finally:
+        J.close_browser()
+        conn.close()
     return out
 
 
@@ -261,15 +338,35 @@ def resume_count():
     return n
 
 
-def start_scan(source, days=7, all_=False, refetch=False):
-    if source not in J.list_sources():
-        return {"error": f"unknown source; available: {J.list_sources()}"}
+def start_scan(source=None, days=7, all_=False, refetch=False, boards=None):
+    """boards: list of board ids; source: every enabled board of one adapter; neither: all enabled."""
+    conn = J.db()
+    try:
+        if boards:
+            sel = [b for b in (J.get_board(conn, x) for x in boards) if b]
+            if len(sel) != len(boards):
+                return {"error": f"unknown board(s) in {boards}"}
+        elif source:
+            if source not in J.list_sources():
+                return {"error": f"unknown source; available: {J.list_sources()}"}
+            sel = J.list_boards(conn, adapter=source, enabled_only=True)
+            if not sel and getattr(J.load_source(source), "BOARD_URL", None):
+                sel = [J.add_board(conn, J.load_source(source).BOARD_URL)]
+        else:
+            sel = J.list_boards(conn, enabled_only=True)
+    finally:
+        conn.close()
+    if not sel:
+        return {"error": "no boards to scan; register one with POST /api/boards {urls:[...]}"}
     active = _active_run()
     if active:
         return {"error": "a run is already active", "run": active}
-    rid = _start_run("scan", {"source": source, "days": days, "all": all_, "refetch": refetch},
-                     lambda conn, log: J.scan_source(conn, source, days=days, all_=all_, refetch=refetch, log=log))
-    return {"run_id": rid, "status": "running"}
+    ids = [b["id"] for b in sel]
+    rid = _start_run("scan", {"boards": ids, "names": [b["name"] for b in sel], "source": source,
+                              "days": days, "all": all_, "refetch": refetch},
+                     lambda conn, log: J.scan_boards(conn, [J.get_board(conn, i) for i in ids], days=days,
+                                                     all_=all_, refetch=refetch, log=log))
+    return {"run_id": rid, "status": "running", "boards": ids}
 
 
 def list_runs(limit=20):
@@ -296,6 +393,9 @@ class _Api:
     """Facade handed to the MCP server."""
     stats = staticmethod(stats_info)
     sources = staticmethod(sources_info)
+    adapters = staticmethod(adapters_info)
+    boards = staticmethod(boards_info)
+    add_boards = staticmethod(add_boards)
     start_scan = staticmethod(start_scan)
     get_run = staticmethod(lambda rid: _get_run(rid))
     read_log = staticmethod(lambda lines, level, q: read_log(lines, level, q))
@@ -437,11 +537,15 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._json(stats_info())
             if path == "/api/sources":
                 return self._json({"sources": sources_info()})
+            if path == "/api/adapters":
+                return self._json({"adapters": adapters_info()})
+            if path == "/api/boards":
+                return self._json({"boards": boards_info()})
             if path == "/api/jobs":
                 conn = J.db()
                 rows = J.list_jobs(conn, verdict=qs.get("verdict"), action=qs.get("action"),
                                    open_only=qs.get("open") in ("1", "true"),
-                                   source=qs.get("source") or None,
+                                   source=qs.get("source") or None, board=qs.get("board") or None,
                                    days=int(qs["days"]) if qs.get("days") else None,
                                    pending_only=qs.get("pending") in ("1", "true"),
                                    q=qs.get("q") or None)
@@ -580,9 +684,28 @@ class Handler(SimpleHTTPRequestHandler):
                 conn.close()
                 return self._json({"revoked": n})
             if path == "/api/scan":
-                r = start_scan(body.get("source") or "usace_yellogov", int(body.get("days", 7)),
-                               bool(body.get("all")), bool(body.get("refetch")))
+                r = start_scan(body.get("source") or None, int(body.get("days", 7)),
+                               bool(body.get("all")), bool(body.get("refetch")),
+                               boards=[int(x) for x in body.get("boards") or []] or None)
                 return self._json(r, 202 if "run_id" in r else (409 if "run" in r else 400))
+            if path == "/api/boards":
+                items = body.get("urls") if isinstance(body.get("urls"), list) else [body]
+                res = add_boards(items)
+                return self._json({"results": res, "added": sum(1 for r in res if "board" in r)},
+                                  201 if any("board" in r for r in res) else 400)
+            if path.startswith("/api/boards/"):
+                parts = path.split("/")
+                bid = int(parts[3])
+                conn = J.db()
+                try:
+                    if len(parts) > 4 and parts[4] == "delete":
+                        n = J.delete_board(conn, bid)
+                        return self._json({"deleted": n}, 200 if n else 404)
+                    b = J.update_board(conn, bid, name=body.get("name"), enabled=body.get("enabled"),
+                                       include=body.get("include"), exclude=body.get("exclude"))
+                    return self._json({"board": b})
+                finally:
+                    conn.close()
             if path == "/api/refresh":
                 conn = J.db()
                 if body.get("ids"):
@@ -597,11 +720,15 @@ class Handler(SimpleHTTPRequestHandler):
 
                 def work(conn, log):
                     out = []
-                    for i in ids:
-                        try:
-                            out.append(J.refresh_job(conn, i, log=log, embed=False))
-                        except Exception as e:  # noqa: BLE001
-                            log(f"[{i}] failed: {e}")
+                    try:
+                        for i in ids:
+                            try:
+                                out.append(J.refresh_job(conn, i, log=log, embed=False))
+                            except Exception as e:  # noqa: BLE001
+                                conn.rollback()
+                                log(f"[{i}] failed: {e}")
+                    finally:
+                        J.close_browser()
                     emb = J.embed_if_possible(conn, [r["id"] for r in out], log)
                     return {"refreshed": len(out), "ids": ids, "embedded": emb.get("embedded", 0)}
                 rid = _start_run("refresh", {"ids": ids}, work, persist=False)
@@ -636,7 +763,11 @@ class Handler(SimpleHTTPRequestHandler):
                     conn.close()
                     return self._json({"action_id": aid, "job": d["job"]}, 201)
                 if sub == "refresh":
-                    r = J.refresh_job(conn, jid, log=lambda m: None)
+                    try:
+                        r = J.refresh_job(conn, jid, log=lambda m: None)
+                    finally:
+                        if not _active_run():          # a running scan owns the browser
+                            J.close_browser()
                     d = J.job_detail(conn, jid, with_text=False)
                     conn.close()
                     return self._json({"refresh": r, "job": d["job"]})

@@ -1,0 +1,673 @@
+{
+  "opportunities": [
+    {
+      "Id": "fb82142c-1397-40d3-874b-bc94383acf37",
+      "Featured": false,
+      "Title": "Financial Consultant",
+      "RequisitionNumber": "FINAN004895",
+      "FullTime": true,
+      "JobCategoryName": "Nusenda",
+      "Locations": [
+        {
+          "Id": "957290ba-2736-5506-aa3a-af6fe4fcd458",
+          "LocalizedName": "Juan Tabo",
+          "LocalizedLocationId": null,
+          "LocalizedDescription": "Juan Tabo",
+          "Address": {
+            "Line1": "2801 Juan Tabo NE",
+            "Line2": null,
+            "City": "Albuquerque",
+            "PostalCode": "87112",
+            "State": {
+              "Code": "NM",
+              "Name": "New Mexico"
+            },
+            "Country": {
+              "Code": "USA",
+              "Name": "United States"
+            }
+          },
+          "DisplayName": true,
+          "DisplayLocationId": false,
+          "DisplayAddress": true,
+          "DisplayStreetAddress": false,
+          "DisplayDescription": false,
+          "SourceOfTruth": 1,
+          "Coordinates": {
+            "Latitude": 35.11391033729725,
+            "Longitude": -106.51576432537864
+          }
+        }
+      ],
+      "PostedDate": "2026-10-13T20:47:39.114Z",
+      "BriefDescription": "We are currently seeking a Full-Time Financial Consultant to join our Juan Tabo Branch. As a Financial Consultant, you will be a trusted financial resource to existing and potential members by utilizing a consultative approach to evaluate, educate and fulfill members’ financial needs. You will show adaptability and knowledge regarding all functions and processes of both the teller and platform operations. You will identify opportunity to refer members to business services, mortgage services, home equity lending, and investment services as needed.",
+      "MatchScore": 1.0,
+      "MatchedLocations": [],
+      "Distance": null,
+      "JobLocationType": 1,
+      "OpportunityType": 0
+    },
+    {
+      "Id": "d2e622a0-f3db-4ae0-9a98-2dc419f4557c",
+      "Featured": false,
+      "Title": "Indirect Lending Credit Officer",
+      "RequisitionNumber": "INDIR004900",
+      "FullTime": true,
+      "JobCategoryName": "Nusenda",
+      "Locations": [
+        {
+          "Id": "f0286ff3-e53b-5af7-b763-4c3fe303081a",
+          "LocalizedName": null,
+          "LocalizedLocationId": "VISTA",
+          "LocalizedDescription": "Vista Hills",
+          "Address": {
+            "Line1": "1790 N Lee Trevino Dr",
+            "Line2": null,
+            "City": "El Paso",
+            "PostalCode": "79936",
+            "State": {
+              "Code": "TX",
+              "Name": "Texas"
+            },
+            "Country": {
+              "Code": "USA",
+              "Name": "United States"
+            }
+          },
+          "DisplayName": false,
+          "DisplayLocationId": false,
+          "DisplayAddress": true,
+          "DisplayStreetAddress": false,
+          "DisplayDescription": false,
+          "SourceOfTruth": 1,
+          "Coordinates": {
+            "Latitude": 31.764549818712,
+            "Longitude": -106.317872380054
+          }
+        }
+      ],
+      "PostedDate": "2026-10-13T19:48:35.901Z",
+      "BriefDescription": "We are currently seeking an Indirect Lending Credit Officer to join our organization. As the Indirect Lending Credit Officer, you will be responsible for evaluating loan quality by fully underwriting, identifying, assessing, and reporting credit risks in all indirect consumer loan types in accordance with credit union policy and guidelines. You will work with dealerships to clear underwriting conditions and/or stipulations while understanding required documentation for making a well-educated underwriting decision. You will ensure that the credit union’s members and auto dealerships are provided a market-leading service relationship with an emphasis on both credit quality and increasing market share by enhancing dealer relationships and providing best-in-class service.",
+      "MatchScore": 1.0,
+      "MatchedLocations": [],
+      "Distance": null,
+      "JobLocationType": 1,
+      "OpportunityType": 0
+    },
+    {
+      "Id": "b047200f-2ded-48b3-b03b-e660b6e49fe6",
+      "Featured": false,
+      "Title": "Facilities Maintenance Technician",
+      "RequisitionNumber": "FACIL004899",
+      "FullTime": true,
+      "JobCategoryName": "Nusenda",
+      "Locations": [
+        {
+          "Id": "f3b78f58-dd32-4556-983f-99285b4a37a3",
+          "LocalizedName": "Nusenda Campus",
+          "LocalizedLocationId": null,
+          "LocalizedDescription": null,
+          "Address": {
+            "Line1": "4100 Pan American Fwy NE",
+            "Line2": null,
+            "City": "Albuquerque",
+            "PostalCode": "87107",
+            "State": {
+              "Code": "NM",
+              "Name": "New Mexico"
+            },
+            "Country": {
+              "Code": "USA",
+              "Name": "United States"
+            }
+          },
+          "DisplayName": true,
+          "DisplayLocationId": false,
+          "DisplayAddress": true,
+          "DisplayStreetAddress": false,
+          "DisplayDescription": false,
+          "SourceOfTruth": 0,
+          "Coordinates": {
+            "Latitude": 35.12901565432627,
+            "Longitude": -106.61506546737236
+          }
+        }
+      ],
+      "PostedDate": "2026-10-13T14:58:15.898Z",
+      "BriefDescription": "We are currently seeking a Facilities and Maintenance Technician to join our organization. As a Facilities and Maintenance Technician at Nusenda, you will be responsible for providing general maintenance, troubleshooting, repair and installation support for the Credit Union's facilities as assigned by the supervisor. You will ensure multiple facilities are maintained in a professional and functional manner while serving as a department resource for technical and day-to-day operations.",
+      "MatchScore": 1.0,
+      "MatchedLocations": [],
+      "Distance": null,
+      "JobLocationType": 1,
+      "OpportunityType": 0
+    }
+  ],
+  "totalCount": 21,
+  "locations": [
+    {
+      "PhysicalLocation": {
+        "Id": "957290ba-2736-5506-aa3a-af6fe4fcd458",
+        "LocalizedName": "Juan Tabo",
+        "LocalizedLocationId": null,
+        "LocalizedDescription": "Juan Tabo",
+        "Address": {
+          "Line1": "2801 Juan Tabo NE",
+          "Line2": null,
+          "City": "Albuquerque",
+          "PostalCode": "87112",
+          "State": {
+            "Code": "NM",
+            "Name": "New Mexico"
+          },
+          "Country": {
+            "Code": "USA",
+            "Name": "United States"
+          }
+        },
+        "DisplayName": true,
+        "DisplayLocationId": false,
+        "DisplayAddress": true,
+        "DisplayStreetAddress": false,
+        "DisplayDescription": false,
+        "SourceOfTruth": 1,
+        "Coordinates": {
+          "Latitude": 35.11391033729725,
+          "Longitude": -106.51576432537864
+        }
+      },
+      "Count": 1
+    },
+    {
+      "PhysicalLocation": {
+        "Id": "f0286ff3-e53b-5af7-b763-4c3fe303081a",
+        "LocalizedName": null,
+        "LocalizedLocationId": "VISTA",
+        "LocalizedDescription": "Vista Hills",
+        "Address": {
+          "Line1": "1790 N Lee Trevino Dr",
+          "Line2": null,
+          "City": "El Paso",
+          "PostalCode": "79936",
+          "State": {
+            "Code": "TX",
+            "Name": "Texas"
+          },
+          "Country": {
+            "Code": "USA",
+            "Name": "United States"
+          }
+        },
+        "DisplayName": false,
+        "DisplayLocationId": false,
+        "DisplayAddress": true,
+        "DisplayStreetAddress": false,
+        "DisplayDescription": false,
+        "SourceOfTruth": 1,
+        "Coordinates": {
+          "Latitude": 31.764549818712,
+          "Longitude": -106.317872380054
+        }
+      },
+      "Count": 1
+    },
+    {
+      "PhysicalLocation": {
+        "Id": "1fafb87a-030f-467e-9bb4-5ab1fa834a4c",
+        "LocalizedName": "Contact Center",
+        "LocalizedLocationId": "Contact Center",
+        "LocalizedDescription": null,
+        "Address": {
+          "Line1": "4100 Pan American Fwy NE",
+          "Line2": null,
+          "City": "Albuquerque",
+          "PostalCode": "87107",
+          "State": null,
+          "Country": {
+            "Code": "USA",
+            "Name": "United States"
+          }
+        },
+        "DisplayName": true,
+        "DisplayLocationId": true,
+        "DisplayAddress": true,
+        "DisplayStreetAddress": true,
+        "DisplayDescription": false,
+        "SourceOfTruth": 0,
+        "Coordinates": {
+          "Latitude": 35.12901565432627,
+          "Longitude": -106.61506546737235
+        }
+      },
+      "Count": 1
+    },
+    {
+      "PhysicalLocation": {
+        "Id": "95fe0c21-2307-596a-b9ce-170abb37e05b",
+        "LocalizedName": null,
+        "LocalizedLocationId": null,
+        "LocalizedDescription": "Gateway",
+        "Address": {
+          "Line1": "6068 Gateway Blvd E",
+          "Line2": null,
+          "City": "El Paso",
+          "PostalCode": "79905",
+          "State": {
+            "Code": "TX",
+            "Name": "Texas"
+          },
+          "Country": {
+            "Code": "USA",
+            "Name": "United States"
+          }
+        },
+        "DisplayName": false,
+        "DisplayLocationId": false,
+        "DisplayAddress": true,
+        "DisplayStreetAddress": false,
+        "DisplayDescription": false,
+        "SourceOfTruth": 1,
+        "Coordinates": {
+          "Latitude": 31.781174209244785,
+          "Longitude": -106.41105096364473
+        }
+      },
+      "Count": 1
+    },
+    {
+      "PhysicalLocation": {
+        "Id": "ca87157c-99a0-5231-941e-faeab0bc813a",
+        "LocalizedName": null,
+        "LocalizedLocationId": null,
+        "LocalizedDescription": "Southside",
+        "Address": {
+          "Line1": "5621 Herrera Drive",
+          "Line2": null,
+          "City": "Santa Fe",
+          "PostalCode": "87507",
+          "State": {
+            "Code": "NM",
+            "Name": "New Mexico"
+          },
+          "Country": {
+            "Code": "USA",
+            "Name": "United States"
+          }
+        },
+        "DisplayName": false,
+        "DisplayLocationId": false,
+        "DisplayAddress": true,
+        "DisplayStreetAddress": false,
+        "DisplayDescription": false,
+        "SourceOfTruth": 1,
+        "Coordinates": {
+          "Latitude": 35.617667820262525,
+          "Longitude": -106.03197549202339
+        }
+      },
+      "Count": 1
+    },
+    {
+      "PhysicalLocation": {
+        "Id": "b9a4fac5-5317-5797-be66-5f2d5e32e75d",
+        "LocalizedName": null,
+        "LocalizedLocationId": null,
+        "LocalizedDescription": "Castellano",
+        "Address": {
+          "Line1": "4849 N Mesa St",
+          "Line2": null,
+          "City": "El Paso",
+          "PostalCode": "79912",
+          "State": {
+            "Code": "TX",
+            "Name": "Texas"
+          },
+          "Country": {
+            "Code": "USA",
+            "Name": "United States"
+          }
+        },
+        "DisplayName": false,
+        "DisplayLocationId": false,
+        "DisplayAddress": true,
+        "DisplayStreetAddress": false,
+        "DisplayDescription": false,
+        "SourceOfTruth": 1,
+        "Coordinates": {
+          "Latitude": 31.80763124311855,
+          "Longitude": -106.50987962158793
+        }
+      },
+      "Count": 1
+    },
+    {
+      "PhysicalLocation": {
+        "Id": "f3b78f58-dd32-4556-983f-99285b4a37a3",
+        "LocalizedName": "Nusenda Campus",
+        "LocalizedLocationId": null,
+        "LocalizedDescription": null,
+        "Address": {
+          "Line1": "4100 Pan American Fwy NE",
+          "Line2": null,
+          "City": "Albuquerque",
+          "PostalCode": "87107",
+          "State": {
+            "Code": "NM",
+            "Name": "New Mexico"
+          },
+          "Country": {
+            "Code": "USA",
+            "Name": "United States"
+          }
+        },
+        "DisplayName": true,
+        "DisplayLocationId": false,
+        "DisplayAddress": true,
+        "DisplayStreetAddress": false,
+        "DisplayDescription": false,
+        "SourceOfTruth": 0,
+        "Coordinates": {
+          "Latitude": 35.12901565432627,
+          "Longitude": -106.61506546737236
+        }
+      },
+      "Count": 5
+    },
+    {
+      "PhysicalLocation": {
+        "Id": "01250b93-cb26-41fd-a5b5-aa0103fde81b",
+        "LocalizedName": "Las Cruces",
+        "LocalizedLocationId": null,
+        "LocalizedDescription": null,
+        "Address": {
+          "Line1": null,
+          "Line2": null,
+          "City": "Las Cruces",
+          "PostalCode": null,
+          "State": {
+            "Code": "NM",
+            "Name": "New Mexico"
+          },
+          "Country": {
+            "Code": "USA",
+            "Name": "United States"
+          }
+        },
+        "DisplayName": true,
+        "DisplayLocationId": false,
+        "DisplayAddress": true,
+        "DisplayStreetAddress": false,
+        "DisplayDescription": false,
+        "SourceOfTruth": 0,
+        "Coordinates": {
+          "Latitude": 32.3161471,
+          "Longitude": -106.780637
+        }
+      },
+      "Count": 1
+    },
+    {
+      "PhysicalLocation": {
+        "Id": "5bffddaa-aaee-5173-8e06-f89e97aa8af5",
+        "LocalizedName": null,
+        "LocalizedLocationId": "UPTCOL",
+        "LocalizedDescription": "Uptown Call Center",
+        "Address": {
+          "Line1": "6501 Indian School Rd NE",
+          "Line2": null,
+          "City": "Albuquerque",
+          "PostalCode": "87110",
+          "State": {
+            "Code": "NM",
+            "Name": "New Mexico"
+          },
+          "Country": {
+            "Code": "USA",
+            "Name": "United States"
+          }
+        },
+        "DisplayName": false,
+        "DisplayLocationId": false,
+        "DisplayAddress": true,
+        "DisplayStreetAddress": false,
+        "DisplayDescription": false,
+        "SourceOfTruth": 1,
+        "Coordinates": {
+          "Latitude": 35.102180286824,
+          "Longitude": -106.571061847066
+        }
+      },
+      "Count": 4
+    },
+    {
+      "PhysicalLocation": {
+        "Id": "e2daadc0-4104-5c79-95e1-395be8b9b898",
+        "LocalizedName": "Ladera",
+        "LocalizedLocationId": null,
+        "LocalizedDescription": "Ladera",
+        "Address": {
+          "Line1": "3205 Coors NW",
+          "Line2": null,
+          "City": "Albuquerque",
+          "PostalCode": "87120",
+          "State": {
+            "Code": "NM",
+            "Name": "New Mexico"
+          },
+          "Country": {
+            "Code": "USA",
+            "Name": "United States"
+          }
+        },
+        "DisplayName": true,
+        "DisplayLocationId": false,
+        "DisplayAddress": true,
+        "DisplayStreetAddress": false,
+        "DisplayDescription": false,
+        "SourceOfTruth": 1,
+        "Coordinates": {
+          "Latitude": 35.11866105274557,
+          "Longitude": -106.70175436896706
+        }
+      },
+      "Count": 1
+    },
+    {
+      "PhysicalLocation": {
+        "Id": "b89efcef-3bd3-4594-bbbf-78a8f6983128",
+        "LocalizedName": "El Paso",
+        "LocalizedLocationId": null,
+        "LocalizedDescription": null,
+        "Address": {
+          "Line1": null,
+          "Line2": null,
+          "City": "El Paso",
+          "PostalCode": null,
+          "State": {
+            "Code": "TX",
+            "Name": "Texas"
+          },
+          "Country": {
+            "Code": "USA",
+            "Name": "United States"
+          }
+        },
+        "DisplayName": true,
+        "DisplayLocationId": false,
+        "DisplayAddress": true,
+        "DisplayStreetAddress": false,
+        "DisplayDescription": false,
+        "SourceOfTruth": 0,
+        "Coordinates": {
+          "Latitude": 31.759162781791062,
+          "Longitude": -106.48748593108596
+        }
+      },
+      "Count": 5
+    },
+    {
+      "PhysicalLocation": {
+        "Id": "acc36511-1493-53ca-8a13-3bf58506af6c",
+        "LocalizedName": null,
+        "LocalizedLocationId": null,
+        "LocalizedDescription": "Journal Center",
+        "Address": {
+          "Line1": "7644 Jefferson Street NE",
+          "Line2": null,
+          "City": "Albuquerque",
+          "PostalCode": "87109",
+          "State": {
+            "Code": "NM",
+            "Name": "New Mexico"
+          },
+          "Country": {
+            "Code": "USA",
+            "Name": "United States"
+          }
+        },
+        "DisplayName": false,
+        "DisplayLocationId": false,
+        "DisplayAddress": true,
+        "DisplayStreetAddress": false,
+        "DisplayDescription": false,
+        "SourceOfTruth": 1,
+        "Coordinates": {
+          "Latitude": 39.759999,
+          "Longitude": -98.499997
+        }
+      },
+      "Count": 1
+    },
+    {
+      "PhysicalLocation": {
+        "Id": "8893a20f-bb29-4fee-a744-e9e9253c4b7b",
+        "LocalizedName": "Darrington",
+        "LocalizedLocationId": null,
+        "LocalizedDescription": null,
+        "Address": {
+          "Line1": "13661 Eastlake Blvd",
+          "Line2": null,
+          "City": "Horizon City",
+          "PostalCode": "79928",
+          "State": {
+            "Code": "TX",
+            "Name": "Texas"
+          },
+          "Country": {
+            "Code": "USA",
+            "Name": "United States"
+          }
+        },
+        "DisplayName": false,
+        "DisplayLocationId": false,
+        "DisplayAddress": true,
+        "DisplayStreetAddress": false,
+        "DisplayDescription": false,
+        "SourceOfTruth": 0,
+        "Coordinates": {
+          "Latitude": 31.700180993276,
+          "Longitude": -106.214439024317
+        }
+      },
+      "Count": 1
+    },
+    {
+      "PhysicalLocation": {
+        "Id": "cc2f704e-76c0-4cfa-aae2-d33a71982941",
+        "LocalizedName": "Various",
+        "LocalizedLocationId": null,
+        "LocalizedDescription": null,
+        "Address": {
+          "Line1": null,
+          "Line2": null,
+          "City": "Albuquerque",
+          "PostalCode": null,
+          "State": {
+            "Code": "NM",
+            "Name": "New Mexico"
+          },
+          "Country": {
+            "Code": "USA",
+            "Name": "United States"
+          }
+        },
+        "DisplayName": true,
+        "DisplayLocationId": false,
+        "DisplayAddress": true,
+        "DisplayStreetAddress": false,
+        "DisplayDescription": false,
+        "SourceOfTruth": 0,
+        "Coordinates": {
+          "Latitude": 35.084232899720064,
+          "Longitude": -106.64904873196045
+        }
+      },
+      "Count": 1
+    },
+    {
+      "PhysicalLocation": {
+        "Id": "2242dc0f-e3f2-5d41-b8f5-cdd2d985af9c",
+        "LocalizedName": "Unser",
+        "LocalizedLocationId": null,
+        "LocalizedDescription": "Unser",
+        "Address": {
+          "Line1": "2001 Unser blvd SE",
+          "Line2": null,
+          "City": "Rio Rancho",
+          "PostalCode": "87124",
+          "State": {
+            "Code": "NM",
+            "Name": "New Mexico"
+          },
+          "Country": {
+            "Code": "USA",
+            "Name": "United States"
+          }
+        },
+        "DisplayName": true,
+        "DisplayLocationId": false,
+        "DisplayAddress": true,
+        "DisplayStreetAddress": false,
+        "DisplayDescription": false,
+        "SourceOfTruth": 1,
+        "Coordinates": {
+          "Latitude": 35.2908617276205,
+          "Longitude": -106.696983487512
+        }
+      },
+      "Count": 1
+    },
+    {
+      "PhysicalLocation": {
+        "Id": "dbcbbccc-618f-57b6-b140-44242d4c9a40",
+        "LocalizedName": "Taos",
+        "LocalizedLocationId": null,
+        "LocalizedDescription": "Taos",
+        "Address": {
+          "Line1": "630 Paseo Del Pueblo Sur",
+          "Line2": null,
+          "City": "Taos",
+          "PostalCode": "87571",
+          "State": {
+            "Code": "NM",
+            "Name": "New Mexico"
+          },
+          "Country": {
+            "Code": "USA",
+            "Name": "United States"
+          }
+        },
+        "DisplayName": false,
+        "DisplayLocationId": false,
+        "DisplayAddress": true,
+        "DisplayStreetAddress": false,
+        "DisplayDescription": true,
+        "SourceOfTruth": 1,
+        "Coordinates": {
+          "Latitude": 36.39424442315662,
+          "Longitude": -105.58022901136215
+        }
+      },
+      "Count": 1
+    }
+  ]
+}

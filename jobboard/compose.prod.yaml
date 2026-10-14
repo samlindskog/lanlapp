@@ -37,14 +37,17 @@ services:
       JOBBOARD_SECRET: ${JOBBOARD_SECRET}
       JOBBOARD_MCP_PORT: "8090"
       JOBBOARD_MCP_BIND: "0.0.0.0"          # inside the container; the host maps it to loopback for nginx
+      JOBSCAN_PROXY: ${JOBSCAN_PROXY:-}      # optional: http://user:pass@host:port (Decodo); empty = direct
+      JOBSCAN_PROXY_COUNTRIES: ${JOBSCAN_PROXY_COUNTRIES:-us,ca}   # exit countries cycled over the proxies
     ports:
       - "127.0.0.1:8080:8080"              # web + API: only via nginx (443)
       - "127.0.0.1:8091:8090"              # MCP: only via nginx (10.88.0.1:8090 over WireGuard)
     restart: unless-stopped
-    mem_limit: 512m
-    user: "65534:65534"                      # nobody: the app never writes to disk
+    mem_limit: 2g                            # Chromium (board scans) needs headroom
+    shm_size: 512m
+    user: "65534:65534"                      # nobody: the app writes only to /tmp (browser profile)
     read_only: true
-    tmpfs: [/tmp]
+    tmpfs: [/tmp:size=1g]
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
 

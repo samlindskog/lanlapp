@@ -17,5 +17,10 @@ Layout, API and operations are in README.md. What matters when changing things:
   and give the user the absolute remote path (a `~` expands locally).
 - **The image holds only `jobboard/` and `jobscan/`** (`.dockerignore` at the repo root). Anything the
   server needs at runtime must live in those two directories.
+- **Boards are registered by URL; adapters are per hosting platform** (`jobscan/sources/`, contract in
+  `__init__.py`). Adding an employer is an API/MCP call (`add_boards`), not code. A new platform is a new
+  adapter module + a fixture case in `tests/test_adapters.py` (captured from the live site, served by a stub).
+- **Fetching goes through Chrome** (`jobscan/browser.py`); `JOBSCAN_BROWSER=0` gives urllib for offline tests.
+  The image installs Chromium; the production container runs it read-only with `/tmp` as scratch.
 - No resumes, EXPERIENCE.md or other personal data belong in this repo; they live in the user's
   separate workspace and reach the service through the MCP tool `upload_resume`.

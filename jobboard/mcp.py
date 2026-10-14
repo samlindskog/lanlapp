@@ -23,7 +23,8 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {
          "verdict": {"type": "string", "description": "comma list of yes,maybe,no,none"},
          "action": {"type": "string", "description": "comma list of applied,drafted,none"},
-         "open_only": {"type": "boolean"}, "source": {"type": "string"}, "days": {"type": "integer"},
+         "open_only": {"type": "boolean"}, "source": {"type": "string", "description": "adapter name"},
+         "board": {"type": "string", "description": "board id or name"}, "days": {"type": "integer"},
          "pending_only": {"type": "boolean"}, "q": {"type": "string", "description": "substring over title/location/series/reason"},
          "limit": {"type": "integer", "default": 100}}}},
     {"name": "get_job", "description": "One job: fields, verdict/action history, and its primary document split into sections.",
@@ -32,10 +33,18 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {"id": {"type": "integer"}, "name": {"type": "string"}}, "required": ["id"]}},
     {"name": "search", "description": "Search stored postings. mode=keyword (AND terms, quotes for phrases, snippets) or mode=semantic (embedding similarity).",
      "inputSchema": {"type": "object", "properties": {"q": {"type": "string"}, "mode": {"type": "string", "enum": ["keyword", "semantic"], "default": "keyword"}, "limit": {"type": "integer", "default": 20}}, "required": ["q"]}},
-    {"name": "sources", "description": "Scan workflows (board adapters) available, with last scan info.",
+    {"name": "sources", "description": "Adapters (hosting platforms) available: name, display_name, kind (family = many employers, site = one board), boards registered, last scan.",
      "inputSchema": {"type": "object", "properties": {}}},
-    {"name": "scan", "description": "Start a background scan of a board; new/changed postings are embedded automatically. Returns a run id to poll with run_status.",
-     "inputSchema": {"type": "object", "properties": {"source": {"type": "string"}, "days": {"type": "integer", "default": 7}, "all": {"type": "boolean", "default": False}, "refetch": {"type": "boolean", "default": False}}, "required": ["source"]}},
+    {"name": "boards", "description": "Registered job boards: id, adapter, name, url, enabled, params (incl. include/exclude title regexes), jobs stored, last scan.",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "add_boards", "description": "Register job boards by URL (many at once). The backend picks the adapter for each URL (Workday, Oracle HCM, iCIMS, UKG, NEOGOV, Greenhouse, Eightfold, Yello/USACE ...), verifies the endpoint answers, and stores the board. Each item is a URL or {url, name, include, exclude}; include/exclude are title regexes applied at scan time (e.g. include 'analyst|account'). Returns per URL the board or the error.",
+     "inputSchema": {"type": "object", "properties": {"urls": {"type": "array", "items": {"anyOf": [{"type": "string"}, {"type": "object", "properties": {"url": {"type": "string"}, "name": {"type": "string"}, "include": {"type": "string"}, "exclude": {"type": "string"}, "adapter": {"type": "string"}}, "required": ["url"]}]}}}, "required": ["urls"]}},
+    {"name": "update_board", "description": "Rename, enable/disable, or change the title filters of a board.",
+     "inputSchema": {"type": "object", "properties": {"id": {"type": "integer"}, "name": {"type": "string"}, "enabled": {"type": "boolean"}, "include": {"type": "string"}, "exclude": {"type": "string"}}, "required": ["id"]}},
+    {"name": "delete_board", "description": "Remove a board; its jobs stay (detached from the board).",
+     "inputSchema": {"type": "object", "properties": {"id": {"type": "integer"}}, "required": ["id"]}},
+    {"name": "scan", "description": "Start a background scan: boards = list of board ids, or source = every board of one adapter, or neither = every enabled board. New/changed postings are embedded automatically. Returns a run id to poll with run_status.",
+     "inputSchema": {"type": "object", "properties": {"boards": {"type": "array", "items": {"type": "integer"}}, "source": {"type": "string"}, "days": {"type": "integer", "default": 7}, "all": {"type": "boolean", "default": False}, "refetch": {"type": "boolean", "default": False}}}},
     {"name": "run_status", "description": "Status, log and summary of a background run (scan/refresh).",
      "inputSchema": {"type": "object", "properties": {"run_id": {"type": "string"}}, "required": ["run_id"]}},
     {"name": "refresh", "description": "Re-fetch postings now (synchronous, up to 20 ids).",
@@ -58,7 +67,7 @@ TOOLS = [
 
 
 def make_handler(J, api):
-    """api: object with start_scan/get_run/active_run/sources/stats/authorized_bearer/read_log/list_runs/log_event."""
+    """api: object with start_scan/get_run/active_run/sources/boards/add_boards/stats/authorized_bearer/read_log/list_runs/log_event."""
 
     def call(name, args):
         conn = J.db()
@@ -69,9 +78,10 @@ def make_handler(J, api):
                 rows = J.list_jobs(conn, verdict=args.get("verdict"), action=args.get("action"),
                                    open_only=bool(args.get("open_only")), source=args.get("source"),
                                    days=args.get("days"), pending_only=bool(args.get("pending_only")),
-                                   q=args.get("q"))
+                                   q=args.get("q"), board=args.get("board"))
                 keep = ("id", "title", "location", "series", "pay_plan", "grade_low", "grade_high", "salary",
                         "open_date", "close_date", "external_url", "board_url", "announcement_no", "source",
+                        "board_id", "board_name",
                         "verdict", "eligible_grades", "verdict_reason", "verdict_author", "claude_verdict",
                         "action", "action_date", "resume_dir", "last_fetched", "embedded")
                 return {"count": len(rows), "jobs": [{k: r.get(k) for k in keep} for r in rows[: int(args.get("limit") or 100)]]}
@@ -87,14 +97,29 @@ def make_handler(J, api):
                 return {"mode": "keyword", "hits": J.search_documents(conn, args["q"], None, int(args.get("limit") or 20))}
             if name == "sources":
                 return {"sources": api.sources()}
+            if name == "boards":
+                return {"boards": api.boards()}
+            if name == "add_boards":
+                res = api.add_boards(args["urls"])
+                return {"results": res, "added": sum(1 for r in res if "board" in r)}
+            if name == "update_board":
+                return {"board": J.update_board(conn, int(args["id"]), name=args.get("name"), enabled=args.get("enabled"),
+                                                include=args.get("include"), exclude=args.get("exclude"))}
+            if name == "delete_board":
+                return {"deleted": J.delete_board(conn, int(args["id"]))}
             if name == "scan":
-                return api.start_scan(args["source"], int(args.get("days") or 7), bool(args.get("all")), bool(args.get("refetch")))
+                return api.start_scan(args.get("source"), int(args.get("days") or 7), bool(args.get("all")),
+                                      bool(args.get("refetch")), boards=[int(x) for x in args.get("boards") or []] or None)
             if name == "run_status":
                 return api.get_run(str(args["run_id"])) or {"error": "not found"}
             if name == "refresh":
                 out = []
-                for i in [int(x) for x in args["ids"]][:20]:
-                    out.append(J.refresh_job(conn, i, log=lambda m: None))
+                try:
+                    for i in [int(x) for x in args["ids"]][:20]:
+                        out.append(J.refresh_job(conn, i, log=lambda m: None))
+                finally:
+                    if not api.active_run():        # a running scan owns the browser
+                        J.close_browser()
                 return {"refreshed": out}
             if name == "set_verdict":
                 vid = J.record_verdict(conn, int(args["id"]), args["verdict"], args.get("grades"), args.get("reason"),

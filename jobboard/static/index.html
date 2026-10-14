@@ -53,6 +53,9 @@
   .muted { color: var(--muted); font-size: 12px; }
   .dlg-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 6px; }
   #scanStart { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .boardlist { max-height: 40vh; overflow: auto; border: 1px solid var(--border, #ddd); padding: 4px 8px; border-radius: 6px; }
+  .boardlist label.board { display: block; margin: 2px 0; }
+  #scanDlg form { min-width: min(42em, 90vw); }
   main { padding: 0 16px 40px; }
   table { width: 100%; border-collapse: collapse; margin-top: 10px; }
   th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
@@ -159,7 +162,7 @@
         <option value="week">closes within 7 days</option>
       </select>
     </div>
-    <div class="group"><span class="label">Source</span><select id="source"><option value="">all</option></select></div>
+    <div class="group"><span class="label">Board</span><select id="source"><option value="">all</option></select></div>
     <div class="group"><span class="label">Sort</span>
       <select id="sort">
         <option value="close_date:asc">closing date, soonest first</option>
@@ -188,9 +191,14 @@
 </header>
 <dialog id="scanDlg">
   <form method="dialog" id="scanForm">
-    <h3>Scan a job board</h3>
-    <label>Board / workflow<br><select name="source" id="scanSource"></select></label>
-    <div id="scanInfo" class="muted"></div>
+    <h3>Scan job boards</h3>
+    <div id="boardList" class="boardlist"></div>
+    <div class="muted" style="margin:4px 0 8px"><a href="#" id="boardsAll">all</a> · <a href="#" id="boardsNone">none</a></div>
+    <details id="addBoards"><summary>Add boards by URL</summary>
+      <textarea id="boardUrls" rows="3" placeholder="one board URL per line (Workday, Oracle HCM, iCIMS, UKG, NEOGOV, Greenhouse, Eightfold, Yello ...)" style="width:100%"></textarea>
+      <div class="muted">Optional title filters for the new boards: include <input type="text" id="boardInclude" placeholder="analyst|account|actuar" style="width:11em"> exclude <input type="text" id="boardExclude" placeholder="senior|director|manager" style="width:11em"></div>
+      <button type="button" id="boardAdd">Add</button> <span id="boardAddStatus" class="muted"></span>
+    </details>
     <label>Posted within the last <input type="number" name="days" min="1" max="365" value="7" style="width:5em"> days</label>
     <label class="chk"><input type="checkbox" name="all"> whole board (ignore days)</label>
     <label class="chk"><input type="checkbox" name="refetch"> re-fetch postings already stored</label>
@@ -267,10 +275,10 @@
       if (openness === "open" && c && c < today) return false;
       if (openness === "closed" && !(c && c < today)) return false;
       if (openness === "week" && !(c && c >= today && c <= week)) return false;
-      if (source && j.source !== source) return false;
+      if (source && (j.board_name || j.source) !== source) return false;
       if (state.semantic) { if (!(j.id in state.semantic)) return false; }
       else if (q) {
-        const hay = [j.title, j.location, j.series, j.verdict_reason, j.announcement_no, j.action_note, gradeOf(j)].join(" ").toLowerCase();
+        const hay = [j.title, j.location, j.board_name, j.series, j.verdict_reason, j.announcement_no, j.action_note, gradeOf(j)].join(" ").toLowerCase();
         if (!hay.includes(q)) return false;
       }
       return true;
@@ -338,7 +346,7 @@
         <td>${statusSelect(j, a)}${j.action_date ? `<br><small>${j.action_date}</small>` : ""}</td>
         <td class="title">${state.semantic ? `<span class="score" title="similarity">${(state.semantic[j.id] * 100).toFixed(0)}% · </span>` : ""}${esc(j.title)}<small>${esc(j.series || "")}${j.announcement_no ? " · " + esc(j.announcement_no) : ""}</small></td>
         <td class="hide-sm">${esc(gradeOf(j))}</td>
-        <td class="hide-sm">${esc((j.location || "").slice(0, 60))}</td>
+        <td class="hide-sm" title="${esc(j.board_name || j.source)}">${esc((j.location || "").slice(0, 60))}${j.board_name ? `<br><small class="muted">${esc(j.board_name.slice(0, 40))}</small>` : ""}</td>
         <td class="hide-sm fetched" title="${esc(fmtLocal(j.last_fetched))}">${esc(fmtAgo(j.last_fetched))}</td>
         <td class="hide-sm">${link ? `<a href="${esc(link)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">open ↗</a>` : ""}</td>
       </tr>` + (state.open === j.id ? detailRow(j) : "");
@@ -357,8 +365,8 @@
         <div>Note: <b>${esc(j.action_note || "—")}</b></div>
         <div>Opens / closes: <b>${esc(j.open_date || "?")} / ${esc(j.close_date || "?")}</b></div>
         <div>Salary: <b>${esc(j.salary || "—")}</b></div>
-        <div>Source: <b>${esc(j.source)}</b> · first seen ${esc(fmtLocal(j.first_seen, true))}</div>
-        <div>Links: ${j.external_url ? `<a href="${esc(j.external_url)}" target="_blank" rel="noopener">USAJOBS</a>` : ""} ${j.board_url ? `<a href="${esc(j.board_url)}" target="_blank" rel="noopener">board</a>` : ""}</div>
+        <div>Board: <b>${esc(j.board_name || j.source)}</b> <small>(${esc(j.source)})</small> · first seen ${esc(fmtLocal(j.first_seen, true))}</div>
+        <div>Links: ${j.external_url ? `<a href="${esc(j.external_url)}" target="_blank" rel="noopener">${/usajobs\.gov/.test(j.external_url) ? "USAJOBS" : "posting"}</a>` : ""} ${j.board_url && j.board_url !== j.external_url ? `<a href="${esc(j.board_url)}" target="_blank" rel="noopener">board</a>` : ""}</div>
         <div>Last fetched: <b>${esc(fmtLocal(j.last_fetched) || "—")}</b>
              <button data-act="refresh" data-id="${j.id}" style="margin-left:6px">Refresh posting</button></div>
       </div>
@@ -442,7 +450,7 @@
     if (r.status === 401) { location.href = "/login.html?next=" + encodeURIComponent(location.pathname); return {jobs: []}; }
     const d = await r.json();
     state.jobs = d.jobs;
-    const sources = [...new Set(d.jobs.map((j) => j.source))].sort();
+    const sources = [...new Set(d.jobs.map((j) => j.board_name || j.source))].sort();
     const cur = $("#source").value;
     $("#source").innerHTML = '<option value="">all</option>' + sources.map((s) => `<option value="${esc(s)}">${esc(s)}</option>`).join("");
     $("#source").value = cur;
@@ -467,27 +475,45 @@
     if (r.status === "running") pollTimer = setTimeout(() => pollRun(id), 1500);
     else { reload(); }
   }
-  let sources = [];
+  let boards = [];
+  function renderBoards() {
+    $("#boardList").innerHTML = boards.length ? boards.map((b) => {
+      const ls = b.last_scan;
+      const when = ls ? `${fmtAgo(ls.started_at)}${ls.status === "failed" ? " · failed" : ls.new != null ? ` · ${ls.new} new` : ""}` : "never scanned";
+      return `<label class="chk board"><input type="checkbox" name="board" value="${b.id}" ${b.enabled ? "checked" : ""}>
+        <b>${esc(b.name)}</b> <small class="muted">${esc(b.adapter)} · ${b.jobs} jobs · ${esc(when)}</small>
+        <a href="${esc(b.url)}" target="_blank" rel="noopener" title="${esc(b.url)}">↗</a></label>`;
+    }).join("") : `<div class="muted">No boards yet. Add one by URL below.</div>`;
+  }
   async function loadSources() {
-    sources = (await (await fetch("/api/sources")).json()).sources;
-    $("#scanSource").innerHTML = sources.map((s) => `<option value="${esc(s.name)}">${esc(s.display_name)}</option>`).join("");
-    showSourceInfo();
+    boards = (await (await fetch("/api/boards")).json()).boards;
+    renderBoards();
   }
-  function showSourceInfo() {
-    const s = sources.find((x) => x.name === $("#scanSource").value); if (!s) return;
-    const ls = s.last_scan;
-    const when = ls ? `last scan ${fmtLocal(ls.started_at)} (${ls.status}${ls.summary ? `: ${ls.summary.new} new, ${ls.summary.known} known` : ""})` : "never scanned";
-    $("#scanInfo").innerHTML = `${s.board_url ? `<a href="${esc(s.board_url)}" target="_blank" rel="noopener">${esc(s.board_url)}</a><br>` : ""}${esc(when)}`;
-  }
-  $("#scanSource").addEventListener("change", showSourceInfo);
+  $("#boardsAll").addEventListener("click", (e) => { e.preventDefault(); document.querySelectorAll('input[name="board"]').forEach((i) => { i.checked = true; }); });
+  $("#boardsNone").addEventListener("click", (e) => { e.preventDefault(); document.querySelectorAll('input[name="board"]').forEach((i) => { i.checked = false; }); });
+  $("#boardAdd").addEventListener("click", async () => {
+    const urls = $("#boardUrls").value.split("\n").map((x) => x.trim()).filter(Boolean);
+    if (!urls.length) return;
+    const inc = $("#boardInclude").value.trim(), exc = $("#boardExclude").value.trim();
+    $("#boardAddStatus").textContent = `adding ${urls.length}…`;
+    try {
+      const d = await post("/api/boards", { urls: urls.map((url) => ({ url, include: inc || undefined, exclude: exc || undefined })) });
+      const bad = d.results.filter((r) => r.error);
+      $("#boardAddStatus").textContent = `${d.added} added` + (bad.length ? `; ${bad.length} failed: ` + bad.map((r) => `${r.url} (${r.error})`).join("; ") : "");
+      if (d.added) $("#boardUrls").value = bad.map((r) => r.url).join("\n");
+      await loadSources();
+    } catch (e) { $("#boardAddStatus").textContent = `failed: ${e.message}`; }
+  });
   $("#scan").addEventListener("click", async () => { await loadSources(); $("#scanDlg").showModal(); });
   $("#scanCancel").addEventListener("click", () => $("#scanDlg").close());
   $("#scanForm").addEventListener("submit", async (e) => {
     e.preventDefault();
     const f = new FormData(e.target);
-    const body = { source: f.get("source"), days: Number(f.get("days") || 7), all: !!f.get("all"), refetch: !!f.get("refetch") };
+    const ids = [...document.querySelectorAll('input[name="board"]:checked')].map((i) => Number(i.value));
+    if (!ids.length) { setRun("failed", "scan: no board selected"); return; }
+    const body = { boards: ids, days: Number(f.get("days") || 7), all: !!f.get("all"), refetch: !!f.get("refetch") };
     $("#scanDlg").close();
-    setRun("running", `scan ${body.source}: starting…`);
+    setRun("running", `scan ${ids.length} board(s): starting…`);
     try { const d = await post("/api/scan", body); pollRun(d.run_id); }
     catch (err) { setRun("failed", `scan failed: ${err.message}`); }
   });

@@ -8,7 +8,10 @@ is synced through this repo.
 ```
 jobscan/             job posting tracker (PostgreSQL + pgvector, runs in the compose stack)
   jobscan.py           CLI + library: scan boards, judge, report, record applications, embed, search
-  sources/             one adapter per job board (usace_yellogov.py, ...)
+  browser.py           fetch layer: Chrome via Selenium + undetected-chromedriver, optional proxy; urllib fallback
+  sources/             one adapter per hosting platform: families (workday, oracle_hcm, icims, icims_jibe,
+                       ukg, neogov, greenhouse, eightfold) and single sites (usace_yellogov); __init__.py
+                       detects the adapter for a board URL; _util.py shared helpers
 jobboard/            shared research service over the database
   server.py            web page for the human, JSON API for Claude (GET /api lists it)
   auth.py, mcp.py      password/session/token auth; MCP server (JSON-RPC over HTTP) for Claude Code
@@ -45,7 +48,10 @@ API in one minute (full list at http://localhost:8080/api):
 curl -s localhost:8080/api/stats
 curl -s 'localhost:8080/api/jobs?verdict=yes,maybe&open=1'
 curl -s 'localhost:8080/api/search?q=budget+analyst'
-curl -s -X POST localhost:8080/api/scan -H 'Content-Type: application/json' -d '{"source":"usace_yellogov","days":7}'
+curl -s -X POST localhost:8080/api/boards -H 'Content-Type: application/json' \
+     -d '{"urls":["https://bernco.wd1.myworkdayjobs.com/berncocareers", {"url":"https://www.governmentjobs.com/careers/cabq","include":"analyst|fiscal|budget"}]}'
+curl -s localhost:8080/api/boards
+curl -s -X POST localhost:8080/api/scan -H 'Content-Type: application/json' -d '{"boards":[1,2],"days":7}'   # omit boards: every enabled board
 curl -s -X POST localhost:8080/api/jobs/ID/verdict -H 'Content-Type: application/json' -d '{"verdict":"yes","grades":"GS-5/7","reason":"..."}'
 curl -s -X POST localhost:8080/api/jobs/ID/action  -H 'Content-Type: application/json' -d '{"action":"applied","resume_dir":"applications/..."}'
 ```
@@ -56,7 +62,9 @@ current automatically: after scans, refreshes and manual adds, and a hash-based 
 CLI equivalents (from the repo root; needs `pip install "psycopg[binary]"` and the dev db container up):
 
 ```
-python3 jobscan/jobscan.py scan --source usace_yellogov --days 7
+python3 jobscan/jobscan.py boards --add https://bernco.wd1.myworkdayjobs.com/berncocareers --include 'analyst|budget'
+python3 jobscan/jobscan.py boards                       # registered boards
+python3 jobscan/jobscan.py scan --days 7                # every enabled board; --board ID or --source workday to narrow
 python3 jobscan/jobscan.py report --open-only
 python3 jobscan/jobscan.py mark <id> applied --date YYYY-MM-DD --resume-dir applications/<dir>
 python3 jobscan/jobscan.py apps
@@ -95,5 +103,32 @@ gunzip -c jobscan-backup.sql.gz | docker compose -f jobboard/compose.yaml exec -
 - One-time server setup: `deploy/bootstrap.sh` (see its header). Firewall input policy: ssh, WireGuard, 443, MCP on wg0.
   Re-runnable; also restores `/tmp/jobscan-dump.sql.gz` into an empty database. Secrets: `deploy/push-secrets.sh`.
 - Claude's token lives in `~/.config/jobboard/token` on the Mac; the MCP server is registered in Claude Code as `jobboard`.
-- MCP tools: stats, list_jobs, get_job, get_section, search, sources, scan, run_status, refresh, set_verdict,
-  set_status, add_job, upload_resume, list_resumes, logs, runs.
+- MCP tools: stats, list_jobs, get_job, get_section, search, sources, boards, add_boards, update_board,
+  delete_board, scan, run_status, refresh, set_verdict, set_status, add_job, upload_resume, list_resumes, logs, runs.
+
+## Boards, adapters and the browser
+
+A *board* is one job site registered by URL (`POST /api/boards`, MCP `add_boards`, CLI `boards --add`).
+The backend picks the *adapter* for the URL: first by URL pattern, then by fetching the page and
+probing (Jibe `/api/jobs`, Eightfold's domain) or following the links it finds (a careers page that
+links to its Workday board). Family adapters cover a hosting platform for any employer; a site
+adapter (USACE on Yello) covers one board. Each board can carry `include` / `exclude` regexes on
+posting titles so a 4,000-job Workday tenant only yields the analyst roles. A scan walks any set of
+boards in one run; the web page's Scan dialog lists them with checkboxes and an add-by-URL box.
+
+Pages are fetched through a real Chrome (`jobscan/browser.py`: Selenium + undetected-chromedriver,
+Chromium in the image) so sites behind Cloudflare and JSON backends that expect a session work.
+JSON and POST calls run as `fetch()` inside a page of the same origin. One Chrome lives for the
+whole run (sockets and proxy tunnels are reused; images, fonts and media are off) and restarts only
+when the proxy must change. `JOBSCAN_BROWSER=0` forces plain HTTP with a keep-alive pool (CI, tests).
+
+Proxy: every host is tried direct first. A 403/429/503 or a Cloudflare challenge that never clears
+escalates that host to the proxy, then to fresh proxy sessions, `JOBSCAN_PROXY_TRIES` (3) in all;
+after that the host is blocked for the rest of the run and the scan moves on. `JOBSCAN_PROXY` lists
+the proxies, one per level, as `host:port:user:pass` or `http://user:pass@host:port` entries separated
+by commas (Decodo's sticky-port endpoint list pastes straight in: each port is its own IP), or one URL
+with `{session}` in the username for session-based gateways; leave it empty for direct only.
+`JOBSCAN_PROXY_COUNTRIES` (compose default `us,ca`) pins exit countries by rewriting each username to
+Decodo's `user-<name>-country-<cc>` form, cycling the list across the proxies. Plain
+HTTP (the fallback and tests) goes through curl_cffi impersonating Chrome's TLS/HTTP2 fingerprint;
+the browser path is real Chromium, so its fingerprint is Chrome's own.

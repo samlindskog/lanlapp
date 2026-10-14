@@ -1,17 +1,11 @@
-"""Adapter: USACE Talent Acquisition job board on Yello (usace.yellogov.com).
+"""Site adapter: the USACE Talent Acquisition job board on Yello (usace.yellogov.com).
 
 Board cards come from a JSON endpoint; each posting page carries the USAJOBS
 announcement number and an Apply link straight to the USAJOBS control-number
-URL, where the real duties/qualifications live.
-
-Adapter contract (used by jobscan.py and jobboard/server.py):
-    DISPLAY_NAME, BOARD_URL
-    PRIMARY_KIND   document kind that holds the real description (shown first)
-    KEY_SECTION    section name that decides eligibility (previewed, judged)
-    list_jobs(fetch, since_days, max_pages) -> [card dict]
-    fetch_job(fetch, card)                  -> [document dict]
-    parse_fields(card, docs)                -> dict of common job fields
-    sections(text, kind)                    -> ordered {name: text} for a document
+URL, where the real duties/qualifications live. match() accepts any
+<x>.yellogov.com/job_boards/<id> URL, so another agency's Yello board would work
+too, but the USAJOBS hand-off is what this adapter is built around.
+See sources/__init__.py for the adapter contract.
 """
 import datetime as dt
 import html
@@ -21,14 +15,35 @@ import sys
 
 sys.path.insert(0, __file__.rsplit("/sources/", 1)[0])
 from jobscan import html_to_text  # noqa: E402
+from sources._util import split_url  # noqa: E402
 
 BOARD_ID = "rHrorPQ_B8HbgbWJDca8Ng"
 BASE = "https://usace.yellogov.com"
 BOARD_URL = f"{BASE}/job_boards/{BOARD_ID}"
 DISPLAY_NAME = "USACE Talent Acquisition (Yello)"
-SEARCH_URL = f"{BOARD_URL}/search?page_number={{page}}"
+KIND = "site"
 PRIMARY_KIND = "usajobs_announcement"
 KEY_SECTION = "Qualifications"
+
+BOARD_RE = re.compile(r"^/job_boards/([A-Za-z0-9_-]+)")
+
+
+def match(url):
+    u = split_url(url)
+    m = BOARD_RE.match(u.path)
+    if not u.netloc.endswith(".yellogov.com") or not m:
+        return None
+    base = f"https://{u.netloc}"
+    org = u.netloc.split(".")[0]
+    return {"key": f"yello:{u.netloc}/{m.group(1)}",
+            "name": "USACE Talent Acquisition" if org == "usace" else f"{org.upper()} (Yello)",
+            "url": f"{base}/job_boards/{m.group(1)}",
+            "params": {"base": base, "board_id": m.group(1)}}
+
+
+def _search_url(board, page):
+    p = board["params"]
+    return f"{p['base']}/job_boards/{p['board_id']}/search?page_number={page}"
 
 # Top-level headings on a USAJOBS announcement page, in page order. The text
 # extractor emits each as a line on its own.
@@ -92,10 +107,11 @@ def age_to_days(s, today=None):
     return None
 
 
-def list_jobs(fetch, since_days=None, max_pages=100):
+def list_jobs(fetch, board, since_days=None, max_pages=100):
     cards, seen = [], set()
+    base = board["params"]["base"]
     for page in range(1, max_pages + 1):
-        status, body = fetch(SEARCH_URL.format(page=page), accept="application/json")
+        status, body = fetch(_search_url(board, page), accept="application/json")
         if status != 200 or not body:
             break
         try:
@@ -115,7 +131,7 @@ def list_jobs(fetch, since_days=None, max_pages=100):
                 "announcement_type": html.unescape(m.group("type")).strip(),
                 "age_text": m.group("age").strip(),
                 "age_days": age_to_days(m.group("age")),
-                "board_url": f"{BASE}{html.unescape(m.group('href'))}",
+                "board_url": f"{base}{html.unescape(m.group('href'))}",
                 "card_html": m.group(0),
             })
         if not page_cards:
@@ -141,7 +157,7 @@ ANN_RE = re.compile(r"(?<![0-9-])[A-Z]{4}-\d{2}-\d{6,9}(?:-[A-Z0-9]+)?\b")
 USAJOBS_RE = re.compile(r'href="(https://www\.usajobs\.gov(?::443)?/job/(\d+)[^"]*)"')
 
 
-def fetch_job(fetch, card):
+def fetch_job(fetch, board, card):
     docs = [{"kind": "board_card", "url": card["board_url"],
              "raw_html": card["card_html"], "text": html_to_text(card["card_html"])}]
     status, body = fetch(card["board_url"])
@@ -180,7 +196,7 @@ def _iso(d):
     return m.group(1) if m else d
 
 
-def parse_fields(card, docs):
+def parse_fields(board, card, docs):
     f = {"title": card["title"], "location": card["location"],
          "board_url": card["board_url"], "external_url": None,
          "announcement_no": None, "series": None, "pay_plan": None,
