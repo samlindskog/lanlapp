@@ -239,24 +239,204 @@
       + '<option value="source:manual">manual</option>';
     $("#source").value = cur;
   }
-  // One status line in the header for every background activity: scans, bulk
-  // refreshes and single-posting refreshes all report here in the same style.
-  // Finished ("done") messages fade out after a few seconds; running and failed stay.
+  // ---------------------------------------------------------------- runs, live
+  // The server streams events (/api/events/stream): its own log lines and every update of a
+  // background run (a log line, a progress change, a status change). The one-liner in the header
+  // shows the latest of whatever is happening; while a run is active it owns the line (headline
+  // + progress bar + cancel), and clicking it opens the run panel: the board and posting in
+  // flight, the counters, and the full log as it streams in. Local UI actions (verdicts, bulk
+  // status, single refresh) still report through setRun.
+  //   runState.run  - the run the stream follows (the active one, or the last one seen)
+  //   runState.view - a run picked in the panel's dropdown to read instead; null = same as run
+  const runState = { run: null, view: null, open: false, follow: true, pending: null, queue: [], recent: [] };
   let clearTimer = null;
+  const FADES = new Set(["done", "info", "warn"]);
   const setRun = (status, text) => {
     const el = $("#run"); clearTimeout(clearTimer);
     el.className = "runstat " + status; el.textContent = text;
-    if (status === "done") clearTimer = setTimeout(() => { el.classList.add("fade"); clearTimer = setTimeout(() => { el.textContent = ""; el.className = "runstat"; }, 600); }, 2500);
+    if (FADES.has(status)) clearTimer = setTimeout(() => {
+      el.classList.add("fade");
+      clearTimer = setTimeout(() => { if (isRunning()) renderRunLine(); else { el.textContent = ""; el.className = "runstat"; } }, 600);
+    }, 2500);
   };
-  let pollTimer = null;
-  async function pollRun(id) {
-    clearTimeout(pollTimer);
-    const r = await (await fetch(`/api/runs/${id}`)).json();
-    const last = (r.log || "").trim().split("\n").pop() || "";
-    setRun(r.status, `${r.kind} ${r.status}: ${last}`);
-    if (r.status === "running") pollTimer = setTimeout(() => pollRun(id), 1500);
-    else { reload(); }
+  const isRunning = () => !!(runState.run && runState.run.status === "running");
+  const fmtElapsed = (a, b) => {
+    const s = Math.max(0, Math.round((new Date(b || Date.now()) - new Date(a)) / 1000)); if (isNaN(s)) return "";
+    const p = (n) => String(n).padStart(2, "0");
+    return s < 60 ? `${s}s` : s < 3600 ? `${Math.floor(s / 60)}m${p(s % 60)}s` : `${Math.floor(s / 3600)}h${p(Math.floor(s % 3600 / 60))}m`;
+  };
+  const parseJSON = (v, dflt) => { if (v == null) return dflt; if (typeof v !== "string") return v; try { return JSON.parse(v); } catch { return dflt; } };
+
+  // How far along a run is, 0..1, or null when it cannot be known (listing a board, no totals yet).
+  function fraction(r) {
+    const p = r.progress || {};
+    if (r.status !== "running") return r.status === "done" ? 1 : null;
+    if (r.kind === "scan" && p.boards_total) {
+      const finished = (p.boards_done || 0) + (p.boards_failed || 0);
+      const within = p.phase === "listing" ? 0 : p.cards ? Math.min(1, (p.job_index || 0) / p.cards) : p.phase === "embedding" ? 1 : 0;
+      return Math.min(1, (finished + (finished < p.boards_total ? within : 0)) / p.boards_total);
+    }
+    if (r.kind === "refresh" && p.total) return Math.min(1, (p.job_index || 0) / p.total);
+    return null;
   }
+  // "scan · Northrop Grumman 3/7 · 12/40": what the one-liner puts in front of the latest log line.
+  function headline(r) {
+    const p = r.progress || {};
+    if (r.kind === "scan") {
+      const where = p.board ? `${p.board}${p.boards_total ? ` ${p.board_index}/${p.boards_total}` : ""}` : "";
+      const jobs = p.phase === "listing" ? "listing" : p.phase === "embedding" ? "embedding" : p.cards ? `${p.job_index || 0}/${p.cards}` : "";
+      return ["scan", where, jobs].filter(Boolean).join(" · ");
+    }
+    if (r.kind === "refresh") return `refresh ${p.job_index || 0}/${p.total || "?"}`;
+    return r.kind;
+  }
+  function renderRunLine() {
+    const r = runState.run, bar = $("#runBar"), x = $("#runCancel");
+    if (!r) { bar.hidden = true; x.hidden = true; return; }
+    const running = r.status === "running", f = fraction(r);
+    x.hidden = !running; x.disabled = !!r.cancel_requested; x.title = r.cancel_requested ? "cancelling…" : "Cancel this run";
+    bar.hidden = !running; bar.classList.toggle("indeterminate", running && f == null);
+    bar.firstElementChild.style.width = f == null ? "0%" : `${Math.round(f * 100)}%`;
+    const last = (r.lines.length ? r.lines[r.lines.length - 1] : "").trim();
+    if (running) setRun("running", `${r.cancel_requested ? "cancelling · " : ""}${headline(r)}: ${last}`);
+    else setRun(r.status, `${r.kind} ${r.status}: ${last}`);
+  }
+  function renderPanel() {
+    const panel = $("#runPanel"); panel.hidden = !runState.open; if (!runState.open) return;
+    const r = runState.view || runState.run, pick = $("#rpPick");
+    const opts = runState.recent.slice();
+    if (r && !opts.some((x) => String(x.id) === String(r.id))) opts.unshift(r);
+    pick.innerHTML = opts.map((x) => `<option value="${esc(x.id)}" ${r && String(x.id) === String(r.id) ? "selected" : ""}>${esc(x.kind)} ${esc(x.id)} · ${esc(fmtLocal(x.started_at))} · ${esc(x.status)}</option>`).join("")
+      || '<option value="">no runs yet</option>';
+    const log = $("#rpLog");
+    if (!r) { $("#rpStatus").textContent = ""; $("#rpElapsed").textContent = ""; $("#rpArgs").textContent = "nothing has run yet"; $("#rpStats").innerHTML = ""; $("#rpBar").hidden = true; $("#rpCancel").hidden = true; log.textContent = ""; return; }
+    const p = r.progress || {}, sm = parseJSON(r.summary, {}) || {}, a = parseJSON(r.args, {}) || {};
+    const running = r.status === "running";
+    $("#rpStatus").textContent = r.status + (running && r.cancel_requested ? " · cancelling" : "");
+    $("#rpStatus").className = "rp-status " + r.status;
+    $("#rpElapsed").textContent = fmtElapsed(r.started_at, r.finished_at) + (running ? " elapsed" : "");
+    $("#rpCancel").hidden = !running; $("#rpCancel").disabled = !!r.cancel_requested;
+    $("#rpArgs").textContent = r.kind === "scan"
+      ? `${(a.names || a.boards || []).length} board(s): ${(a.names || []).join(", ")} · ${a.all ? "whole board" : `last ${a.days} days`}${a.refetch ? " · re-fetching stored postings" : ""}`
+      : r.kind === "refresh" ? `${(a.ids || []).length} posting(s)` : "";
+    const cell = (label, v, cls = "") => v == null || v === "" ? "" : `<div class="${cls}">${label} <b>${esc(v)}</b></div>`;
+    let cells;
+    if (r.kind === "scan") {
+      const total = p.boards_total ?? (sm.boards ? sm.boards.length + (sm.failed || []).length : null);
+      const finished = (p.boards_done || 0) + (p.boards_failed || 0);
+      const queuedCards = running && p.cards != null && p.phase !== "listing" ? Math.max(0, p.cards - (p.job_index || 0)) : null;
+      const boardsLeft = running && total != null ? Math.max(0, total - finished - (p.board ? 1 : 0)) : null;
+      cells = cell("Board", p.board ? `${p.board_index}/${total} · ${p.board}${p.platform ? ` (${p.platform})` : ""}` : total != null ? `${finished || (sm.boards || []).length}/${total} done` : null, "span")
+        + cell("Posting", p.job_title ? `${p.job_index}/${p.cards} · ${p.job_title}` : p.phase === "listing" ? "listing the board's cards…" : p.phase === "embedding" ? "embedding new text…" : null, "span")
+        + cell("Cards listed", p.cards_total ?? sm.cards)
+        + cell("Pages fetched", p.fetched)
+        + cell("New", p.new ?? sm.new)
+        + cell("Already known", p.known ?? sm.known)
+        + cell("Re-fetched", p.refetched)
+        + cell("Verdicts carried", p.carried ?? sm.carried)
+        + cell("Embedded", p.embedded ?? sm.embedded)
+        + cell("No page (skipped)", p.skipped)
+        + cell("Queued", queuedCards != null ? `${queuedCards} card(s)${boardsLeft ? ` + ${boardsLeft} board(s)` : ""}` : null)
+        + cell("Boards failed", p.boards_failed ?? (sm.failed ? sm.failed.length : null))
+        + cell("Need judgment", sm.need_judgment ? sm.need_judgment.length : null);
+    } else {
+      cells = cell("Posting", p.job_title ? `${p.job_index}/${p.total} · ${p.job_title}` : p.phase === "embedding" ? "embedding changed text…" : null, "span")
+        + cell("Refreshed", p.refreshed ?? sm.refreshed) + cell("Failed", p.failed ?? sm.failed) + cell("Embedded", p.embedded ?? sm.embedded);
+    }
+    $("#rpStats").innerHTML = cells;
+    const f = fraction(r), bar = $("#rpBar");
+    bar.hidden = !running; bar.classList.toggle("indeterminate", running && f == null);
+    bar.firstElementChild.style.width = f == null ? "0%" : `${Math.round(f * 100)}%`;
+    // The log: append only what is new, so reading while it grows keeps the scroll position.
+    const shown = log.dataset.run === String(r.id) ? Number(log.dataset.n || 0) : 0;
+    if (shown === 0 || shown > r.lines.length) { log.textContent = r.lines.join("\n"); runState.follow = true; }
+    else if (r.lines.length > shown) log.append(document.createTextNode("\n" + r.lines.slice(shown).join("\n")));
+    log.dataset.run = String(r.id); log.dataset.n = String(r.lines.length);
+    if (runState.follow) log.scrollTop = log.scrollHeight;
+  }
+  $("#rpLog").addEventListener("scroll", () => { const l = $("#rpLog"); runState.follow = l.scrollHeight - l.scrollTop - l.clientHeight < 30; });
+  setInterval(() => { if (runState.open && isRunning() && !runState.view) $("#rpElapsed").textContent = fmtElapsed(runState.run.started_at) + " elapsed"; }, 1000);
+
+  async function fetchRun(id) {
+    const r = await fetch(`/api/runs/${encodeURIComponent(id)}`);
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.statusText);
+    const d = await r.json();
+    d.lines = d.log ? d.log.split("\n") : [];
+    d.n = d.line_count ?? d.lines.length;          // entries the server has logged (one may span lines)
+    return d;
+  }
+  // Follow a run: its log so far from the API, every later line and progress change from the stream.
+  function watchRun(id) {
+    const p = runState.pending = fetchRun(id).then((d) => {
+      if (runState.pending !== p) return;
+      runState.pending = null;
+      if (runState.view && String(runState.view.id) === String(d.id)) runState.view = null;
+      runState.run = d;
+      const q = runState.queue; runState.queue = [];
+      q.forEach(applyEvent);
+      renderRunLine(); renderPanel();
+    }).catch((e) => { if (runState.pending === p) runState.pending = null; setRun("failed", `run ${id}: ${e.message}`); });
+    return p;
+  }
+  function applyEvent(ev) {
+    const r = runState.run;
+    if (runState.pending) { runState.queue.push(ev); return; }
+    if (!r || String(r.id) !== String(ev.run)) {       // a run we do not know (started here, via MCP, or before the page loaded)
+      runState.queue = [ev]; watchRun(ev.run); return;
+    }
+    const wasRunning = r.status === "running";
+    if (ev.line != null) {
+      if (ev.line_no === r.n + 1) { r.lines.push(...String(ev.line).split("\n")); r.n++; }
+      else if (ev.line_no > r.n + 1) { runState.queue = [ev]; watchRun(r.id); return; }   // missed some: resync
+    }
+    if (ev.progress) r.progress = ev.progress;
+    r.status = ev.status; r.cancel_requested = ev.cancel_requested;
+    if (ev.summary) r.summary = ev.summary;
+    if (wasRunning && r.status !== "running") { r.finished_at = ev.t; reload(); loadRecent(); }
+    renderRunLine(); renderPanel();
+  }
+  function onLogEvent(ev) {
+    if (ev.run != null || isRunning()) return;       // run lines come through the run itself; a run owns the line
+    setRun(ev.level === "error" ? "error" : ev.level === "warn" ? "warn" : "info", String(ev.msg).split("\n")[0]);
+  }
+  function connectEvents() {
+    const es = new EventSource("/api/events/stream");
+    es.onmessage = (e) => {
+      let ev; try { ev = JSON.parse(e.data); } catch { return; }
+      if (ev.kind === "run") applyEvent(ev); else if (ev.kind === "log") onLogEvent(ev);
+    };
+    // Reconnects happen by themselves (Last-Event-ID resumes); after one, resync the run we follow.
+    let first = true;
+    es.onopen = () => { if (!first && isRunning()) watchRun(runState.run.id); first = false; };
+  }
+  async function cancelRun() {
+    const r = runState.run; if (!r || r.status !== "running") return;
+    $("#runCancel").disabled = true; $("#rpCancel").disabled = true;
+    try { await post(`/api/runs/${encodeURIComponent(r.id)}/cancel`); }
+    catch (e) { setRun("failed", `cancel failed: ${e.message}`); $("#runCancel").disabled = false; $("#rpCancel").disabled = false; }
+  }
+  async function loadRecent() {
+    try { runState.recent = (await (await fetch("/api/runs?limit=15")).json()).runs || []; } catch { /* keep what we have */ }
+    renderPanel();
+  }
+  async function openPanel() {
+    runState.open = true; renderPanel();
+    await loadRecent();
+    if (!runState.run && !runState.view && runState.recent.length) {   // nothing live: show the last run
+      try { runState.view = await fetchRun(runState.recent[0].id); } catch { /* panel shows the list only */ }
+      renderPanel();
+    }
+  }
+  $("#run").addEventListener("click", openPanel);
+  $("#rpClose").addEventListener("click", () => { runState.open = false; runState.view = null; renderPanel(); });
+  $("#rpPick").addEventListener("change", async (e) => {
+    const id = e.target.value; if (!id) return;
+    if (runState.run && String(runState.run.id) === id) { runState.view = null; renderPanel(); return; }
+    try { runState.view = await fetchRun(id); } catch (err) { setRun("failed", `run ${id}: ${err.message}`); }
+    renderPanel();
+  });
+  $("#runCancel").addEventListener("click", cancelRun);
+  $("#rpCancel").addEventListener("click", cancelRun);
   let boards = [];
   function renderBoards() {
     $("#boardList").innerHTML = boards.length ? boards.map((b) => {
@@ -297,14 +477,14 @@
     const body = { boards: ids, days: Number(f.get("days") || 7), all: !!f.get("all"), refetch: !!f.get("refetch") };
     $("#scanDlg").close();
     setRun("running", `scan ${ids.length} board(s): starting…`);
-    try { const d = await post("/api/scan", body); pollRun(d.run_id); }
+    try { const d = await post("/api/scan", body); watchRun(d.run_id); }
     catch (err) { setRun("failed", `scan failed: ${err.message}`); }
   });
   $("#refreshAll").addEventListener("click", async () => {
     const ids = listed().filter((j) => j.external_url || j.board_url).map((j) => j.id);
     if (!ids.length) { setRun("failed", "refresh: nothing listed to refresh"); return; }
     setRun("running", `refresh ${ids.length} listed posting(s): starting…`);
-    try { const d = await post("/api/refresh", { ids }); pollRun(d.run_id); }
+    try { const d = await post("/api/refresh", { ids }); watchRun(d.run_id); }
     catch (e) { setRun("failed", `refresh failed: ${e.message}`); }
   });
   $("#rows").addEventListener("click", async (e) => {
@@ -416,7 +596,8 @@
   fetch("/api/auth/me").then((r) => r.json()).then((m) => { if (m.via === "session") $("#logout").hidden = false; }).catch(() => {});
   $("#logout").addEventListener("click", async (e) => { e.preventDefault(); await fetch("/api/auth/logout", { method: "POST" }); location.href = "/login.html"; });
   loadBoardFilter();
+  connectEvents();
   reload().then((d) => {
-    if (d.active_run) pollRun(d.active_run.id);
+    if (d.active_run && d.active_run.kind !== "sync") watchRun(d.active_run.id);
   }).catch((e) => { $("#rows").innerHTML = `<tr><td colspan="10">failed to load /api/jobs: ${esc(e)}</td></tr>`; });
 })();

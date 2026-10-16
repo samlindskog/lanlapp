@@ -34,9 +34,15 @@ Agent API  : JSON over HTTP, documented at GET /api  (also in .claude/skills/job
   POST /api/scan                  {boards?:[id..], source?, days?:7, all?:false, refetch?:false} -> {run_id}
                                   (boards = ids; source = every board of one adapter; neither = all enabled)
   POST /api/refresh               {ids?:[..]} or {filter:"open-qualifying"}       -> {run_id}
-  GET  /api/runs  /api/runs/<id>  background run status + log (scans persist; refresh runs are transient, ids like t3)
+  GET  /api/runs  /api/runs/<id>  background run status, log, progress (board/posting in flight, counters) and
+                                  summary (scans persist; refresh runs are transient, ids like t3)
+  POST /api/runs/<id>/cancel      stop a running run at its next fetch -> status 'cancelled'
   GET  /api/logs?lines=200&level=all|warn|error&q=<substring>   server log ring buffer (requests, errors,
                                   tracebacks, run outcomes, embedding results); newest last
+  GET  /api/events?since=<seq>    events after seq: {kind:"log", level, msg} server log lines and {kind:"run",
+                                  run, status, line, line_no, progress} run updates; -> {events, seq, active_run}
+  GET  /api/events/stream         the same as Server-Sent Events (id = seq, data = the event JSON; a comment
+                                  line every 20 s keeps the connection alive; reconnects resume from Last-Event-ID)
 
 Auth (JOBBOARD_AUTH=1, see auth.py): password login -> session cookie for the
 browser; bearer tokens for the API and MCP.
@@ -75,6 +81,7 @@ import jobscan as J  # noqa: E402
 sys.path.insert(0, HERE)
 import auth  # noqa: E402
 import capacity  # noqa: E402
+import logbuf  # noqa: E402
 import mcp as mcp_mod  # noqa: E402
 import runs  # noqa: E402
 import service  # noqa: E402
@@ -147,6 +154,8 @@ ROUTES = [
     ("GET", r"/api/logs", "logs", lambda m, qs, b: _q(qs, b, lines=qs.get("lines", 200)), 200),
     ("GET", r"/api/runs", "runs", lambda m, qs, b: _q(qs, b), 200),
     ("GET", r"/api/runs/([^/]+)", "run_status", lambda m, qs, b: {"run_id": m[0]}, 200),
+    ("POST", r"/api/runs/([^/]+)/cancel", "cancel_run", lambda m, qs, b: {"run_id": m[0]}, 200),
+    ("GET", r"/api/events", "events", lambda m, qs, b: _q(qs, b), 200),
     ("POST", r"/api/scan", "scan", lambda m, qs, b: b, 202),
     ("POST", r"/api/boards", "add_boards", lambda m, qs, b: b, 201),
     ("POST", r"/api/boards/(\d+)", "update_board", lambda m, qs, b: _q(qs, b, id=m[0]), 200),
@@ -197,7 +206,7 @@ class Handler(SimpleHTTPRequestHandler):
         # 4xx/5xx responses are worth keeping at warn/error; normal traffic at debug.
         code = args[1] if len(args) > 1 and isinstance(args[1], str) else ""
         lvl = "error" if code.startswith("5") else "warn" if code.startswith("4") else "debug"
-        log_event(lvl, f"{self.address_string()} {msg}")
+        log_event(lvl, f"{self.address_string()} {msg}", stream=False)   # in the log, not on the page's run line
 
     SECURITY_HEADERS = (
         ("X-Content-Type-Options", "nosniff"),
@@ -300,6 +309,7 @@ class Handler(SimpleHTTPRequestHandler):
         ("GET", r"/login", "r_login_page"),
         ("GET", r"/api", "r_api_doc"),
         ("GET", r"/api/auth/me", "r_me"),
+        ("GET", r"/api/events/stream", "r_events"),
         ("GET", r"/api/auth/tokens", "r_tokens"),
         ("GET", r"/files/(.+)", "r_file"),
         ("POST", r"/api/auth/login", "r_login"),
@@ -397,6 +407,47 @@ class Handler(SimpleHTTPRequestHandler):
 
     def r_file(self, m, qs, body):
         return self._serve_resume(m[0])
+
+    EVENT_PING = 20                 # seconds; under nginx's proxy_read_timeout (120 s) and Cloudflare's 100 s
+    EVENT_LIFETIME = 3600           # a stream is closed after this; the browser reconnects and resumes
+    EVENT_MAX = 8                   # open streams at once (one per page); the VPS is small
+    _streams = 0
+    _streams_lock = threading.Lock()
+
+    def r_events(self, m, qs, body):
+        """Server-Sent Events: every event (service.events) as it happens, until the client goes
+        away. One thread per open stream, at most EVENT_MAX, each for at most EVENT_LIFETIME so a
+        client that vanished without a socket error cannot hold a thread for good. id: is the seq,
+        so a browser reconnect resumes from Last-Event-ID; without it only new events are sent
+        (?since=<seq> asks for the backlog)."""
+        since = self.headers.get("Last-Event-ID") or qs.get("since")
+        since = int(since) if since not in (None, "") else logbuf.current_seq()
+        cls = type(self)
+        with cls._streams_lock:
+            if cls._streams >= cls.EVENT_MAX:
+                return self._json({"error": f"too many open event streams ({cls.EVENT_MAX})"}, 503)
+            cls._streams += 1
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Accel-Buffering", "no")      # nginx: stream, do not buffer
+            self.end_headers()
+            self.wfile.write(b": connected\n\n")
+            deadline = time.time() + self.EVENT_LIFETIME
+            while time.time() < deadline:
+                evs = logbuf.wait_events(since, self.EVENT_PING)
+                if not evs:
+                    self.wfile.write(b": ping\n\n")
+                    continue
+                for ev in evs:
+                    since = ev["seq"]
+                    self.wfile.write(f"id: {since}\ndata: {json.dumps(ev, default=str)}\n\n".encode())
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass                                       # client left; the thread ends here
+        finally:
+            with cls._streams_lock:
+                cls._streams -= 1
 
     def r_login(self, m, qs, body):
         if not auth.AUTH_ON:

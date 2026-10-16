@@ -36,12 +36,37 @@
   .sem button { padding: 0 6px; font-size: 11px; }
   td.score { color: var(--muted); font-size: 12px; white-space: nowrap; }
   button.on { background: var(--accent); color: #fff; border-color: var(--accent); }
-  .runstat { color: var(--muted); font-size: 13px; }
+  /* The run line: progress bar, latest line (click for the run panel), cancel. */
+  .runline { display: inline-flex; align-items: center; gap: 8px; flex: 1 1 240px; min-width: 0; }
+  .runstat { color: var(--muted); font-size: 13px; cursor: pointer; white-space: nowrap; overflow: hidden;
+             text-overflow: ellipsis; min-width: 0; flex: 1 1 auto; transition: opacity .6s; }
+  .runstat:hover { text-decoration: underline dotted; }
   .runstat.running { color: var(--maybe); }
-  .runstat.failed { color: var(--no); }
+  .runstat.failed, .runstat.cancelled, .runstat.error { color: var(--no); }
   .runstat.done { color: var(--yes); }
-  .runstat { transition: opacity .6s; }
+  .runstat.warn { color: var(--maybe); }
   .runstat.fade { opacity: 0; }
+  .bar { display: inline-block; width: 90px; height: 6px; border-radius: 3px; background: var(--chip); overflow: hidden; flex: none; }
+  .bar i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .4s; }
+  .bar.indeterminate i { width: 30%; animation: slide 1.2s infinite linear; }
+  @keyframes slide { from { transform: translateX(-100%); } to { transform: translateX(333%); } }
+  button.x { padding: 0 6px; font-size: 12px; line-height: 18px; color: var(--no); border-color: var(--no); flex: none; }
+  button.x:disabled { opacity: .5; cursor: default; }
+  #runPanel { position: fixed; right: 16px; bottom: 16px; width: min(680px, calc(100vw - 32px)); max-height: 72vh;
+              display: flex; flex-direction: column; gap: 8px; background: var(--card); border: 1px solid var(--line);
+              border-radius: 10px; box-shadow: 0 8px 30px rgba(0,0,0,.25); padding: 12px 14px; z-index: 5; }
+  #runPanel[hidden] { display: none; }
+  .rp-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .rp-head select { max-width: 55%; font-size: 13px; }
+  .rp-status { font-weight: 600; text-transform: uppercase; font-size: 12px; letter-spacing: .04em; }
+  .rp-status.running { color: var(--maybe); } .rp-status.done { color: var(--yes); }
+  .rp-status.failed, .rp-status.cancelled { color: var(--no); }
+  .rp-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 3px 14px; font-size: 13px; color: var(--muted); }
+  .rp-grid b { color: var(--fg); font-weight: 600; }
+  .rp-grid .span { grid-column: 1 / -1; }
+  .bar.wide { width: 100%; height: 8px; }
+  .rp-log { flex: 1 1 auto; min-height: 140px; margin: 0; max-height: none; overflow: auto; }
+  #rpCancel { color: var(--no); border-color: var(--no); }
   dialog { border: 1px solid var(--line); border-radius: 10px; background: var(--card); color: var(--fg);
            padding: 18px 20px; min-width: 320px; max-width: 90vw; }
   dialog::backdrop { background: rgba(0,0,0,.35); }
@@ -186,9 +211,27 @@
       <button id="refreshAll" title="Re-fetch every posting currently listed (current filters) so dates and text are current">Refresh</button>
       <button id="bulkToggle" title="Enter selection mode: shows checkboxes and the bulk status panel">Select…</button>
     </div>
-    <span id="run" class="runstat"></span>
+    <span class="runline">
+      <span id="runBar" class="bar" hidden><i></i></span>
+      <span id="run" class="runstat" title="Click for the run's details and log"></span>
+      <button id="runCancel" class="x" title="Cancel this run" hidden>✕</button>
+    </span>
   </div>
 </header>
+<aside id="runPanel" hidden>
+  <div class="rp-head">
+    <select id="rpPick" title="Recent runs"></select>
+    <span id="rpStatus" class="rp-status"></span>
+    <span id="rpElapsed" class="muted"></span>
+    <span style="flex:1"></span>
+    <button id="rpCancel" hidden>Cancel run</button>
+    <button id="rpClose" title="Close">✕</button>
+  </div>
+  <div id="rpArgs" class="muted"></div>
+  <div id="rpStats" class="rp-grid"></div>
+  <div id="rpBar" class="bar wide" hidden><i></i></div>
+  <pre id="rpLog" class="rp-log"></pre>
+</aside>
 <dialog id="scanDlg">
   <form method="dialog" id="scanForm">
     <h3>Scan job boards</h3>

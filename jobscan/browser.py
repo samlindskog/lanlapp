@@ -88,6 +88,10 @@ class Config:
         self.browser_dir = env.get("JOBSCAN_BROWSER_DIR") or None
 
 
+class Cancelled(Exception):
+    """The operation was cancelled (Session.check raised); callers let it propagate."""
+
+
 class UnsafeURL(ValueError):
     """The URL points somewhere the service must never fetch."""
 
@@ -763,9 +767,10 @@ class Session:
     and finally return (0, ""). Every request to a career site goes through here, so the
     escalation policy is the same for scans, board registration and refreshes."""
 
-    def __init__(self, log=None, cfg=None):
+    def __init__(self, log=None, cfg=None, check=None):
         self.cfg = cfg or Config()
         self.log = log or _stderr
+        self.check = check or (lambda: None)     # raises Cancelled to stop the operation; run before every fetch
         self.pool = ProxyPool(self.cfg.proxy, self.cfg.proxy_tries, self.cfg.countries)
         self.access = Access(self.pool, self.log)
         self.chrome = Chrome(self.cfg, self.log)
@@ -801,6 +806,7 @@ class Session:
     def fetch(self, url, retries=2, delay=0.4, accept=None, data=None, headers=None, method=None, transport=None):
         method = method or ("POST" if data is not None else "GET")
         transport = transport or self.transport
+        self.check()
         try:
             check_url(url)
         except UnsafeURL as e:
@@ -810,6 +816,7 @@ class Session:
             return 403, ""
         last = None
         for attempt in range(retries + 1 + self.pool.tries):
+            self.check()
             proxy = self.access.proxy_for(url)
             try:
                 status, body = transport(url, method, data, headers, accept, proxy)
@@ -827,6 +834,8 @@ class Session:
                     time.sleep(delay)
                     return status, body
                 last = f"HTTP {status}"
+            except Cancelled:
+                raise
             except Exception as e:  # noqa: BLE001
                 last = e
             time.sleep(1.5 * (attempt + 1))

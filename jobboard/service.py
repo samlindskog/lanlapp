@@ -14,6 +14,7 @@ import jobscan as J
 import auth
 import capacity
 import runs
+import logbuf
 from logbuf import log_event, read_log, status as log_status
 
 SUMMARY_FIELDS = ("id", "title", "location", "series", "pay_plan", "grade_low", "grade_high", "salary",
@@ -262,8 +263,9 @@ def scan(args):
     bids = [b["id"] for b in sel]
     rid = runs.start("scan", {"boards": bids, "names": [b["name"] for b in sel], "source": source,
                               "days": days, "all": all_, "refetch": refetch},
-                     lambda conn, log: J.scan_boards(conn, [J.get_board(conn, i) for i in bids], days=days,
-                                                     all_=all_, refetch=refetch, log=log))
+                     lambda conn, run: J.scan_boards(conn, [J.get_board(conn, i) for i in bids], days=days,
+                                                     all_=all_, refetch=refetch, log=run.log,
+                                                     progress=run.progress, check=run.check))
     return {"run_id": rid, "status": "running", "boards": bids}
 
 
@@ -272,8 +274,9 @@ def refresh(args):
     ids = _ints(args.get("ids"))[:20]
     if not ids:
         raise ValueError("ids required")
-    with capacity.hold("refresh"), db() as conn, J.browser.Session(lambda m: None) as s:
-        out = [J.refresh_job(conn, i, log=lambda m: None, session=s) for i in ids]
+    log = lambda m: log_event("info", f"refresh: {str(m).strip()}")  # noqa: E731
+    with capacity.hold("refresh"), db() as conn, J.browser.Session(log) as s:
+        out = [J.refresh_job(conn, i, log=log, session=s) for i in ids]
         job = J.job_detail(conn, ids[-1], with_text=False)["job"]
     return {"refreshed": out, "refresh": out[-1], "job": job}
 
@@ -287,17 +290,28 @@ def refresh_run(args):
             ids = [r["id"] for r in J.list_jobs(conn, verdict="yes,maybe", open_only=True) if r["source"] != "manual"]
     capacity.check()
 
-    def work(conn, log):
-        out = []
-        with J.browser.Session(log) as s:
-            for i in ids:
+    def work(conn, run):
+        out, failed = [], 0
+        run.progress.update(phase="fetching", total=len(ids), job_index=0, job_title=None, refreshed=0, failed=0)
+        with J.browser.Session(run.log, check=run.check) as s:
+            for n, i in enumerate(ids):
+                run.check()
+                j = conn.execute("SELECT title FROM jobs WHERE id=%s", (i,)).fetchone()
+                run.progress.update(job_index=n + 1, job_title=f"[{i}] {j['title'] if j else '?'}")
                 try:
-                    out.append(J.refresh_job(conn, i, log=log, embed=False, session=s))
+                    out.append(J.refresh_job(conn, i, log=run.log, embed=False, session=s))
+                    run.progress.add(refreshed=1)
+                except J.browser.Cancelled:
+                    raise
                 except Exception as e:  # noqa: BLE001
                     conn.rollback()
-                    log(f"[{i}] failed: {e}")
-        emb = J.embed_if_possible(conn, [r["id"] for r in out], log)
-        return {"refreshed": len(out), "ids": ids, "embedded": emb.get("embedded", 0)}
+                    failed += 1
+                    run.progress.add(failed=1)
+                    run.log(f"[{i}] failed: {e}")
+        run.progress.update(phase="embedding", job_title=None)
+        emb = J.embed_if_possible(conn, [r["id"] for r in out], run.log)
+        run.progress.update(phase="done")
+        return {"refreshed": len(out), "failed": failed, "ids": ids, "embedded": emb.get("embedded", 0)}
     rid = runs.start("refresh", {"ids": ids}, work, persist=False)
     return {"run_id": rid, "status": "running", "count": len(ids)}
 
@@ -311,6 +325,20 @@ def run_status(args):
 
 def recent_runs(args):
     return {"runs": runs.recent(_int(args.get("limit"), 20))}
+
+
+def cancel_run(args):
+    """Stop a running scan or refresh at its next fetch; the run ends with status 'cancelled'."""
+    return runs.cancel(str(args["run_id"]))
+
+
+def events(args):
+    """Events (server log lines, run lines and progress) after a seq number; the polling form of
+    /api/events/stream. since=0 returns the whole ring (bounded)."""
+    since = _int(args.get("since"), None)
+    seq = logbuf.current_seq()
+    evs = logbuf.events_since(since if since is not None else seq, _int(args.get("limit"), 500))
+    return {"events": evs, "seq": max([seq] + [e["seq"] for e in evs]), "active_run": capacity.busy()}
 
 
 def logs(args):
@@ -366,7 +394,9 @@ OPERATIONS = {
     "scan": (scan, "Start a background scan: boards = list of board ids, or source = every board of one adapter, or neither = every enabled board. New/changed postings are embedded automatically. Returns a run id to poll with run_status.",
              _S(boards={"type": "array", "items": _intt}, source=_str, days={"type": "integer", "default": 7},
                 all={"type": "boolean", "default": False}, refetch={"type": "boolean", "default": False})),
-    "run_status": (run_status, "Status, log and summary of a background run (scan/refresh).", {"type": "object", "properties": {"run_id": _str}, "required": ["run_id"]}),
+    "run_status": (run_status, "Status, log, progress (board/posting in flight, counters) and summary of a background run (scan/refresh).", {"type": "object", "properties": {"run_id": _str}, "required": ["run_id"]}),
+    "cancel_run": (cancel_run, "Cancel a running scan or refresh. It stops before its next page fetch (within one page load) and ends with status 'cancelled'; what it stored so far stays.", {"type": "object", "properties": {"run_id": _str}, "required": ["run_id"]}),
+    "events": (events, None, _S(since=_intt, limit=_intt)),
     "refresh": (refresh, "Re-fetch postings now (synchronous, up to 20 ids). Refused while a scan holds the browser.",
                 {"type": "object", "properties": {"ids": {"type": "array", "items": _intt}}, "required": ["ids"]}),
     "refresh_run": (refresh_run, None, _S()),

@@ -1,21 +1,71 @@
 """Background runs. A scan is recorded in the runs table (the Scan dialog shows the last one per
-board, and the log is the audit trail); a bulk refresh is transient, tracked in memory only
-while it runs. Both run on a daemon thread with their own DB connection and a log callback
-that appends to the run's log as it goes."""
+board, and the log is the audit trail); a bulk refresh is transient, tracked in memory only while
+it runs. Both run on a daemon thread with their own DB connection and a Run object that the work
+reports through: run.log(line) appends to the run's log, run.progress (a jobscan Progress) carries
+the structured state (board and posting in flight, counters), run.check() raises
+browser.Cancelled once cancel() was called. Every change is published to the event stream
+(logbuf.publish, kind "run") so the page follows a run live without polling."""
 import json
 import threading
 import traceback
 
 import jobscan as J
-from logbuf import log_event
+from logbuf import log_event, publish
 
 _lock = threading.Lock()
-_transient = {}          # id -> dict(kind, args, status, started_at, finished_at, log, summary)
+_live = {}               # id -> Run: every running run, plus finished transient ones (their only record)
 _seq = 0
 
 
+class Run:
+    def __init__(self, run_id, kind, args, persist):
+        self.id, self.kind, self.args, self.persist = run_id, kind, json.dumps(args), persist
+        self.status, self.started_at, self.finished_at, self.summary = "running", J.now(), None, None
+        self.lines = []
+        self.cancel_requested = False
+        self.conn = None                                   # the worker's connection (worker thread only)
+        self.progress = J.Progress(lambda state: self._publish())
+
+    # --- hooks handed to the work (worker thread)
+    def log(self, msg):
+        msg = str(msg)
+        self.lines.append(msg)
+        if self.persist and self.conn is not None:
+            self.conn.execute("UPDATE runs SET log=%s WHERE id=%s", ("\n".join(self.lines), self.id))
+            self.conn.commit()
+        self._publish(line=msg)
+
+    def check(self):
+        if self.cancel_requested:
+            raise J.browser.Cancelled(f"run {self.id} cancelled")
+
+    # --- bookkeeping
+    def _finish(self, status, summary=None):
+        self.status, self.finished_at = status, J.now()
+        self.summary = json.dumps(summary, default=str) if summary is not None else None
+        if self.persist and self.conn is not None:
+            self.conn.execute("UPDATE runs SET status=%s, finished_at=%s, summary=%s WHERE id=%s",
+                              (status, self.finished_at, self.summary, self.id))
+            self.conn.commit()
+        self._publish()
+
+    def _publish(self, line=None):
+        publish("run", run=self.id, run_kind=self.kind, status=self.status, line=line, line_no=len(self.lines),
+                progress=dict(self.progress.state), cancel_requested=self.cancel_requested,
+                summary=self.summary if self.status != "running" else None)
+
+    def snapshot(self, with_log=True):
+        d = {"id": self.id, "kind": self.kind, "args": self.args, "status": self.status,
+             "started_at": self.started_at, "finished_at": self.finished_at, "summary": self.summary,
+             "progress": dict(self.progress.state), "cancel_requested": self.cancel_requested,
+             "line_count": len(self.lines)}
+        if with_log:
+            d["log"] = "\n".join(self.lines)
+        return d
+
+
 def start(kind, args, target, persist=True):
-    """target(conn, log) -> summary dict, run on a thread. Returns the run id (int, or 't<n>')."""
+    """target(conn, run) -> summary dict, run on a thread. Returns the run id (int, or 't<n>')."""
     global _seq
     if persist:
         conn = J.db()
@@ -27,59 +77,91 @@ def start(kind, args, target, persist=True):
         with _lock:
             _seq += 1
             run_id = f"t{_seq}"
-            _transient[run_id] = {"id": run_id, "kind": kind, "args": json.dumps(args), "status": "running",
-                                  "started_at": J.now(), "finished_at": None, "log": "", "summary": None}
+    run = Run(run_id, kind, args, persist)
+    with _lock:
+        _live[run_id] = run
+    run._publish()
 
     def worker():
-        rconn = J.db()
-        lines = []
-
-        def log(msg):
-            lines.append(str(msg))
-            if persist:
-                rconn.execute("UPDATE runs SET log=%s WHERE id=%s", ("\n".join(lines), run_id))
-                rconn.commit()
-            else:
-                _transient[run_id]["log"] = "\n".join(lines)
-
-        def finish(status, summary=None):
-            if persist:
-                rconn.execute("UPDATE runs SET status=%s, finished_at=%s, summary=%s WHERE id=%s",
-                              (status, J.now(), json.dumps(summary) if summary is not None else None, run_id))
-                rconn.commit()
-            else:
-                _transient[run_id].update(status=status, finished_at=J.now(),
-                                          summary=json.dumps(summary) if summary is not None else None)
-
+        status, summary, line, lvl, note = "failed", None, None, "error", None
         try:
-            summary = target(rconn, log)
-            finish("done", summary)
-            log_event("info", f"run {run_id} ({kind}) done: {json.dumps(summary, default=str)[:300]}")
+            run.conn = J.db()
+            summary = target(run.conn, run)
+            status, lvl, note = "done", "info", f"run {run_id} ({kind}) done: {json.dumps(summary, default=str)[:300]}"
+        except J.browser.Cancelled:
+            status, line, lvl, note = "cancelled", "! cancelled", "warn", f"run {run_id} ({kind}) cancelled"
         except Exception:  # noqa: BLE001
-            tb = traceback.format_exc()
-            log(tb)
-            finish("failed")
-            log_event("error", f"run {run_id} ({kind}) failed:\n{tb}")
-        rconn.close()
+            line = traceback.format_exc()
+            note = f"run {run_id} ({kind}) failed:\n{line}"
+        # Record the outcome whatever state the worker's connection is in (it may be what failed):
+        # on a fresh connection if need be, and in memory regardless, so a run never stays
+        # 'running' and keeps the browser slot (capacity.busy) until a restart.
+        for attempt in range(2):
+            try:
+                if attempt:
+                    run.conn = J.db()
+                else:
+                    run.conn.rollback()
+                if line and (not run.lines or run.lines[-1] != line):
+                    run.log(line)
+                run._finish(status, summary)
+                break
+            except Exception as e:  # noqa: BLE001
+                log_event("error", f"run {run_id}: outcome not recorded ({e.__class__.__name__}: {e})"
+                                   + ("; retrying on a new connection" if not attempt else ""), run=run_id)
+                if attempt:
+                    run.status, run.finished_at = status, J.now()
+                    run._publish()
+        log_event(lvl, note, run=run_id)
+        try:
+            run.conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+        run.conn = None
+        if persist:                                        # the table is the record from here on
+            with _lock:
+                _live.pop(run_id, None)
 
     threading.Thread(target=worker, name=f"run-{run_id}", daemon=True).start()
     return run_id
 
 
+def _live_run(rid):
+    with _lock:
+        for r in _live.values():
+            if str(r.id) == str(rid):
+                return r
+    return None
+
+
 def active():
     """{'id', 'kind'} of the run in progress, or None."""
-    for r in _transient.values():
-        if r["status"] == "running":
-            return {"id": r["id"], "kind": r["kind"]}
+    with _lock:
+        for r in _live.values():
+            if r.status == "running":
+                return {"id": r.id, "kind": r.kind}
     conn = J.db()
     r = conn.execute("SELECT id, kind FROM runs WHERE status='running' ORDER BY id DESC LIMIT 1").fetchone()
     conn.close()
     return dict(r) if r else None
 
 
+def cancel(rid):
+    """Ask a running run to stop; it ends with status 'cancelled' at its next fetch (within one
+    page load). Raises KeyError when no such run is running."""
+    r = _live_run(rid)
+    if not r or r.status != "running":
+        raise KeyError(f"running run {rid}")
+    r.cancel_requested = True
+    r._publish()
+    log_event("info", f"run {rid} ({r.kind}): cancel requested", run=r.id)
+    return r.snapshot(with_log=False)
+
+
 def get(rid):
-    if rid in _transient:
-        return dict(_transient[rid])
+    r = _live_run(rid)
+    if r:
+        return r.snapshot()
     try:
         rid = int(rid)
     except (TypeError, ValueError):
@@ -95,7 +177,8 @@ def recent(limit=20):
     rows = [dict(r) for r in conn.execute(
         "SELECT id, kind, args, status, started_at, finished_at, summary FROM runs ORDER BY id DESC LIMIT %s", (limit,))]
     conn.close()
-    transient = [{k: v for k, v in r.items() if k != "log"} for r in _transient.values()]
+    with _lock:
+        transient = [r.snapshot(with_log=False) for r in _live.values() if not r.persist]
     return sorted(transient + rows, key=lambda r: r.get("started_at") or "", reverse=True)[:limit]
 
 

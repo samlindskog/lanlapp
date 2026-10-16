@@ -119,12 +119,12 @@ FAMILY = [
       "salary": "$47,445.00 - $74,901.00"}),
     ("oracle_hcm", "https://hcgn.fa.us2.oraclecloud.com/hcmUI/CandidateExperience/en/sites/CX_1",
      {"recruitingCEJobRequisitions?": "oracle_list.json", "recruitingCEJobRequisitionDetails": "oracle_detail.json"},
-     {"key": "oracle_hcm:hcgn.fa.us2.oraclecloud.com/CX_1", "cards": 50, "age": 0,
+     {"key": "oracle_hcm:hcgn.fa.us2.oraclecloud.com/CX_1", "cards": 50, "posted": "2026-10-14",   # age = days since
       "kinds": ["posting", "posting_json"], "secs": ["Description", "Responsibilities", "Qualifications"]}),
     ("icims_jibe", "https://careers.sammonsfinancialgroup.com/jobs",       # not recognisable from the URL: probe
      {"/api/jobs?keywords=3773": "jibe_list.json", "/api/jobs?": "jibe_list.json",
       "careers.sammonsfinancialgroup.com/jobs": "<html>jibe</html>"},
-     {"key": "icims_jibe:careers.sammonsfinancialgroup.com", "cards": 3, "age": 7, "kinds": ["posting"],
+     {"key": "icims_jibe:careers.sammonsfinancialgroup.com", "cards": 3, "posted": "2026-10-07", "kinds": ["posting"],
       "name": "Sammons Financial Group", "ext": "https://careers-sammonsfinancialgroup.icims.com/jobs/3773/login"}),
     ("ukg", "https://recruiting2.ultipro.com/NEW1011NMEFC/JobBoard/96c51545-b78a-46f6-8562-bf841a0799cb/",
      {"LoadSearchResults": "ukg_list.json", "OpportunityDetail": "ukg_detail.html"},
@@ -168,6 +168,9 @@ def check_family(name, url, fixtures, want):
         assert c["title"] == want["title"], (name, c["title"])
     if "age" in want:
         assert c["age_days"] == want["age"], (name, c["age_days"])
+    if "posted" in want:        # the fixture carries an absolute date; the adapter ages it against today
+        import datetime as dt
+        assert c["age_days"] == (dt.date.today() - dt.date.fromisoformat(want["posted"])).days, (name, c["age_days"])
     docs = mod.fetch_job(fetch, board, c)
     assert [d["kind"] for d in docs] == want["kinds"], (name, [d["kind"] for d in docs])
     assert len(docs[0]["text"] or "") >= want.get("min_text", 500), (name, len(docs[0]["text"] or ""))

@@ -58,6 +58,16 @@ curl -sf -X POST "$MCP/mcp" "${AUTH[@]}" "${JSON[@]}" -d '{"jsonrpc":"2.0","id":
   | jq 'd["result"]["isError"]' | grep -qx False || { echo "FAIL: mcp list_jobs"; exit 1; }
 echo "ok mcp tools/call"
 
+echo "== events (server log + run updates): JSON and the SSE stream"
+expect 401 "$WEB/api/events"
+expect 401 "$WEB/api/events/stream"
+expect 200 "$WEB/api/events?since=0" "${AUTH[@]}"
+curl -sf "$WEB/api/events?since=0" "${AUTH[@]}" | jq 'any(e["kind"]=="log" for e in d["events"])' | grep -qx True || { echo "FAIL: /api/events has no log events"; exit 1; }
+STREAM=$(curl -s -N --max-time 2 "$WEB/api/events/stream" "${AUTH[@]}" || true)     # times out by design; the opening comment must have arrived
+printf '%s' "$STREAM" | head -1 | grep -q '^: connected' || { echo "FAIL: event stream did not open: $STREAM"; exit 1; }
+echo "ok event stream"
+expect 404 -X POST "$WEB/api/runs/999999/cancel" "${AUTH[@]}" "${JSON[@]}" -d '{}'
+
 echo "== job + resume round trip"
 JID=$(curl -sf "$WEB/api/jobs?q=Smoke+test+job" "${AUTH[@]}" | jq '(d["jobs"] or [{}])[0].get("id","")')
 if [ -z "$JID" ]; then

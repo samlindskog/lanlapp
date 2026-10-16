@@ -7,13 +7,35 @@ from core.embed import embed_if_possible
 from core.text import html_to_text
 
 
+class Progress:
+    """Structured state of a running operation, for whoever watches it (the board page's run
+    panel): which board and posting are in flight, how many cards were listed, fetched, new,
+    known. update() sets fields, add() increments counters; every change goes to publish(state),
+    the caller's hook (runs.py pushes it to the event stream). The default is a silent sink."""
+
+    def __init__(self, publish=None):
+        self.state = {}
+        self.publish = publish or (lambda state: None)
+
+    def update(self, **fields):
+        self.state.update(fields)
+        self.publish(self.state)
+
+    def add(self, **counters):
+        for k, v in counters.items():
+            self.state[k] = self.state.get(k, 0) + v
+        self.publish(self.state)
+
+
 def scan_board(conn, board, session, days=7, all_=False, limit=None, refetch=False,
-               max_pages=100, log=print, embed=True):
+               max_pages=100, log=print, embed=True, progress=None):
     """Fetch new postings from one board through the run's Session. Incremental: known
     (board, source_id) pairs are not re-fetched unless refetch=True. A new job whose announcement
     number was already judged under another id inherits that verdict. New/changed jobs are
     embedded afterwards when an API key is available. Titles are filtered by the board's
-    include/exclude regexes."""
+    include/exclude regexes. progress: a Progress (board-level fields are set by the caller);
+    session.check() is run between postings so a cancel lands between fetches."""
+    p = progress or Progress()
     fetch = session.fetch
     src = load_source(board["adapter"])
     conn.execute("""INSERT INTO sources VALUES (%s,%s,%s)
@@ -26,22 +48,28 @@ def scan_board(conn, board, session, days=7, all_=False, limit=None, refetch=Fal
     cards = [c for c in cards if keep(c.get("title"))]
     log(f"{board['name']} ({board['adapter']}): {len(cards)} cards"
         + (f", {len(skipped)} dropped by title filter" if skipped else ""))
+    p.update(phase="fetching", cards=len(cards), job_index=0, job_title=None)
+    p.add(cards_total=len(cards))
     new = updated = carried = 0
     need_judgment, touched = [], []
     for i, card in enumerate(cards):
         if limit and new >= limit:
             break
+        session.check()
+        p.update(job_index=i + 1, job_title=card.get("title"))
         row = conn.execute("SELECT id FROM jobs WHERE source=%s AND board_id=%s AND source_id=%s",
                            (board["adapter"], board["id"], card["source_id"])).fetchone()
         if row and not refetch:
             conn.execute("UPDATE jobs SET last_seen=%s, posted_age_days=%s WHERE id=%s",
                          (now(), card.get("age_days"), row["id"]))
             updated += 1
+            p.add(known=1)
             continue
         log(f"[{i+1}/{len(cards)}] {card['title']} — {card.get('location','')}")
         docs = src.fetch_job(fetch, board, card)
         if not docs:                                   # nothing fetched: leave it for the next scan
             log(f"  ! no document fetched for {card['source_id']}; skipped")
+            p.add(skipped=1)
             continue
         fields = src.parse_fields(board, card, docs)
         for k in ("announcement_no", "salary", "location", "title"):   # adapters may hand back numbers
@@ -77,30 +105,45 @@ def scan_board(conn, board, session, days=7, all_=False, limit=None, refetch=Fal
                               f"same announcement as job {prior['other_id']}: {prior['reason']}",
                               now(), prior["profile_hash"], prior["author"]))
                 carried += 1
+                p.add(carried=1)
             else:
                 need_judgment.append({"id": job_id, "title": fields.get("title"), "board": board["name"]})
         _store_documents(conn, job_id, docs, replace=bool(row))
         touched.append(job_id)
         conn.commit()
+        p.add(fetched=1, **({"new": 1} if not row else {"refetched": 1}))
     log(f"{board['name']}: {new} new, {updated} already known, {carried} verdicts carried over")
+    p.update(phase="embedding", job_title=None)
     embedded = embed_if_possible(conn, touched, log)["embedded"] if embed else 0
+    p.add(embedded=embedded)
     return {"board": board["name"], "board_id": board["id"], "cards": len(cards), "new": new,
             "known": updated, "carried": carried, "need_judgment": need_judgment, "embedded": embedded}
 
 def scan_boards(conn, boards, days=7, all_=False, limit=None, refetch=False, max_pages=100,
-                log=print, embed=True):
+                log=print, embed=True, progress=None, check=None):
     """Scan several boards in one run: one browser.Session (one Chrome, one proxy escalation
     state, one log) for the whole run, torn down at the end. A board that fails is logged and
-    skipped so the others still run."""
+    skipped so the others still run. progress: a Progress to report into; check: raises
+    browser.Cancelled to stop the run (checked before every fetch), which propagates."""
+    p = progress or Progress()
+    p.update(boards_total=len(boards), boards_done=0, boards_failed=0, cards_total=0,
+             fetched=0, new=0, refetched=0, known=0, skipped=0, carried=0, embedded=0)
     results, failed = [], []
-    with browser.Session(log) as s:
-        for b in boards:
+    with browser.Session(log, check=check) as s:
+        for i, b in enumerate(boards):
+            p.update(phase="listing", board=b["name"], platform=load_source(b["adapter"]).DISPLAY_NAME,
+                     board_index=i + 1, cards=0, job_index=0, job_title=None)
             try:
-                results.append(scan_board(conn, b, s, days, all_, limit, refetch, max_pages, log, embed))
+                results.append(scan_board(conn, b, s, days, all_, limit, refetch, max_pages, log, embed, p))
+                p.add(boards_done=1)
+            except browser.Cancelled:
+                raise
             except Exception as e:  # noqa: BLE001
                 conn.rollback()
                 failed.append({"board": b["name"], "board_id": b["id"], "error": f"{e.__class__.__name__}: {e}"})
                 log(f"! {b['name']} failed: {e.__class__.__name__}: {e}")
+                p.add(boards_failed=1)
+    p.update(phase="done", board=None, job_title=None)
     need = [j for r in results for j in r["need_judgment"]]
     tot = {k: sum(r[k] for r in results) for k in ("cards", "new", "known", "carried", "embedded")}
     log(f"done: {tot['new']} new, {tot['known']} already known, {tot['carried']} verdicts carried over"

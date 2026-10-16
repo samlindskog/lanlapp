@@ -19,9 +19,9 @@ jobboard/            shared research service over the database
                        the MCP tools; both front doors below are one line per operation
   server.py            HTTP front door: auth, static pages, file serving, a route table over service.py
   mcp.py               MCP front door (JSON-RPC over HTTP) for Claude Code, tools straight from the table
-  runs.py              background runs (scans persisted, refreshes transient) with their logs
+  runs.py              background runs (scans persisted, refreshes transient): log, progress, cancel; each update is an event
   capacity.py          the one browser slot: a scan, a refresh or a registration at a time (409 otherwise)
-  logbuf.py            in-memory log ring buffer read by /api/logs and the logs tool
+  logbuf.py            in-memory log ring buffer (/api/logs, the logs tool) and the event stream (/api/events/stream)
   auth.py              password/session/token auth
   static/              index.html + app.js (the board; filtering is the server's, the page sorts),
                        view.html (one job), login.html
@@ -114,7 +114,7 @@ gunzip -c jobscan-backup.sql.gz | docker compose -f jobboard/compose.yaml exec -
   Re-runnable; also restores `/tmp/jobscan-dump.sql.gz` into an empty database. Secrets: `deploy/push-secrets.sh`.
 - Claude's token lives in `~/.config/jobboard/token` on the Mac; the MCP server is registered in Claude Code as `jobboard`.
 - MCP tools: stats, list_jobs, get_job, get_section, search, sources, boards, add_boards, update_board,
-  delete_board, scan, run_status, refresh, set_verdict, set_status, add_job, upload_resume, list_resumes, logs, runs.
+  delete_board, scan, run_status, cancel_run, refresh, set_verdict, set_status, add_job, upload_resume, list_resumes, logs, runs.
 
 ## Boards, adapters and the browser
 
