@@ -129,7 +129,7 @@ FAMILY = [
     ("ukg", "https://recruiting2.ultipro.com/NEW1011NMEFC/JobBoard/96c51545-b78a-46f6-8562-bf841a0799cb/",
      {"LoadSearchResults": "ukg_list.json", "OpportunityDetail": "ukg_detail.html"},
      {"key": "ukg:NEW1011NMEFC/96c51545-b78a-46f6-8562-bf841a0799cb", "cards": 3, "title": "Financial Consultant",
-      "age": 1, "kinds": ["posting"], "min_text": 2000, "ann": "FINAN004895"}),
+      "posted": "2026-10-13", "kinds": ["posting"], "min_text": 2000, "ann": "FINAN004895"}),
     ("neogov", "https://www.governmentjobs.com/careers/santafecounty",
      {"careers/home/index?agency=": "neogov_list.html", "/careers/santafecounty/jobs/": "neogov_detail.html"},
      {"key": "neogov:santafecounty", "cards": 10, "title": "Driver/Cooks Assistant", "age": 21,
@@ -141,7 +141,7 @@ FAMILY = [
     ("eightfold", "https://searchjobs.libertymutualgroup.com/careers",      # domain comes from the page: probe
      {"/api/apply/v2/jobs/": "eightfold_detail.json", "/api/apply/v2/jobs?": "eightfold_list.json",
       "libertymutualgroup.com/careers": '<html>eightfold {"domain":"libertymutual.com"}</html>'},
-     {"key": "eightfold:searchjobs.libertymutualgroup.com/libertymutual.com", "cards": 2, "age": 8,
+     {"key": "eightfold:searchjobs.libertymutualgroup.com/libertymutual.com", "cards": 2, "posted": "2026-10-06",
       "kinds": ["posting", "posting_json"], "min_text": 3000}),
     ("icims", "https://careers-wafd.icims.com/jobs/search?ss=1",
      {"icims.com/jobs/search": "icims_list.html", "icims.com/jobs/5182": "icims_detail.html"},
