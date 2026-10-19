@@ -442,7 +442,7 @@
     $("#boardList").innerHTML = boards.length ? boards.map((b) => {
       const ls = b.last_scan;
       const when = ls ? `${fmtAgo(ls.started_at)}${ls.status === "failed" ? " · failed" : ls.new != null ? ` · ${ls.new} new` : ""}` : "never scanned";
-      return `<label class="chk board"><input type="checkbox" name="board" value="${b.id}" ${b.enabled ? "checked" : ""}>
+      return `<label class="chk board"><input type="checkbox" name="board" value="${b.id}">
         <b>${esc(b.name)}</b> <small class="muted">${esc(b.adapter)} · ${b.jobs} jobs · ${esc(when)}</small>
         <a href="${esc(b.url)}" target="_blank" rel="noopener" title="${esc(b.url)}">↗</a></label>`;
     }).join("") : `<div class="muted">No boards yet. Add one by URL below.</div>`;
