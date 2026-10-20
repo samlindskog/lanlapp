@@ -306,6 +306,20 @@ def check_firecrawl(mod):
     assert mod.list_jobs(s, board, since_days=None, max_pages=3)[0]["source_id"] == cards[0]["source_id"]   # stable across scans
     op, url, o = s.calls[-1]
     assert (op, url, o["limit"], o["maxDepth"], o["scrapeOptions"]["formats"]) == ("crawl", "https://www.example.org/jobs/", 3, 2, ["markdown", "links", "json"]), s.calls
+    # junk the extraction returns now and then (a link to the list, not an opening) is dropped,
+    # on the front page (which then still crawls its listing sub-page) and on crawled pages alike
+    for junk in ("View all jobs", "See All Jobs", "Search jobs", "Browse Jobs by Category", "Jobs", "Careers", "Openings", "Positions", "all open jobs"):
+        assert mod.JUNK_TITLE_RE.search(junk), junk
+    for real in ("Budget Analyst", "Jobs Coordinator", "All-Source Analyst", "Career Counselor", "View Manager"):
+        assert not mod.JUNK_TITLE_RE.search(real), real
+    s.calls.clear()
+    front_junk = {**front, "json": {"openings": [{"title": "View all jobs", "location": "Not specified"}, {"title": "Careers"}, {"title": "Search Jobs"}]}}
+    crawled_junk = {"status": "completed", "data": [{"json": {"openings": [{"title": "All Jobs"}, {"title": "Branch Manager", "location": "Albuquerque, NM"}]},
+                                                      "metadata": {"sourceURL": "https://www.example.org/jobs/"}}]}
+    s.firecrawl = lambda url, op="scrape", **o: (s.calls.append((op, url, o)) or (200, front_junk if op == "scrape" else crawled_junk))
+    cards = mod.list_jobs(s, board, since_days=None, max_pages=3)
+    assert [c["title"] for c in cards] == ["Branch Manager"] and [c[0] for c in s.calls] == ["scrape", "crawl"], (cards, s.calls)
+    assert "concrete job openings" in mod.JSON_OPTIONS["prompt"] and "View all jobs" in mod.JSON_OPTIONS["prompt"]
 
 
 def check_detection():
