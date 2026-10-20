@@ -132,7 +132,7 @@ fi
 # 0600 to the staging owner under the staging names; scp them off and delete them here afterwards.
 if [ -f "$HERE/export-certs" ]; then
   rm -f "$HERE/export-certs"
-  TLS=$(ls /etc/nginx/jobboard/jobboard-tls.conf /etc/nginx/snippets/tls.conf 2>/dev/null | head -1)
+  TLS=; for f in /etc/nginx/jobboard/jobboard-tls.conf /etc/nginx/snippets/tls.conf; do [ -f "$f" ] && { TLS=$f; break; }; done
   [ -n "$TLS" ] || { echo "no nginx TLS snippet found (/etc/nginx/jobboard/jobboard-tls.conf or /etc/nginx/snippets/tls.conf)"; exit 1; }
   GRP=$(id -gn "$OWNER")
   for pair in ssl_certificate:origin.pem ssl_certificate_key:origin.key ssl_client_certificate:cloudflare-origin-pull-ca.pem; do
