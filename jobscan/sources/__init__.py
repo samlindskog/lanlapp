@@ -13,9 +13,11 @@ Adapter contract (jobscan.py and jobboard/server.py rely on it; tests/test_adapt
     KEY_SECTION      section name that decides eligibility (previewed, judged), or None
 
     match(url)                       -> board | None   pure URL check, no network
-    probe(url, html, fetch)          -> board | None   optional; the page is already fetched
-    list_jobs(fetch, board, since_days, max_pages) -> [card]
-    fetch_job(fetch, board, card)    -> [document]
+    probe(url, html, session)        -> board | None   optional; the page is already fetched
+    verify(board, session)           -> board          optional; confirms the endpoint answers,
+                                                       may fix tenant/site ids; raises ValueError
+    list_jobs(session, board, since_days, max_pages) -> [card]
+    fetch_job(session, board, card)  -> [document]
     parse_fields(board, card, docs)  -> dict of common job fields
     sections(text, kind)             -> ordered {name: text} for a document
 
@@ -30,8 +32,11 @@ Adapter contract (jobscan.py and jobboard/server.py rely on it; tests/test_adapt
     fields   title, location, board_url, external_url, announcement_no, series, pay_plan,
              grade_low, grade_high, salary, open_date, close_date (all optional but present)
 
-fetch(url, accept=None, data=None, headers=None) -> (status, body): browser.py's fetch; data
-makes it a POST (dicts become JSON). Adapters never import urllib themselves.
+session is the operation's browser.Session, passed down by the caller (scan run, add_boards
+request, refresh batch) for the duration of the call. Adapters only ever use
+session.fetch(url, accept=None, data=None, headers=None, method=None) -> (status, body); data
+makes it a POST (dicts become JSON). Adapters never import urllib themselves and never keep
+the session beyond the call.
 """
 import importlib
 import os
@@ -49,10 +54,10 @@ def load(name):
     return importlib.import_module(f"sources.{name}")
 
 
-def detect(url, fetch=None, adapter=None):
+def detect(url, session=None, adapter=None):
     """Pick the adapter for a board URL: (adapter_name, board) or None.
     1. each adapter's match(url) on the URL itself (no network);
-    2. with fetch: load the page once, then each adapter's probe(url, html, fetch);
+    2. with a Session: load the page once, then each adapter's probe(url, html, session);
     3. URLs found in that page (a careers site that links to its myworkdayjobs.com board)."""
     url = (url or "").strip()
     if not re.match(r"https?://", url):
@@ -62,17 +67,17 @@ def detect(url, fetch=None, adapter=None):
         b = load(name).match(url)
         if b:
             return name, b
-    if not fetch:
+    if not session:
         return None
     from browser import check_url
     check_url(url)                      # raises UnsafeURL for loopback/private/link-local targets
-    status, html = fetch(url)
+    status, html = session.fetch(url)
     if not html:
         return None
     for name in cands:
         mod = load(name)
         if hasattr(mod, "probe"):
-            b = mod.probe(url, html, fetch)
+            b = mod.probe(url, html, session)
             if b:
                 return name, b
     seen = set()

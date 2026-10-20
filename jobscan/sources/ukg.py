@@ -29,23 +29,23 @@ def match(url):
             "url": base + "/", "params": {"base": base, "host": u.netloc}}
 
 
-def _search(fetch, board, skip):
+def _search(session, board, skip):
     body = {"opportunitySearch": {"Top": PAGE, "Skip": skip, "QueryString": "",
                                   "OrderBy": [{"Value": "postedDateDesc", "PropertyName": "PostedDate", "Ascending": False}],
                                   "Filters": []}}
-    status, text = fetch(f"{board['params']['base']}/JobBoardView/LoadSearchResults", data=body, accept="application/json")
+    status, text = session.fetch(f"{board['params']['base']}/JobBoardView/LoadSearchResults", data=body, accept="application/json")
     d = json_body(text)
     return status, (d if isinstance(d, dict) and isinstance(d.get("opportunities"), list) else None)
 
 
-def verify(board, fetch):
-    status, d = _search(fetch, board, 0)
+def verify(board, session):
+    status, d = _search(session, board, 0)
     if d is None:
         # the other host serves some boards
         alt = "recruiting2.ultipro.com" if board["params"]["host"] == "recruiting.ultipro.com" else "recruiting.ultipro.com"
         trial = {**board, "params": {**board["params"], "host": alt,
                                      "base": board["params"]["base"].replace(board["params"]["host"], alt)}}
-        s2, d2 = _search(fetch, trial, 0)
+        s2, d2 = _search(session, trial, 0)
         if d2 is not None:
             board["params"].update(trial["params"])
             board["url"] = board["params"]["base"] + "/"
@@ -65,9 +65,9 @@ def _card(board, o):
             "board_url": f"{board['params']['base']}/OpportunityDetail?opportunityId={o.get('Id')}"}
 
 
-def list_jobs(fetch, board, since_days=None, max_pages=100):
+def list_jobs(session, board, since_days=None, max_pages=100):
     def page(n):
-        status, d = _search(fetch, board, n * PAGE)
+        status, d = _search(session, board, n * PAGE)
         if d is None:
             return None
         return [_card(board, o) for o in d["opportunities"]], d.get("totalCount") or 0
@@ -101,8 +101,8 @@ def _description(html):
 JSON_FIELD_RE = {k: re.compile(r'"%s":"((?:[^"\\]|\\.)*)"' % k) for k in ("RequisitionNumber", "PostedDate", "Title")}
 
 
-def fetch_job(fetch, board, card):
-    status, html = fetch(card["board_url"])
+def fetch_job(session, board, card):
+    status, html = session.fetch(card["board_url"])
     if not html:
         return []
     for key, dst in (("RequisitionNumber", "req_id"), ("PostedDate", "open_date"), ("Title", "title")):

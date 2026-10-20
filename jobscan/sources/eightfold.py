@@ -36,7 +36,7 @@ def match(url):
     return None
 
 
-def probe(url, html, fetch):
+def probe(url, html, session):
     if "eightfold" not in html.lower():
         return None
     m = HTML_DOMAIN_RE.search(html)
@@ -50,14 +50,14 @@ def _list_url(board, start):
     return f"{p['origin']}/api/apply/v2/jobs?domain={p['domain']}&start={start}&num={PAGE}&sort_by=timestamp"
 
 
-def _page(fetch, board, start):
-    status, text = fetch(_list_url(board, start), accept="application/json")
+def _page(session, board, start):
+    status, text = session.fetch(_list_url(board, start), accept="application/json")
     d = json_body(text)
     return status, (d if isinstance(d, dict) and isinstance(d.get("positions"), list) else None)
 
 
-def verify(board, fetch):
-    status, d = _page(fetch, board, 0)
+def verify(board, session):
+    status, d = _page(session, board, 0)
     if d is None:
         raise ValueError(f"no Eightfold job list at {board['url']} (HTTP {status}); the site may need a browser session")
     board["params"]["total"] = d.get("count")
@@ -72,19 +72,19 @@ def _card(board, p):
             "card_html": ""}
 
 
-def list_jobs(fetch, board, since_days=None, max_pages=100):
+def list_jobs(session, board, since_days=None, max_pages=100):
     def page(n):
-        status, d = _page(fetch, board, n * PAGE)
+        status, d = _page(session, board, n * PAGE)
         if d is None:
             return None
         return [_card(board, p) for p in d["positions"]], d.get("count") or 0
     return paginate(page, since_days, max_pages, board["name"])
 
 
-def fetch_job(fetch, board, card):
+def fetch_job(session, board, card):
     p = board["params"]
-    status, text = fetch(f"{p['origin']}/api/apply/v2/jobs/{card['source_id']}?domain={p['domain']}",
-                         accept="application/json")
+    status, text = session.fetch(f"{p['origin']}/api/apply/v2/jobs/{card['source_id']}?domain={p['domain']}",
+                                 accept="application/json")
     j = json_body(text) or {}
     if not j.get("job_description") and not j.get("name"):
         return []

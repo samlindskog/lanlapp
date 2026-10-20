@@ -69,11 +69,11 @@ CARD_RE = re.compile(
 age_to_days = posted_text_days      # Yello shows NEW, 2d, 1w, 2mo or a bare 'Sep 3'
 
 
-def list_jobs(fetch, board, since_days=None, max_pages=100):
+def list_jobs(session, board, since_days=None, max_pages=100):
     cards, seen = [], set()
     base = board["params"]["base"]
     for page in range(1, max_pages + 1):
-        status, body = fetch(_search_url(board, page), accept="application/json")
+        status, body = session.fetch(_search_url(board, page), accept="application/json")
         if status != 200 or not body:
             break
         try:
@@ -119,15 +119,15 @@ ANN_RE = re.compile(r"(?<![0-9-])[A-Z]{4}-\d{2}-\d{6,9}(?:-[A-Z0-9]+)?\b")
 USAJOBS_RE = re.compile(r'href="(https://www\.usajobs\.gov(?::443)?/job/(\d+)[^"]*)"')
 
 
-def fetch_job(fetch, board, card):
+def fetch_job(session, board, card):
     docs = [doc("board_card", card["board_url"], card["card_html"])]
-    status, body = fetch(card["board_url"])
+    status, body = session.fetch(card["board_url"])
     if body:
         docs.append(doc("board_posting", card["board_url"], body))
         m = USAJOBS_RE.search(body)
         if m:
             uj_url = f"https://www.usajobs.gov/job/{m.group(2)}"
-            st2, body2 = fetch(uj_url)
+            st2, body2 = session.fetch(uj_url)
             if body2:
                 docs.append(doc("usajobs_announcement", uj_url, body2))
     return docs

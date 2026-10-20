@@ -9,8 +9,10 @@ os.environ["JOBSCAN_BROWSER"] = "0"
 HERE = os.path.dirname(os.path.abspath(__file__))
 FIX = os.path.join(HERE, "fixtures")
 sys.path.insert(0, os.path.join(HERE, "..", "jobscan"))
+sys.path.insert(0, HERE)
 import jobscan as J  # noqa: E402
 import sources as S  # noqa: E402
+from helpers import FakeSession  # noqa: E402
 
 REQUIRED = ("DISPLAY_NAME", "KIND", "BOARD_URL", "PRIMARY_KIND", "KEY_SECTION", "match", "list_jobs",
             "fetch_job", "parse_fields", "sections")
@@ -52,8 +54,8 @@ def check_contract(mod, name):
     assert mod.match("https://example.com/") is None, f"{name}: match() must reject unrelated URLs"
 
 
-def board_for(name, url, fetch):
-    hit = S.detect(url, fetch)
+def board_for(name, url, session):
+    hit = S.detect(url, session)
     assert hit and hit[0] == name, f"detect({url}) -> {hit}, expected {name}"
     b = hit[1]
     for k in ("key", "name", "url", "params"):
@@ -61,19 +63,20 @@ def board_for(name, url, fetch):
     b.update(id=1, adapter=name, enabled=True)
     mod = S.load(name)
     if hasattr(mod, "verify"):
-        b = mod.verify(b, fetch)
+        b = mod.verify(b, session)
     return mod, b
 
 
 def check_usace(mod):
-    mod, board = board_for("usace_yellogov", mod.BOARD_URL, stub_fetch)
+    session = FakeSession(stub_fetch)
+    mod, board = board_for("usace_yellogov", mod.BOARD_URL, session)
     assert board["key"] == "yello:usace.yellogov.com/rHrorPQ_B8HbgbWJDca8Ng", board["key"]
-    cards = mod.list_jobs(stub_fetch, board, since_days=7, max_pages=3)
+    cards = mod.list_jobs(session, board, since_days=7, max_pages=3)
     assert len(cards) == 1, cards
     c = cards[0]
     assert c["source_id"] == "ABC123def456GHI789jkl0" and c["title"] == "Budget Analyst"
     assert c["location"] == "Kahlotus, Washington" and c["age_days"] == 2
-    docs = mod.fetch_job(stub_fetch, board, c)
+    docs = mod.fetch_job(session, board, c)
     kinds = [d["kind"] for d in docs]
     assert kinds == ["board_card", "board_posting", "usajobs_announcement"], kinds
     f = mod.parse_fields(board, c, docs)
@@ -103,9 +106,10 @@ def check_usace(mod):
             return 200, json.dumps({"html": CARD_HTML + new_card + old_card + odd_card,
                                     "more_requisitions": False})
         return stub_fetch(url, retries, delay, accept)
-    ids = [c["source_id"][:3] for c in mod.list_jobs(fetch3, board, since_days=7, max_pages=1)]
+    session3 = FakeSession(fetch3)
+    ids = [c["source_id"][:3] for c in mod.list_jobs(session3, board, since_days=7, max_pages=1)]
     assert ids == ["ABC", "NEW", "ODD"], ids
-    assert [c["source_id"][:3] for c in mod.list_jobs(fetch3, board, since_days=None, max_pages=1)] == ["ABC", "NEW", "OLD", "ODD"]
+    assert [c["source_id"][:3] for c in mod.list_jobs(session3, board, since_days=None, max_pages=1)] == ["ABC", "NEW", "OLD", "ODD"]
 
 
 # Family adapters: fixtures captured from the live sites on 2026-10-14. Each case: adapter, a board
@@ -156,11 +160,12 @@ def check_family(name, url, fixtures, want):
             if k in u:
                 return 200, (f if f.startswith("<") else open(os.path.join(FIX, f), encoding="utf-8").read())
         return 404, ""
-    mod, board = board_for(name, url, fetch)
+    session = FakeSession(fetch)
+    mod, board = board_for(name, url, session)
     assert board["key"] == want["key"], (name, board["key"])
     if "name" in want:
         assert board["name"] == want["name"], (name, board["name"])
-    cards = mod.list_jobs(fetch, board, since_days=None, max_pages=2)
+    cards = mod.list_jobs(session, board, since_days=None, max_pages=2)
     assert len(cards) == want["cards"], (name, len(cards))
     c = cards[0]
     assert c["source_id"] and c["title"] and "board_url" in c, (name, c)
@@ -171,7 +176,7 @@ def check_family(name, url, fixtures, want):
     if "posted" in want:        # the fixture carries an absolute date; the adapter ages it against today
         import datetime as dt
         assert c["age_days"] == (dt.date.today() - dt.date.fromisoformat(want["posted"])).days, (name, c["age_days"])
-    docs = mod.fetch_job(fetch, board, c)
+    docs = mod.fetch_job(session, board, c)
     assert [d["kind"] for d in docs] == want["kinds"], (name, [d["kind"] for d in docs])
     assert len(docs[0]["text"] or "") >= want.get("min_text", 500), (name, len(docs[0]["text"] or ""))
     f = mod.parse_fields(board, c, docs)
@@ -186,7 +191,7 @@ def check_family(name, url, fixtures, want):
     # refresh path: a card rebuilt from the stored job alone must still fetch
     bare = {"source_id": c["source_id"], "title": c["title"], "location": c["location"],
             "board_url": c["board_url"], "card_html": "", "age_days": None}
-    docs2 = mod.fetch_job(fetch, board, bare)
+    docs2 = mod.fetch_job(session, board, bare)
     assert docs2 and docs2[0]["kind"] == "posting", (name, "refresh fetch")
     f2 = mod.parse_fields(board, bare, docs2)
     for fk in ("announcement_no", "open_date", "external_url", "salary"):   # a refresh must not lose fields
@@ -215,7 +220,7 @@ def check_detection():
     assert S.detect("https://www.example.com/careers") is None
     # link scan: a careers page that only links to its Workday board
     page = '<html><a href="https://geico.wd1.myworkdayjobs.com/External">Jobs</a></html>'
-    hit = S.detect("https://careers.geico.com/", lambda u, **k: (200, page))
+    hit = S.detect("https://careers.geico.com/", FakeSession(lambda u, **k: (200, page)))
     assert hit and hit[0] == "workday" and hit[1]["key"] == "workday:geico/External", hit
 
 

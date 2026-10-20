@@ -41,13 +41,13 @@ def add_board(conn, url, name=None, include=None, exclude=None, adapter=None, pa
     import sources as S
     s, owned = _session(session)
     try:
-        hit = S.detect(url, s.fetch, adapter=adapter)
+        hit = S.detect(url, s, adapter=adapter)
         if not hit:
             raise ValueError(f"no adapter recognises {url} (adapters: {', '.join(list_sources())})")
         adapter_name, board = hit
         mod = load_source(adapter_name)
         if hasattr(mod, "verify"):
-            board = mod.verify(board, s.fetch)   # confirms the endpoint answers; may fix tenant/site ids
+            board = mod.verify(board, s)   # confirms the endpoint answers; may fix tenant/site ids
     finally:
         if owned:
             s.close()

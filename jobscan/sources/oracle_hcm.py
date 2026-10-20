@@ -45,21 +45,21 @@ def _list_url(board, offset):
             f"sortBy=POSTING_DATES_DESC,limit={PAGE},offset={offset}")
 
 
-def _page(fetch, board, offset):
-    status, text = fetch(_list_url(board, offset), accept="application/json")
+def _page(session, board, offset):
+    status, text = session.fetch(_list_url(board, offset), accept="application/json")
     d = json_body(text)
     items = (d or {}).get("items") if isinstance(d, dict) else None
     return status, (items[0] if items else None)
 
 
-def verify(board, fetch):
-    status, it = _page(fetch, board, 0)
+def verify(board, session):
+    status, it = _page(session, board, 0)
     if it is None or it.get("TotalJobsCount") is None:
         for alt in TRY_SITES:
             if alt == board["params"]["site_number"]:
                 continue
             trial = {**board, "params": {**board["params"], "site_number": alt}}
-            s2, it2 = _page(fetch, trial, 0)
+            s2, it2 = _page(session, trial, 0)
             if it2 is not None and it2.get("TotalJobsCount"):
                 board["params"]["site_number"] = alt
                 it = it2
@@ -79,9 +79,9 @@ def _card(board, r):
             "board_url": f"{p['origin']}/hcmUI/CandidateExperience/en/sites/{p['site']}/job/{rid}", "card_html": ""}
 
 
-def list_jobs(fetch, board, since_days=None, max_pages=100):
+def list_jobs(session, board, since_days=None, max_pages=100):
     def page(n):
-        status, it = _page(fetch, board, n * PAGE)
+        status, it = _page(session, board, n * PAGE)
         if it is None:
             return None
         return [_card(board, r) for r in it.get("requisitionList") or []], it.get("TotalJobsCount") or 0
@@ -94,8 +94,8 @@ def _detail_url(board, rid):
             f"&onlyData=true&finder=ById;Id=%22{rid}%22,siteNumber={p['site_number']}")
 
 
-def fetch_job(fetch, board, card):
-    status, text = fetch(_detail_url(board, card["source_id"]), accept="application/json")
+def fetch_job(session, board, card):
+    status, text = session.fetch(_detail_url(board, card["source_id"]), accept="application/json")
     d = json_body(text) or {}
     it = (d.get("items") or [None])[0]
     if not it:

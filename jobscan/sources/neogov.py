@@ -39,13 +39,13 @@ def match(url):
             "params": {"agency": agency}}
 
 
-def _page(fetch, board, page):
-    return fetch(f"{HOST}/careers/home/index?agency={board['params']['agency']}&page={page}",
-                 headers={"X-Requested-With": "XMLHttpRequest"})
+def _page(session, board, page):
+    return session.fetch(f"{HOST}/careers/home/index?agency={board['params']['agency']}&page={page}",
+                         headers={"X-Requested-With": "XMLHttpRequest"})
 
 
-def verify(board, fetch):
-    status, html = _page(fetch, board, 1)
+def verify(board, session):
+    status, html = _page(session, board, 1)
     if not html or "job-postings-number" not in html:
         raise ValueError(f"no NEOGOV listing for agency {board['params']['agency']} (HTTP {status})")
     m = re.search(r'id="job-postings-number">(\d+)', html)
@@ -75,9 +75,9 @@ def _card(board, m):
             "card_html": m.group(0)}
 
 
-def list_jobs(fetch, board, since_days=None, max_pages=100):
+def list_jobs(session, board, since_days=None, max_pages=100):
     def page(n):
-        status, html = _page(fetch, board, n)
+        status, html = _page(session, board, n)
         if not html:
             return None
         return [_card(board, m) for m in ITEM_RE.finditer(html)], None
@@ -91,8 +91,8 @@ HEADINGS = ["Description", "Primary Purpose", "Essential Job Functions", "Essent
             "Supplemental Information", "Working Conditions", "Physical Demands", "Benefits"]
 
 
-def fetch_job(fetch, board, card):
-    status, html = fetch(card["board_url"])
+def fetch_job(session, board, card):
+    status, html = session.fetch(card["board_url"])
     if not html:
         return []
     m = DETAIL_RE.search(html)

@@ -28,16 +28,16 @@ def match(url):
     return None
 
 
-def _page(fetch, board, page):
-    status, text = fetch(f"{board['params']['origin']}/api/jobs?page={page}&limit={PAGE}&sortBy=posted_date&descending=true",
-                         accept="application/json")
+def _page(session, board, page):
+    status, text = session.fetch(f"{board['params']['origin']}/api/jobs?page={page}&limit={PAGE}&sortBy=posted_date&descending=true",
+                                 accept="application/json")
     d = json_body(text)
     return status, (d if isinstance(d, dict) and isinstance(d.get("jobs"), list) else None)
 
 
-def probe(url, html, fetch):
+def probe(url, html, session):
     b = _board(url)
-    status, d = _page(fetch, b, 1)
+    status, d = _page(session, b, 1)
     if d is None or not all(isinstance(j.get("data"), dict) for j in d["jobs"][:3]):
         return None
     hiring = next((j["data"].get("hiring_organization") for j in d["jobs"] if j.get("data")), None)
@@ -46,8 +46,8 @@ def probe(url, html, fetch):
     return b
 
 
-def verify(board, fetch):
-    status, d = _page(fetch, board, 1)
+def verify(board, session):
+    status, d = _page(session, board, 1)
     if d is None:
         raise ValueError(f"no Jibe /api/jobs at {board['url']} (HTTP {status})")
     board["params"]["total"] = d.get("totalCount")
@@ -64,25 +64,25 @@ def _card(board, j):
             "external_url": d.get("apply_url"), "card_html": "", "data": d}
 
 
-def list_jobs(fetch, board, since_days=None, max_pages=100):
+def list_jobs(session, board, since_days=None, max_pages=100):
     def page(n):
-        status, d = _page(fetch, board, n)
+        status, d = _page(session, board, n)
         if d is None:
             return None
         return [c for c in (_card(board, j) for j in d["jobs"]) if c["source_id"]], d.get("totalCount") or 0
     return paginate(page, since_days, max_pages, board["name"], start=1)
 
 
-def fetch_job(fetch, board, card):
+def fetch_job(session, board, card):
     d = card.get("data")
     if not d:   # refresh: the listing search finds a job by its req id (there is no per-job endpoint)
-        status, text = fetch(f"{board['params']['origin']}/api/jobs?keywords={card['source_id']}&limit=20",
-                             accept="application/json")
+        status, text = session.fetch(f"{board['params']['origin']}/api/jobs?keywords={card['source_id']}&limit=20",
+                                     accept="application/json")
         j = json_body(text) or {}
         d = next((x.get("data") for x in (j.get("jobs") or []) if isinstance(x.get("data"), dict)
                   and str(x["data"].get("req_id") or x["data"].get("slug")) == str(card["source_id"])), None)
         if not d:
-            status, text = fetch(card["board_url"])
+            status, text = session.fetch(card["board_url"])
             return [doc("posting", card["board_url"], text)] if text else []
         card.update({k: v for k, v in _card(board, {"data": d}).items() if not card.get(k)})   # fresh listing data for parse_fields
     extra = [("Qualifications", d.get("qualifications"))]

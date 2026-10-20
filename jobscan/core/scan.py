@@ -36,13 +36,12 @@ def scan_board(conn, board, session, days=7, all_=False, limit=None, refetch=Fal
     include/exclude regexes. progress: a Progress (board-level fields are set by the caller);
     session.check() is run between postings so a cancel lands between fetches."""
     p = progress or Progress()
-    fetch = session.fetch
     src = load_source(board["adapter"])
     conn.execute("""INSERT INTO sources VALUES (%s,%s,%s)
         ON CONFLICT (name) DO UPDATE SET display_name=EXCLUDED.display_name, board_url=EXCLUDED.board_url""",
                  (board["adapter"], src.DISPLAY_NAME, board["url"]))
     conn.commit()
-    cards = src.list_jobs(fetch, board, since_days=None if all_ else days, max_pages=max_pages)
+    cards = src.list_jobs(session, board, since_days=None if all_ else days, max_pages=max_pages)
     keep = _title_filter(board)
     skipped = [c for c in cards if not keep(c.get("title"))]
     cards = [c for c in cards if keep(c.get("title"))]
@@ -66,7 +65,7 @@ def scan_board(conn, board, session, days=7, all_=False, limit=None, refetch=Fal
             p.add(known=1)
             continue
         log(f"[{i+1}/{len(cards)}] {card['title']} — {card.get('location','')}")
-        docs = src.fetch_job(fetch, board, card)
+        docs = src.fetch_job(session, board, card)
         if not docs:                                   # nothing fetched: leave it for the next scan
             log(f"  ! no document fetched for {card['source_id']}; skipped")
             p.add(skipped=1)
@@ -174,17 +173,17 @@ def refresh_job(conn, job_id, log=print, embed=True, session=None):
         raise KeyError(job_id)
     s, owned = _session(session, log)
     try:
-        return _refresh_job(conn, j, s.fetch, log, embed)
+        return _refresh_job(conn, j, s, log, embed)
     finally:
         if owned:
             s.close()
 
-def _refresh_job(conn, j, fetch, log, embed):
+def _refresh_job(conn, j, session, log, embed):
     job_id = j["id"]
     if j["source"] == "manual" or not j["board_url"]:
         if not j["external_url"]:
             return {"id": job_id, "refetched": 0}
-        st, body = fetch(j["external_url"])
+        st, body = session.fetch(j["external_url"])
         if body:
             _store_documents(conn, job_id, [{"kind": "posting", "url": j["external_url"],
                                              "raw_html": body, "text": html_to_text(body)}], replace=True)
@@ -201,7 +200,7 @@ def _refresh_job(conn, j, fetch, log, embed):
                                           "url": j["board_url"], "params": {}, "enabled": True}
     card = {"source_id": j["source_id"], "title": j["title"], "location": j["location"],
             "board_url": j["board_url"], "card_html": "", "age_days": None}
-    docs = [d for d in src.fetch_job(fetch, board, card) if d["kind"] != "board_card"]
+    docs = [d for d in src.fetch_job(session, board, card) if d["kind"] != "board_card"]
     if not docs:                                   # fetch failed: keep what we have
         log(f"refresh [{job_id}] {j['title']}: nothing fetched, stored data kept")
         return {"id": job_id, "refetched": 0, "close_date": j["close_date"]}

@@ -46,8 +46,8 @@ def _list_url(board, page):
 XHR = "text/html"
 
 
-def verify(board, fetch):
-    status, html = fetch(_list_url(board, 0), accept=XHR)
+def verify(board, session):
+    status, html = session.fetch(_list_url(board, 0), accept=XHR)
     if not html or "iCIMS_JobCardItem" not in html and "iCIMS_JobsTable" not in html:
         raise ValueError(f"no iCIMS job list at {board['url']} (HTTP {status})")
     t = re.search(r"<title>(.*?)</title>", html, re.S)
@@ -76,13 +76,13 @@ def _card(board, m):
             "board_url": href, "card_html": m.group(0)}
 
 
-def list_jobs(fetch, board, since_days=None, max_pages=100):
+def list_jobs(session, board, since_days=None, max_pages=100):
     last = []
 
     def page(n):
         if last and n >= last[0]:
             return [], None
-        status, html = fetch(_list_url(board, n), accept=XHR)
+        status, html = session.fetch(_list_url(board, n), accept=XHR)
         if not html:
             return None
         pm = PAGE_RE.search(html)                  # "Search Results Page 1 of 2"
@@ -92,9 +92,9 @@ def list_jobs(fetch, board, since_days=None, max_pages=100):
     return paginate(page, since_days, max_pages, board["name"], date_sorted=False)   # cards carry no date
 
 
-def fetch_job(fetch, board, card):
+def fetch_job(session, board, card):
     url = card["board_url"] + ("?in_iframe=1" if "?" not in card["board_url"] else "&in_iframe=1")
-    status, html = fetch(url, accept=XHR)
+    status, html = session.fetch(url, accept=XHR)
     if not html:
         return []
     fields = {}

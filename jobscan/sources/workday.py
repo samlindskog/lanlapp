@@ -51,21 +51,21 @@ def _cxs(board):
     return f"{p['origin']}/wday/cxs/{p['tenant']}/{p['site']}"
 
 
-def _page(fetch, board, offset, search=""):
+def _page(session, board, offset, search=""):
     body = {"appliedFacets": board["params"].get("facets") or {}, "limit": PAGE, "offset": offset,
             "searchText": search}
-    status, text = fetch(f"{_cxs(board)}/jobs", data=body, accept="application/json")
+    status, text = session.fetch(f"{_cxs(board)}/jobs", data=body, accept="application/json")
     d = json_body(text)
     return status, (d if isinstance(d, dict) and "jobPostings" in d else None)
 
 
-def verify(board, fetch):
+def verify(board, session):
     """Confirm the CXS endpoint answers; try the underscore tenant variant if not."""
-    status, d = _page(fetch, board, 0)
+    status, d = _page(session, board, 0)
     if d is None and "-" in board["params"]["tenant"]:
         alt = board["params"]["tenant"].replace("-", "_")
         trial = {**board, "params": {**board["params"], "tenant": alt}}
-        status2, d2 = _page(fetch, trial, 0)
+        status2, d2 = _page(session, trial, 0)
         if d2 is not None:
             board["params"]["tenant"] = alt
             board["key"] = board["key"].replace(f"workday:{board['params']['tenant'].replace('_', '-')}/", f"workday:{alt}/", 1)
@@ -86,12 +86,12 @@ def _card(board, j):
             "board_url": f"{p['origin']}/{p['site']}{path}", "card_html": ""}
 
 
-def list_jobs(fetch, board, since_days=None, max_pages=100):
+def list_jobs(session, board, since_days=None, max_pages=100):
     search = board["params"].get("query") or ""       # with a search text the order is relevance
     total = []
 
     def page(n):
-        status, d = _page(fetch, board, n * PAGE, search)
+        status, d = _page(session, board, n * PAGE, search)
         if d is None:
             return None
         if not total:
@@ -109,8 +109,8 @@ def _path(board, card):
     return u.path[i + len(site) + 1:] if i >= 0 else u.path
 
 
-def fetch_job(fetch, board, card):
-    status, text = fetch(f"{_cxs(board)}{_path(board, card)}", accept="application/json")
+def fetch_job(session, board, card):
+    status, text = session.fetch(f"{_cxs(board)}{_path(board, card)}", accept="application/json")
     d = json_body(text) or {}
     info = d.get("jobPostingInfo") or {}
     if not info:

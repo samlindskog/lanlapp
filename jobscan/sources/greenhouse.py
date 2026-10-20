@@ -37,8 +37,8 @@ def _api(board):
     return f"https://boards-api.greenhouse.io/v1/boards/{board['params']['token']}/jobs?content=true"
 
 
-def verify(board, fetch):
-    status, text = fetch(_api(board), accept="application/json")
+def verify(board, session):
+    status, text = session.fetch(_api(board), accept="application/json")
     d = json_body(text)
     if not isinstance(d, dict) or "jobs" not in d:
         raise ValueError(f"no Greenhouse board '{board['params']['token']}' (HTTP {status})")
@@ -57,8 +57,8 @@ def _card(board, j):
             "board_url": j.get("absolute_url") or f"{board['url']}/jobs/{j.get('id')}", "card_html": "", "data": j}
 
 
-def list_jobs(fetch, board, since_days=None, max_pages=100):
-    status, text = fetch(_api(board), accept="application/json")
+def list_jobs(session, board, since_days=None, max_pages=100):
+    status, text = session.fetch(_api(board), accept="application/json")
     d = json_body(text)
     if not isinstance(d, dict) or "jobs" not in d:
         log(f"  ! greenhouse: no list for {board['name']} (HTTP {status})")
@@ -68,11 +68,11 @@ def list_jobs(fetch, board, since_days=None, max_pages=100):
     return within(cards, since_days)
 
 
-def fetch_job(fetch, board, card):
+def fetch_job(session, board, card):
     j = card.get("data")
     if not j:
-        status, text = fetch(f"https://boards-api.greenhouse.io/v1/boards/{board['params']['token']}/jobs/{card['source_id']}",
-                             accept="application/json")
+        status, text = session.fetch(f"https://boards-api.greenhouse.io/v1/boards/{board['params']['token']}/jobs/{card['source_id']}",
+                                     accept="application/json")
         j = json_body(text) or {}
         if isinstance(j, dict) and "jobs" in j:          # a board listing came back: pick ours
             j = next((x for x in j["jobs"] if str(x.get("id")) == str(card["source_id"])), {})
