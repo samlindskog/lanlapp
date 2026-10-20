@@ -231,7 +231,13 @@ def check_relay():
         reply += _read_all(c)
         c.close()
         assert status == 200 and b"origin ok /abs?x=1" in reply and paths[-1] == "/abs?x=1", reply   # origin-form
+        # An idle tunnel opened before an escalation is dropped by it (Chrome pools connections
+        # inside a tunnel; without this its next request would keep the old route).
+        _, idle, _ = _relay_request(port, f"CONNECT 127.0.0.1:{oport} HTTP/1.1\r\n\r\n".encode())
         assert s.access.escalate("https://127.0.0.1/", "test")                           # -> level 1
+        idle.settimeout(3)
+        assert idle.recv(10) == b"", "tunnel survived the escalation"
+        idle.close()
         status, body = _tunnel_get(port, oport, "/via-proxy")
         assert status == 200 and b"origin ok /via-proxy" in body, (status, body)
         assert len(heads) == 1 and b"Proxy-Authorization: Basic dTpwdw==" in heads[0], heads  # u:pw
@@ -252,6 +258,10 @@ def check_relay():
         pass
     else:
         raise AssertionError("relay still accepting after Session.close()")
+    # The fixed port is free again at once (Linux keeps a listener alive while a thread sits in
+    # accept(); close() must wake it, or the next operation's relay cannot bind).
+    with B.Session(lambda m: None, B.Config(dict(env, JOBSCAN_RELAY_PORT=str(port)))) as s2:
+        assert s2.relay.port == port
     with B.Session(lambda m: None, cfg) as s:                                            # the real guard
         assert _tunnel_get(s.relay.port, oport)[0] == 403
         assert _relay_request(s.relay.port, b"CONNECT localhost:80 HTTP/1.1\r\n\r\n")[0] == 403

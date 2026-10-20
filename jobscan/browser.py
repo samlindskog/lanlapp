@@ -375,6 +375,7 @@ class Access:
         self._level = {}
         self.blocked = set()
         self.log = log
+        self.on_change = lambda host: None   # the Session's relay: drop live tunnels to a re-routed host
 
     @staticmethod
     def host(url):
@@ -394,9 +395,11 @@ class Access:
             self.blocked.add(host)
             self.log(f"  ! {host}: {why} on {self.pool.label(self.pool.url(lvl))}; "
                      f"blocked for this operation after {lvl} proxy session(s)")
+            self.on_change(host)
             return False
         self._level[host] = lvl + 1
         self.log(f"  ! {host}: {why} on {self.pool.label(self.pool.url(lvl))} -> {self.pool.label(self.pool.url(lvl + 1))}")
+        self.on_change(host)
         return True
 
 
@@ -450,8 +453,25 @@ class ProxyRelay:
         self.port = self.sock.getsockname()[1]
         self.addr = f"127.0.0.1:{self.port}"
         self._stop = False
+        self._live = {}                    # host -> {(client, upstream socket)}: tunnels in flight
+        self._lock = threading.Lock()
         self._thread = threading.Thread(target=self._serve, name="proxy-relay", daemon=True)
         self._thread.start()
+
+    def drop(self, host):
+        """Close every live tunnel to a host. Chrome pools connections inside a tunnel, so a host
+        whose level just changed would keep using the old route; closing the tunnel makes its next
+        request a new CONNECT, routed at the new level (the old design restarted Chrome for this)."""
+        with self._lock:
+            pairs = list(self._live.pop(host, ()))
+        for pair in pairs:
+            for s_ in pair:
+                try:
+                    s_.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+        if pairs:
+            self.log(f"  relay: dropped {len(pairs)} tunnel(s) to {host}")
 
     def _serve(self):
         while not self._stop:
@@ -517,6 +537,8 @@ class ProxyRelay:
                 self.log(f"  ! relay: cannot reach {ProxyPool.label(upstream) if upstream else req.host}: {e}")
                 client.sendall(_reply(502, f"cannot reach {req.host}"))
                 return
+            with self._lock:
+                self._live.setdefault(req.host, set()).add((client, up))
             if upstream:
                 up.sendall(req.head(auth=_basic_auth(upstream)) + rest)
             elif req.connect:
@@ -529,6 +551,9 @@ class ProxyRelay:
         except Exception:  # noqa: BLE001
             pass
         finally:
+            with self._lock:
+                for pairs in self._live.values():
+                    pairs.discard((client, up))
             for s_ in (client, up):
                 try:
                     s_.close()
@@ -571,11 +596,17 @@ class ProxyRelay:
                 (b if s_ is a else a).sendall(data)
 
     def close(self):
+        """Stop accepting and release the port. shutdown() first: close() alone does not wake a
+        thread blocked in accept(), and the kernel keeps the listening socket (and the fixed port)
+        alive until that accept returns, so the next operation's relay could not bind."""
         self._stop = True
-        try:
-            self.sock.close()
-        except OSError:
-            pass
+        for call in (lambda: self.sock.shutdown(socket.SHUT_RDWR), self.sock.close):
+            try:
+                call()
+            except OSError:
+                pass
+        if self._thread.is_alive() and threading.current_thread() is not self._thread:
+            self._thread.join(timeout=2)
 
 
 class _ProxyRequest:
@@ -969,6 +1000,7 @@ class Session:
         # The relay is the way out for Chrome and for Firecrawl; plain HTTP uses the proxies itself.
         if self.cfg.enabled or self.cfg.firecrawl:
             self.relay = ProxyRelay(self.access, self.cfg, self.log, self.dest_check)
+            self.access.on_change = self.relay.drop
             self.chrome.relay = self.relay
         self._token = _current_log.set(self.log)
         return self
