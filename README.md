@@ -37,9 +37,13 @@ jobboard/            shared research service over the database
                        the scan dialog with its tab strip), geo.js (the dialog's Geographic tab + geo helpers),
                        view.html (one job), login.html
   Dockerfile           the production image: python:3.13-slim + psycopg + jobscan/ + jobboard/, nothing else
-  compose.yaml         dev stack;  compose.auth.yaml: overlay with auth + nginx;  compose.prod.yaml: VPS
+  compose.yaml         dev stack;  compose.auth.yaml: overlay with auth + nginx;  compose.crawl.yaml: overlay joining
+                       the crawl network (dev.sh up-fc);  compose.prod.yaml: production (the desktop)
   dev.sh               up | up-auth | smoke | token | logs | ps | down
-deploy/              VPS: bootstrap.sh, deploy.sh, compose-up.sh, nginx/ (site + rule snippets shared with dev)
+deploy/              production hosts: bootstrap.sh (the desktop: install, dump/restore/export modes), hub-bootstrap.sh
+                       (the WireGuard hub: Cloudflare 443 forward, enable-dnat/disable-dnat/retire-app), deploy.sh,
+                       compose-up.sh, nginx/ (site + snippets, shared with dev), systemd/ (WireGuard watchdog),
+                       crawl/ (Firecrawl + SearXNG stack), RUNBOOK.md (the migration, step by step)
 tests/               test_adapters.py (adapters), test_browser.py (fetch layer, guards), test_service.py
                        (operation table vs both doors), test_geo.py (geographic scan over fakes), smoke.sh
                        (end-to-end against a running auth stack)
@@ -108,30 +112,50 @@ docker compose -f jobboard/compose.yaml exec db pg_dump -U jobscan jobscan | gzi
 gunzip -c jobscan-backup.sql.gz | docker compose -f jobboard/compose.yaml exec -T db psql -U jobscan jobscan
 ```
 
-## Production (uscentral1)
+## Production (the desktop `sldesktop`, behind the WireGuard hub `uscentral1`)
 
-- https://jobs.slindskog.net behind nginx (Cloudflare origin cert + authenticated origin pulls), password login.
-- Stack: `jobboard/compose.prod.yaml` under `/opt/jobboard`, Postgres data in the `pgdata` volume. The app
-  image is built from the checkout and holds only `jobboard/` and `jobscan/` (`.dockerignore` at the repo
-  root); no code or repo is mounted. Container: nobody user, read-only, no capabilities, 512 MB.
-- nginx: `deploy/nginx/jobboard.conf` (site: TLS, listeners, WireGuard allow-list) installed to
-  sites-available, plus the rule snippets `deploy/nginx/jobboard-*.conf` installed to `/etc/nginx/jobboard/`.
-  Both are installed by the bootstrap, so an nginx change needs a bootstrap run, not a push.
-- Deploy: push to master -> GitHub Actions tests, then ssh as `deploy`. The deploy keys are pinned to a
+- Topology: the stack runs on the desktop (Debian, WireGuard peer 10.88.0.2, sshd 1025). The hub
+  (72.14.178.40, WireGuard 10.88.0.1) runs nothing but WireGuard and nftables: it forwards Cloudflare's 443 to
+  10.88.0.2:443 (DNAT, only from Cloudflare's published ranges, refreshed weekly by `jobboard-cloudflare-ips.timer`;
+  masqueraded so the desktop sees 10.88.0.1), public 2222 to the desktop's sshd, and routes the laptop
+  (10.88.0.3) to the desktop for ssh and MCP. DNS is unchanged: jobs.slindskog.net and slindskog.net point at
+  Cloudflare, whose origin is the hub.
+- https://jobs.slindskog.net: nginx on the desktop binds 10.88.0.2:443 only, with the Cloudflare origin cert and
+  authenticated origin pulls (`deploy/nginx/jobboard-tls.conf`), trusting 10.88.0.1 for the real client address
+  (`jobboard-realip.conf`); password login. The homepage for slindskog.net is served here too.
+- Stack: `jobboard/compose.prod.yaml` under `/opt/jobboard`, Postgres data in the `pgdata` volume. The app image
+  is built from the checkout and holds only `jobboard/` and `jobscan/` (`.dockerignore` at the repo root); no
+  code or repo is mounted. Container: nobody user, read-only, no capabilities, 3 GB. It also joins the external
+  Docker network `crawl` (172.31.0.0/24), where the crawl stack (`deploy/crawl/compose.yaml`, project `crawl`:
+  Firecrawl, its Playwright service, queue and database, and SearXNG; no published ports) runs. Firecrawl's
+  outbound traffic goes through the app's proxy relay (`JOBSCAN_RELAY_PORT` 8899, peers `JOBSCAN_RELAY_PEERS`),
+  so one access policy covers Chrome and Firecrawl alike.
+- nginx: `deploy/nginx/jobboard.conf` (site; placeholders for the addresses filled by the bootstrap) installed to
+  sites-available, plus the snippets `deploy/nginx/jobboard-*.conf` installed to `/etc/nginx/jobboard/` and the
+  certificates to `/etc/nginx/jobboard/certs/`. All installed by the bootstrap, so an nginx change needs a
+  bootstrap run, not a push.
+- Deploy: push to master -> GitHub Actions tests, then ssh as `deploy` through the hub's 2222 forward (secrets
+  DEPLOY_HOST, DEPLOY_PORT=2222, DEPLOY_KNOWN_HOSTS = the desktop's host key). The deploy keys are pinned to a
   forced command (`/usr/local/bin/jobboard-deploy`, root-owned copy of `deploy/deploy.sh`): a key holder can
   only deploy a ref. `deploy` has no docker access; the container work runs through the sudoers-whitelisted
   root helper `/usr/local/sbin/jobboard-compose-up` (`deploy/compose-up.sh`). Both copies are installed by
   the bootstrap, so changing deploy logic needs a bootstrap run, not a push.
-  Manual: `ssh -i ~/.ssh/jobboard_deploy deploy@72.14.178.40 jobboard-deploy [ref]`.
+  Manual: `ssh -i ~/.ssh/jobboard_deploy -p 2222 deploy@72.14.178.40 jobboard-deploy [ref]`.
 - Tokens: `POST /api/auth/token {name, password}` once; then `Authorization: Bearer <token>` for API and MCP.
 - Only the login paths (`/login`, `/login.html`, `POST /api/auth/login`, `POST /api/auth/token`) are reachable
   without a credential. nginx refuses every other request that carries neither a session cookie nor a Bearer
   token (401 for `/api/`, redirect to login for pages), and the app enforces the same rule again.
-- MCP for Claude Code, reachable only over WireGuard (nginx on 10.88.0.1:8090, Bearer only, proxied to the
-  container on 127.0.0.1:8091):
-  `claude mcp add --transport http jobboard http://10.88.0.1:8090/mcp --header "Authorization: Bearer <token>"`
-- One-time server setup: `deploy/bootstrap.sh` (see its header). Firewall input policy: ssh, WireGuard, 443, MCP on wg0.
-  Re-runnable; also restores `/tmp/jobscan-dump.sql.gz` into an empty database. Secrets: `deploy/push-secrets.sh`.
+- MCP for Claude Code, reachable only over WireGuard (nginx on 10.88.0.2:8090, Bearer only, proxied to the
+  container on 127.0.0.1:8091; the hub forwards 10.88.0.3 -> 10.88.0.2:8090):
+  `claude mcp add --transport http jobboard http://10.88.0.2:8090/mcp --header "Authorization: Bearer <token>"`
+- Firewall: the desktop filters only what arrives on `wg0` (`table inet jobboard`: the hub to 443 and 1025, the
+  laptop to 1025 and 8090, ICMP; LAN untouched). The hub accepts 443 only from Cloudflare's ranges. A watchdog
+  (`jobboard-wg-watch.timer`) restarts the desktop's tunnel after repeated failed pings of the hub.
+- Host setup: `deploy/bootstrap.sh` on the desktop (staged by `scp deploy/bootstrap.sh
+  sldesktoplocal:/home/sam/jobboard-bootstrap/bootstrap.sh`, run with sudo; re-runnable; maintenance modes by
+  flag file: `dump` = the off-box backup, `restore` = replace the database from a staged dump, `export-secrets`,
+  `export-certs`, `show-firewall`, `reboot`) and `deploy/hub-bootstrap.sh` on the hub (`--check`, `apply`,
+  `enable-dnat`, `disable-dnat`, `retire-app`). `deploy/RUNBOOK.md` is the migration runbook.
 - Claude's token lives in `~/.config/jobboard/token` on the Mac; the MCP server is registered in Claude Code as `jobboard`.
 - MCP tools: stats, list_jobs, get_job, get_section, search, sources, boards, add_boards, update_board,
   delete_board, scan, run_status, cancel_run, repeat_run, refresh, set_verdict, set_status, add_job, upload_resume,
