@@ -40,7 +40,8 @@
         <small>${a.all ? "whole board" : `last ${a.days ?? 7} days`}${a.refetch ? " · re-fetching stored postings" : ""}${a.source ? ` · source ${esc(a.source)}` : ""}</small>`;
     }
     if (r.kind === "geo") {
-      const where = a.lat != null ? `<a href="${esc(JB.geo.mapsLink(a.lat, a.lon))}" target="_blank" rel="noopener" title="${esc(a.center || "")}">${esc(a.label || JB.geo.fmtCoord(a.lat, a.lon))}</a>` : esc(a.center || "?");
+      const typed = a.center_text || a.center || "";        // center_text: as typed (an address, a Maps link); center: the coordinates
+      const where = a.lat != null ? `<a href="${esc(JB.geo.mapsLink(a.lat, a.lon))}" target="_blank" rel="noopener" title="${esc(typed)}">${esc(a.label || JB.geo.fmtCoord(a.lat, a.lon))}</a>` : esc(typed || "?");
       return `${where} <small>${esc(JB.geo.describeArgs(a))}</small>`;
     }
     if (r.kind === "refresh") return `${(a.ids || []).length} posting(s)`;

@@ -117,9 +117,10 @@
                max_places: Number($("#geoMax").value || 300), recheck_days: Number($("#geoRecheck").value || 0),
                rediscover: $("#geoRediscover").checked };
     },
-    // Edit and run on the Scans page: the stored request's args, as the user typed them.
+    // Edit and run on the Scans page: the stored request's args. center_text is what was typed
+    // (an address is geocoded again on this interactive path; a Repeat uses the stored coordinates).
     prefill(panel, a) {
-      $("#geoCenter").value = a.center || ""; $("#geoRadius").value = a.radius_km ?? 10;
+      $("#geoCenter").value = a.center_text || a.center || ""; $("#geoRadius").value = a.radius_km ?? 10;
       $("#geoMax").value = a.max_places ?? 300; $("#geoRecheck").value = a.recheck_days ?? 30;
       $("#geoRediscover").checked = !!a.rediscover; $("#geoKeywords").value = a.keywords || "";
       $("#geoTags").value = Array.isArray(a.tags) ? a.tags.join("\n") : (a.tags || "");

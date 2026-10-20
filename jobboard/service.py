@@ -374,9 +374,11 @@ def geo_categories(args):
 
 def geo_scan(args):
     """Start a geographic scan (a persisted run of kind 'geo'): businesses around the centre ->
-    their careers pages become boards (origin geo) -> those boards are scanned. The request is
-    stored as given (repeat_run replays it); the run's args carry the resolved centre."""
+    their careers pages become boards (origin geo) -> those boards are scanned. The stored
+    request (what repeat_run replays) carries the centre as resolved coordinates, so a repeat
+    is deterministic and needs no geocoder; what was typed is kept as center_text for display."""
     lat, lon, label = _resolve_center(args.get("center"))
+    center, center_text = f"{lat:.5f}, {lon:.5f}", (args.get("center_text") or args.get("center") or "").strip()
     radius = 10.0 if args.get("radius_km") in (None, "") else float(args["radius_km"])
     if not 0 < radius <= 200:
         raise ValueError("radius_km must be between 0 and 200")
@@ -393,7 +395,7 @@ def geo_scan(args):
     max_places = _int(args.get("max_places"), 300)
     if not 1 <= max_places <= 5000:
         raise ValueError("max_places must be between 1 and 5000")
-    resolved = {"center": (args.get("center") or "").strip(), "lat": lat, "lon": lon, "label": label,
+    resolved = {"center": center, "center_text": center_text, "lat": lat, "lon": lon, "label": label,
                 "radius_km": radius, "categories": cats, "keywords": (args.get("keywords") or "").strip() or None,
                 "tags": _strs(args.get("tags")) or [], "finders": finders,
                 "include": J.check_regex(args.get("include"), "include"),
@@ -405,7 +407,7 @@ def geo_scan(args):
     def work(conn, run):
         with J.browser.Session(run.log, check=run.check) as s:
             return J.geo_scan(conn, resolved, s, log=run.log, progress=run.progress, check=run.check, run_id=run.id)
-    rid = runs.start("geo", resolved, work, request={"op": "geo_scan", "args": args})
+    rid = runs.start("geo", resolved, work, request={"op": "geo_scan", "args": {**args, "center": center, "center_text": center_text}})
     return {"run_id": rid, "status": "running", "center": {"lat": lat, "lon": lon, "label": label}}
 
 
@@ -555,7 +557,7 @@ OPERATIONS = {
              _S(boards={"type": "array", "items": _intt}, source=_str, days={"type": "integer", "default": 7},
                 all={"type": "boolean", "default": False}, refetch={"type": "boolean", "default": False})),
     "geo_scan": (geo_scan, "Start a geographic scan (background run of kind 'geo'): businesses around a point are discovered from OpenStreetMap, their websites and careers pages found, each careers page registered as a board (origin geo) and scanned. center: 'lat, lng', a Google Maps link, or an address (geocoded). Returns a run id to poll with run_status; places lists what was found.",
-                 _S(center={"type": "string", "description": "'35.0844, -106.6504', a Google Maps URL (@lat,lng / ?q=lat,lng / !3dlat!4dlng), or an address"},
+                 _S(center={"type": "string", "description": "'35.0844, -106.6504', a Google Maps URL (@lat,lng / ?q=lat,lng / !3dlat!4dlng), or an address (geocoded once; the stored request keeps the coordinates)"},
                     radius_km={"type": "number", "default": 10},
                     categories={"type": "array", "items": _str, "description": "registry keys (geo_categories); default " + ", ".join(J.DEFAULT_CATEGORIES)},
                     keywords={"type": "string", "description": "match place names (comma-separated alternatives)"},

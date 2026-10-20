@@ -140,6 +140,27 @@ def test_geo_doors():
     finally:
         runs.get, service.OPERATIONS["geo_scan"] = real_get, real_op
     assert out == {"run_id": 99, "status": "running", "repeated_from": 7, "dropped": []} and seen == [{"center": "35, -106", "finders": [], "radius_km": 3}], (out, seen)
+    # What geo_scan hands runs.start: the run's args carry the resolved centre; the stored request
+    # has center replaced by the coordinates (a repeat never geocodes again) and center_text as typed.
+    real_start, real_check, starts = runs.start, service.capacity.check, []
+    runs.start = lambda kind, args, work, persist=True, request=None: starts.append((kind, args, request)) or 77
+    service.capacity.check = lambda: None
+    try:
+        out = service.call("geo_scan", {"center": "https://maps.google.com/?q=35.0844,-106.6504", "finders": [], "radius_km": 3})
+    finally:
+        runs.start, service.capacity.check = real_start, real_check
+    kind, a, req = starts[0]
+    assert out["run_id"] == 77 and kind == "geo" and a["lat"] == 35.0844 and a["lon"] == -106.6504, (out, a)
+    assert a["center"] == "35.08440, -106.65040" and a["center_text"] == "https://maps.google.com/?q=35.0844,-106.6504", a
+    assert req == {"op": "geo_scan", "args": {"center": "35.08440, -106.65040", "center_text": "https://maps.google.com/?q=35.0844,-106.6504",
+                                              "finders": [], "radius_km": 3}}, req
+    starts.clear()
+    runs.start, service.capacity.check = (lambda kind, args, work, persist=True, request=None: starts.append((kind, args, request)) or 78), (lambda: None)
+    try:
+        service.call("geo_scan", req["args"])                        # the repeat: coordinates in, center_text kept
+    finally:
+        runs.start, service.capacity.check = real_start, real_check
+    assert starts[0][1]["center_text"] == "https://maps.google.com/?q=35.0844,-106.6504" and starts[0][2] == req, starts[0]
 
 
 def main():
