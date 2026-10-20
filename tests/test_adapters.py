@@ -199,6 +199,99 @@ def check_family(name, url, fixtures, want):
             assert f2.get(fk), (name, "refresh lost", fk, f[fk])
 
 
+class FirecrawlSession(FakeSession):
+    """FakeSession with a canned Firecrawl: the board page lists two openings (one linked, one
+    not) and the posting page answers with markdown + html. Every call is recorded."""
+    BOARD = "https://www.example.org/careers"
+    POST = "https://www.example.org/careers/budget-analyst-42"
+    PAGE_MD = "# Careers at Example\n\nWe are hiring.\n\n## Openings\n\n- Budget Analyst\n- Cook"
+    POST_MD = "# Budget Analyst\n\nSanta Fe, NM\n\n## Duties\n\nBudgets.\n\n### Qualifications\n\nA degree."
+
+    def __init__(self):
+        super().__init__(lambda u, **k: (404, ""))
+        self.calls = []
+
+    def firecrawl(self, url, op="scrape", **options):
+        self.calls.append((op, url, options))
+        if op == "crawl":
+            return 0, {}
+        if url == self.BOARD and "json" in options.get("formats", []):
+            return 200, {"markdown": self.PAGE_MD, "links": [self.BOARD, self.POST, "https://www.example.org/about"],
+                         "metadata": {"title": "Careers at Example", "statusCode": 200},
+                         "json": {"openings": [
+                             {"title": "Budget Analyst", "url": "/careers/budget-analyst-42", "location": "Santa Fe, NM",
+                              "posted": "October 10, 2026", "closes": "2026-10-30", "snippet": "Runs the budget."},
+                             {"title": "Cook", "location": "Taos, NM", "snippet": "Cooks lunch."}]}}
+        if url == self.BOARD:
+            return 200, {"markdown": self.PAGE_MD, "metadata": {"title": "Careers at Example", "statusCode": 200}}
+        if url == self.POST:
+            return 200, {"markdown": self.POST_MD, "html": "<h1>Budget Analyst</h1>", "metadata": {"statusCode": 200}}
+        if url.endswith("/empty"):
+            return 200, {"markdown": "  ", "metadata": {"statusCode": 200}}
+        return 404, {}
+
+
+def check_fallback():
+    """add_board's fallback rule is DB-bound; its pure part (the board a fallback adapter gets,
+    with the normalised URL in the key) is checked here."""
+    from core.boards import fallback_board
+    b = fallback_board("firecrawl", "HTTPS://WWW.Example.org/careers/#jobs")
+    assert b == {"key": "firecrawl:https://www.example.org/careers", "name": None,
+                 "url": "HTTPS://WWW.Example.org/careers/#jobs", "params": {}}, b
+    assert fallback_board("firecrawl", " example.org/Jobs?x=1 ")["key"] == "firecrawl:https://example.org/Jobs?x=1"
+    assert fallback_board("firecrawl", "https://example.org")["key"] == "firecrawl:https://example.org"
+
+
+def check_firecrawl(mod):
+    s = FirecrawlSession()
+    assert S.detect(s.BOARD) is None and S.detect(s.BOARD, s, adapter="firecrawl") is None   # never by URL
+    board = {"key": "firecrawl:" + s.BOARD, "name": None, "url": s.BOARD, "params": {}}
+    board = mod.verify(board, s)
+    assert board["name"] == "Careers at Example" and s.calls[-1][2] == {"formats": ["markdown"]}, (board, s.calls)
+    assert mod.verify({**board, "name": "Given"}, s)["name"] == "Given"
+    try:
+        mod.verify({**board, "url": s.BOARD + "/empty"}, s)
+        raise AssertionError("verify accepted an empty page")
+    except ValueError:
+        pass
+    board.update(id=1, adapter="firecrawl", enabled=True)
+    cards = mod.list_jobs(s, board, since_days=None, max_pages=5)
+    assert [c["title"] for c in cards] == ["Budget Analyst", "Cook"], cards
+    assert s.calls[-1][0] == "scrape" and s.calls[-1][2]["formats"] == ["markdown", "links", "json"], s.calls[-1]
+    a, b = cards
+    assert a["url"] == a["board_url"] == s.POST and a["location"] == "Santa Fe, NM" and a["snippet"] == "Runs the budget."
+    assert a["age_days"] == 10 and a["open_date"] == "2026-10-10" and a["close_date"] == "2026-10-30", a
+    assert b["url"] is None and b["board_url"] == s.BOARD and b["age_days"] is None, b
+    assert len({a["source_id"], b["source_id"]}) == 2 and len(a["source_id"]) == 40
+    assert mod.list_jobs(s, board, since_days=5)[0]["title"] == "Cook"       # dated card outside the window dropped
+    docs = mod.fetch_job(s, board, a)
+    assert docs == [{"kind": "posting", "url": s.POST, "raw_html": "<h1>Budget Analyst</h1>", "text": s.POST_MD}], docs
+    assert s.calls[-1] == ("scrape", s.POST, {"formats": ["markdown", "html"]})
+    n = len(s.calls)
+    assert mod.fetch_job(s, board, b) == [{"kind": "posting", "url": s.BOARD, "raw_html": None, "text": "Cooks lunch."}]
+    assert len(s.calls) == n                                                  # a link-less opening fetches nothing
+    f = mod.parse_fields(board, a, docs)
+    assert (f["title"], f["location"], f["external_url"], f["board_url"]) == ("Budget Analyst", "Santa Fe, NM", s.POST, s.POST)
+    assert f["open_date"] == "2026-10-10" and f["close_date"] == "2026-10-30" and f["salary"] is None, f
+    assert mod.parse_fields(board, b, [])["external_url"] == s.BOARD
+    assert list(mod.sections(docs[0]["text"], "posting")) == ["Budget Analyst", "Duties", "Qualifications"]
+    assert mod.sections(docs[0]["text"], "posting")["Duties"] == "Budgets."
+    assert mod.sections("plain text\nno headings") == {"": "plain text\nno headings"}
+    # refresh path: a card rebuilt from the job row still finds the posting; a link-less one fetches nothing
+    bare = {"source_id": a["source_id"], "title": a["title"], "location": a["location"], "board_url": s.POST, "card_html": "", "age_days": None}
+    assert mod.fetch_job(s, board, bare)[0]["text"] == s.POST_MD
+    assert mod.fetch_job(s, board, {**bare, "board_url": s.BOARD}) == []
+    # a front-door page without openings crawls its listing sub-page with the same extraction
+    s.calls.clear()
+    front = {"markdown": "# Hi", "links": ["https://www.example.org/about", "https://www.example.org/jobs/"], "json": {"openings": []}}
+    s.firecrawl = lambda url, op="scrape", **o: (s.calls.append((op, url, o)) or (200, front if op == "scrape" else
+                  {"status": "completed", "data": [{"json": {"openings": [{"title": "Clerk"}]}}, {"json": {"openings": [{"title": "Clerk"}]}}]}))
+    cards = mod.list_jobs(s, board, since_days=None, max_pages=3)
+    assert [c["title"] for c in cards] == ["Clerk"], cards
+    op, url, o = s.calls[-1]
+    assert (op, url, o["limit"], o["maxDepth"], o["scrapeOptions"]["formats"]) == ("crawl", "https://www.example.org/jobs/", 3, 2, ["markdown", "links", "json"]), s.calls
+
+
 def check_detection():
     for url, name in [
         ("https://fifththird.wd5.myworkdayjobs.com/53careers", "workday"),
@@ -232,13 +325,17 @@ def main():
         check_contract(mod, name)
         if name == "usace_yellogov":
             check_usace(mod)
+        if name == "firecrawl":
+            check_firecrawl(mod)
         print(f"{name}: contract ok")
     check_detection()
     print("detection: ok")
+    check_fallback()
+    print("fallback: ok")
     for name, url, fixtures, want in FAMILY:
         check_family(name, url, fixtures, want)
         print(f"{name}: fixture walk ok")
-    assert {n for n, *_ in FAMILY} | {"usace_yellogov"} == set(names), "every adapter needs a fixture case"
+    assert {n for n, *_ in FAMILY} | {"usace_yellogov", "firecrawl"} == set(names), "every adapter needs a fixture case"
     # core helpers that adapters rely on
     assert J.generic_sections("Overview\nText.\n\nRequirements\nA degree.")["Requirements"] == "A degree."
     from sources._util import posted_text_days, iso_date

@@ -1,6 +1,7 @@
 """Boards: registration by URL (adapter detection + verification through a browser Session), filters."""
 import json
 import re
+import urllib.parse
 import browser
 from core.adapters import list_sources, load_source
 from core.db import now
@@ -33,15 +34,32 @@ def get_board(conn, ref):
         r = conn.execute("SELECT * FROM boards WHERE key=%s OR name=%s ORDER BY id LIMIT 1", (ref, ref)).fetchone()
     return _board_row(r) if r else None
 
-def add_board(conn, url, name=None, include=None, exclude=None, adapter=None, params=None, session=None):
+def fallback_board(adapter, url):
+    """The board a fallback adapter (one whose match() never wins by URL) gets for a URL nothing
+    recognised. The key carries the normalised URL (scheme and host lowercased, no trailing slash,
+    no fragment) so the same page registers once however it was typed; the URL itself is kept as
+    given and verify() fills the name from the page."""
+    url = url.strip()
+    if not re.match(r"https?://", url, re.I):
+        url = "https://" + url
+    u = urllib.parse.urlsplit(url)
+    key = urllib.parse.urlunsplit((u.scheme.lower(), u.netloc.lower(), u.path.rstrip("/"), u.query, ""))
+    return {"key": f"{adapter}:{key}", "name": None, "url": url, "params": {}}
+
+def add_board(conn, url, name=None, include=None, exclude=None, adapter=None, params=None, session=None,
+              fallback_adapter=None):
     """Register a job board by URL. The adapter is detected (URL pattern, then a page probe);
     an already-registered board (same key) is returned unchanged except for the fields given.
     include/exclude: regexes on posting titles applied at scan time (None = no filter).
-    session: the caller's browser.Session (one per add_boards request); opened here if absent."""
+    session: the caller's browser.Session (one per add_boards request); opened here if absent.
+    fallback_adapter: the adapter a URL nothing recognises goes to (the generic firecrawl one when
+    a Firecrawl is configured); forcing adapter= to it skips detection, which could never pick it."""
     import sources as S
     s, owned = _session(session)
     try:
-        hit = S.detect(url, s, adapter=adapter)
+        hit = None if adapter and adapter == fallback_adapter else S.detect(url, s, adapter=adapter)
+        if not hit and fallback_adapter:
+            hit = fallback_adapter, fallback_board(fallback_adapter, url)
         if not hit:
             raise ValueError(f"no adapter recognises {url} (adapters: {', '.join(list_sources())})")
         adapter_name, board = hit
