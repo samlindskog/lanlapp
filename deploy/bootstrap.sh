@@ -23,6 +23,7 @@
 #   show-firewall   print the live nftables ruleset, listening sockets and wg state; change nothing
 #   dump            pg_dump the database to <this dir>/jobscan-dump.sql.gz (0600, staging owner): the backup path
 #   export-secrets  copy /opt/jobboard/.env to <this dir>/jobboard.env (0600, staging owner)
+#   recreate        app stack down and up again (fresh containers, same data)
 #   export-certs    copy the installed TLS files (paths read from the live nginx config) and the deploy user's
 #                   key files to <this dir> under the staging names above (0600, staging owner)
 #   restore         REPLACE the database from <this dir>/jobscan-dump.sql.gz (stop app, drop, recreate, restore, start)
@@ -187,6 +188,17 @@ if [ -f "$HERE/export-certs" ]; then
     [ -f "$SRC" ] && install -m 600 -o "$OWNER" -g "$GRP" "$SRC" "$HERE/${pair#*:}" && echo "  $SRC -> $HERE/${pair#*:}" || echo "  $SRC absent; skipped"
   done
   echo "fetch with: scp $(hostname -s):$HERE/{origin.pem,origin.key,cloudflare-origin-pull-ca.pem,github_deploy_key,jobboard_deploy.pub} <dir>/   then delete them here"
+  exit 0
+fi
+
+# --- maintenance mode: `touch <dir>/recreate` then run; takes the app stack down and up again so every
+# container is created afresh (a network change can leave a reconnected container without its compose
+# aliases: `db` stops resolving). Data stays in the volume. The crawl stack is untouched.
+if [ -f "$HERE/recreate" ]; then
+  rm -f "$HERE/recreate"
+  [ -f "$APP/.env" ] || { echo "no $APP/.env: run the full bootstrap first"; exit 1; }
+  C down --remove-orphans
+  /usr/local/sbin/jobboard-compose-up
   exit 0
 fi
 
