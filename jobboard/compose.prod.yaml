@@ -1,7 +1,10 @@
-# Production stack on the VPS. Run from /opt/jobboard (deploy/compose-up.sh does this):
+# Production stack on the desktop (sldesktop). Run from /opt/jobboard (deploy/compose-up.sh does this):
 #   docker compose -f jobboard/compose.prod.yaml --env-file .env up -d --build
-# .env (deploy-owned, 0600) holds: POSTGRES_PASSWORD, JOBBOARD_PASSWORD_HASH, JOBBOARD_SECRET, OPENAI_API_KEY
+# .env (deploy-owned, 0600) holds: POSTGRES_PASSWORD, JOBBOARD_PASSWORD_HASH, JOBBOARD_SECRET, OPENAI_API_KEY,
+# SEARXNG_SECRET (crawl stack), optional JOBSCAN_PROXY*.
 # The app image is built from the checkout and contains only jobboard/ and jobscan/; nothing is mounted.
+# The app also joins the external network `crawl` (deploy/crawl/compose.yaml: Firecrawl + SearXNG), where it
+# is reachable as `jobboard` (the proxy relay on 8899) and reaches firecrawl-api / searxng by name.
 services:
   db:
     image: pgvector/pgvector:pg16
@@ -18,7 +21,7 @@ services:
       timeout: 3s
       retries: 30
     restart: unless-stopped
-    # no ports: reachable only from the app container
+    # no ports, default network only: reachable from the app container alone
 
   jobboard:
     build:
@@ -39,17 +42,25 @@ services:
       JOBBOARD_MCP_BIND: "0.0.0.0"          # inside the container; the host maps it to loopback for nginx
       JOBSCAN_PROXY: ${JOBSCAN_PROXY:-}      # optional: http://user:pass@host:port (Decodo); empty = direct
       JOBSCAN_PROXY_COUNTRIES: ${JOBSCAN_PROXY_COUNTRIES:-us,ca}   # exit countries cycled over the proxies
+      FIRECRAWL_URL: http://firecrawl-api:3002   # crawl stack, over the `crawl` network
+      SEARXNG_URL: http://searxng:8080
+      JOBSCAN_RELAY_PORT: "8899"            # proxy relay for the crawl stack (PROXY_SERVER=http://jobboard:8899); not published
+    networks: [default, crawl]
     ports:
-      - "127.0.0.1:8080:8080"              # web + API: only via nginx (443)
-      - "127.0.0.1:8091:8090"              # MCP: only via nginx (10.88.0.1:8090 over WireGuard)
+      - "127.0.0.1:8080:8080"              # web + API: only via nginx (10.88.0.2:443, fed by the hub's DNAT)
+      - "127.0.0.1:8091:8090"              # MCP: only via nginx (10.88.0.2:8090 over WireGuard)
     restart: unless-stopped
-    mem_limit: 1200m                         # the VPS has 2 GB in all; Chromium runs lean (see browser.py)
-    shm_size: 256m
+    mem_limit: 3g                            # desktop: room for Chromium with several tabs; browser.py still runs lean
+    shm_size: 512m                           # Chromium's shared memory (renderer IPC); 256m on the old 2 GB VPS
     user: "65534:65534"                      # nobody: the app writes only to /tmp (browser profile)
     read_only: true
     tmpfs: ["/tmp:size=512m,exec"]           # exec: the patched chromedriver copy runs from here
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
+
+networks:
+  crawl:
+    external: true                           # docker network create crawl (bootstrap and compose-up.sh do it)
 
 volumes:
   pgdata:

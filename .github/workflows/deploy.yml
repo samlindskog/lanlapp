@@ -2,7 +2,7 @@ name: test and deploy
 
 on:
   push:
-    branches: [master]
+    branches: [master, next]      # next: tests only; master: tests, then deploy
   workflow_dispatch:
 
 jobs:
@@ -39,12 +39,16 @@ jobs:
         env:
           KEY: ${{ secrets.DEPLOY_SSH_KEY }}
           HOST: ${{ secrets.DEPLOY_HOST }}
+          PORT: ${{ secrets.DEPLOY_PORT }}
           KNOWN: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
         run: |
           if [ -z "$KEY" ]; then echo "DEPLOY_SSH_KEY secret not set; skipping deploy"; exit 0; fi
           mkdir -p ~/.ssh && chmod 700 ~/.ssh
           printf '%s\n' "$KEY" > ~/.ssh/deploy && chmod 600 ~/.ssh/deploy
           printf '%s\n' "$KNOWN" > ~/.ssh/known_hosts
-          # The deploy key is pinned to a forced command on the VPS (jobboard-deploy); whatever is sent here
-          # is only read as the ref to deploy. The deploy user has no docker access and no shell.
-          ssh -i ~/.ssh/deploy -o IdentitiesOnly=yes "deploy@$HOST" "jobboard-deploy origin/master"
+          # The desktop runs production behind the WireGuard hub: DEPLOY_HOST is the hub's public address and
+          # DEPLOY_PORT (2222) its DNAT to the desktop's sshd (1025) over wg0, so DEPLOY_KNOWN_HOSTS must hold
+          # the DESKTOP's host key as seen through that port (ssh-keyscan -p 2222 <hub>). The deploy key is
+          # pinned to a forced command there (jobboard-deploy); whatever is sent is only read as the ref to
+          # deploy. The deploy user has no docker access and no shell.
+          ssh -i ~/.ssh/deploy -o IdentitiesOnly=yes -p "${PORT:-22}" "deploy@$HOST" "jobboard-deploy origin/master"

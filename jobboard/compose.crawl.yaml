@@ -1,0 +1,16 @@
+# Overlay for the dev stack: the app joins the external `crawl` network and sees the crawl stack
+# (deploy/crawl/compose.yaml, project `crawl`) exactly as production does.
+#   ./dev.sh up-fc    (= network create + crawl project up + compose.yaml -f compose.crawl.yaml up)
+# Combine with compose.auth.yaml by hand if you want nginx too:
+#   docker compose -f compose.yaml -f compose.auth.yaml -f compose.crawl.yaml up -d
+services:
+  jobboard:
+    environment:
+      FIRECRAWL_URL: http://firecrawl-api:3002
+      SEARXNG_URL: http://searxng:8080
+      JOBSCAN_RELAY_PORT: "8899"             # Firecrawl's PROXY_SERVER=http://jobboard:8899 (container name)
+    networks: [default, crawl]
+
+networks:
+  crawl:
+    external: true

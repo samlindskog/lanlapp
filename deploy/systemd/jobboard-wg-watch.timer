@@ -1,0 +1,11 @@
+# Installed and enabled by deploy/bootstrap.sh. Every 2 minutes; see jobboard-wg-watch.sh for why.
+[Unit]
+Description=jobboard: WireGuard watchdog, every 2 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target

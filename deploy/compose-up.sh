@@ -6,9 +6,11 @@
 set -euo pipefail
 cd /opt/jobboard
 C="docker compose -f jobboard/compose.prod.yaml --env-file .env"
+# The app joins the external network `crawl` (the crawl stack's); compose refuses to start without it.
+docker network inspect crawl >/dev/null 2>&1 || docker network create crawl >/dev/null
 # The app image is built from the checkout (code baked in), so --build picks up the new commit.
 $C up -d --build --remove-orphans
-for i in $(seq 1 40); do
+for _ in $(seq 1 40); do
   code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/login.html || true)
   if [ "$code" = "200" ]; then echo "ok (login page 200)"; exit 0; fi
   sleep 2
