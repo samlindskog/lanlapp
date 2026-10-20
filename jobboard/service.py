@@ -215,13 +215,16 @@ def search(args):
 
 
 def add_job(args):
-    with db() as conn:
+    # The page is fetched when there is a URL and no text (jobscan.add_job); that drives Chrome,
+    # so it takes the browser slot. A text-only add never waits on a running scan.
+    fetch_url = bool(args.get("url")) and not args.get("text")
+    slot = capacity.hold("add_job") if fetch_url else contextlib.nullcontext()
+    with slot, db() as conn:
         jid = J.add_job(conn, args["title"], args.get("source") or "manual", args.get("source_id"),
                         args.get("location"), args.get("announcement"), args.get("url"),
                         args.get("series"), args.get("pay_plan"), args.get("grade_low"), args.get("grade_high"),
                         args.get("salary"), args.get("open_date"), args.get("close_date"), None,
-                        args.get("text"), args.get("kind") or "posting",
-                        fetch_url=_bool(args.get("fetch")) or (bool(args.get("url")) and not args.get("text")))
+                        args.get("text"), args.get("kind") or "posting", fetch_url=fetch_url)
         return J.job_detail(conn, jid, with_text=False)
 
 
