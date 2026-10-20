@@ -1,0 +1,146 @@
+# Crawl stack beside the app on the desktop: self-hosted Firecrawl + SearXNG. Project `crawl`, every
+# service on the pre-created external network `crawl` (the app container `jobboard` joins it too), NO
+# published ports: the only clients are the app container (FIRECRAWL_URL / SEARXNG_URL) and Firecrawl's
+# own pieces. Brought up by deploy/bootstrap.sh (CRAWL=1) and by jobboard/dev.sh up-fc:
+#   docker network create crawl   (once)
+#   docker compose -f deploy/crawl/compose.yaml --env-file /opt/jobboard/.env -p crawl up -d
+# The env file is the app's .env: OPENAI_API_KEY (JSON extraction), SEARXNG_SECRET (added by the bootstrap),
+# optional tuning in .env.example. README.md explains the pieces.
+#
+# Shape and variables follow firecrawl/firecrawl docker-compose.yaml at release 2.11 (Oct 2026): one api
+# container runs the API and its workers (harness.js --start-docker; there is no separate worker service
+# in this release), Playwright for rendering, Redis, RabbitMQ and the NuQ Postgres queue backend. Images
+# are pinned; playwright-service and nuq-postgres publish sha tags only.
+name: crawl
+
+x-fc-logging: &fc-logging
+  driver: json-file
+  options: { max-size: "10m", max-file: "3", compress: "true" }
+
+services:
+  firecrawl-api:
+    image: ghcr.io/firecrawl/firecrawl:2.11.560
+    container_name: crawl-firecrawl-api
+    command: node dist/src/harness.js --start-docker
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "3002"
+      EXTRACT_WORKER_PORT: "3004"
+      WORKER_PORT: "3005"
+      ENV: local
+      HARNESS_STARTUP_TIMEOUT_MS: "120000"
+      USE_DB_AUTHENTICATION: "false"       # no Supabase; the API is unauthenticated and reachable only on `crawl`
+      REDIS_URL: redis://redis:6379
+      REDIS_RATE_LIMIT_URL: redis://redis:6379
+      PLAYWRIGHT_MICROSERVICE_URL: http://playwright-service:3000/scrape
+      NUQ_RABBITMQ_URL: amqp://rabbitmq:5672
+      POSTGRES_HOST: nuq-postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres           # queue db, never leaves the `crawl` network
+      POSTGRES_DB: postgres
+      NUM_WORKERS_PER_QUEUE: ${FIRECRAWL_WORKERS:-2}              # modest: one personal desktop
+      MAX_CONCURRENT_JOBS: ${FIRECRAWL_MAX_CONCURRENT_JOBS:-2}
+      CRAWL_CONCURRENT_REQUESTS: ${FIRECRAWL_CONCURRENT_REQUESTS:-3}
+      BROWSER_POOL_SIZE: "2"
+      BLOCK_MEDIA: "true"
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}   # JSON extraction / LLM features; same key as the app
+      MODEL_NAME: ${FIRECRAWL_MODEL:-gpt-4o-mini}
+      PROXY_SERVER: http://jobboard:8899    # the app container's proxy relay (JOBSCAN_RELAY_PORT): one egress policy
+      SEARXNG_ENDPOINT: http://searxng:8080 # /v2/search goes through our SearXNG, not a public engine
+      LOGGING_LEVEL: ${FIRECRAWL_LOG_LEVEL:-info}
+    depends_on:
+      redis: { condition: service_started }
+      playwright-service: { condition: service_started }
+      rabbitmq: { condition: service_healthy }
+      nuq-postgres: { condition: service_healthy }
+    ulimits:
+      nofile: { soft: 65535, hard: 65535 }
+    restart: unless-stopped
+    mem_limit: 2g
+    logging: *fc-logging
+
+  playwright-service:
+    image: ghcr.io/firecrawl/playwright-service:sha-a7a63b4bfabf
+    container_name: crawl-playwright
+    environment:
+      PORT: "3000"
+      BLOCK_MEDIA: "true"                   # no images/fonts/media: half the bandwidth, lower memory
+      MAX_CONCURRENT_PAGES: ${FIRECRAWL_CONCURRENT_REQUESTS:-3}
+      PROXY_SERVER: http://jobboard:8899    # rendered pages leave through the same relay
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    tmpfs: ["/tmp/.cache:noexec,nosuid,size=512m"]
+    restart: unless-stopped
+    mem_limit: 1500m
+    logging: *fc-logging
+
+  redis:
+    image: redis:7-alpine
+    container_name: crawl-redis
+    command: redis-server --bind 0.0.0.0 --save "" --appendonly no   # cache + rate limits only: nothing to persist
+    restart: unless-stopped
+    mem_limit: 256m
+    logging: *fc-logging
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: crawl-rabbitmq
+    command: rabbitmq-server
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+    restart: unless-stopped
+    mem_limit: 512m
+    logging: *fc-logging
+
+  nuq-postgres:
+    image: ghcr.io/firecrawl/nuq-postgres:sha-a7a63b4bfabf
+    container_name: crawl-nuq-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    volumes:
+      - nuq-pgdata:/var/lib/postgresql/data   # queue state survives a recreate; losing it only loses in-flight jobs
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    restart: unless-stopped
+    mem_limit: 512m
+    logging: *fc-logging
+
+  searxng:
+    image: searxng/searxng:2026.10.19-81371861f
+    container_name: crawl-searxng
+    environment:
+      SEARXNG_SETTINGS_PATH: /srv/searxng/settings.yml   # our file, read-only; /etc/searxng stays the image's
+      SEARXNG_SECRET: ${SEARXNG_SECRET:?SEARXNG_SECRET missing in the env file}
+      SEARXNG_BASE_URL: http://searxng:8080/
+      SEARXNG_BIND_ADDRESS: "0.0.0.0"
+      SEARXNG_PORT: "8080"
+    volumes:
+      - ./searxng/settings.yml:/srv/searxng/settings.yml:ro
+      - searxng-etc:/etc/searxng
+      - searxng-cache:/var/cache/searxng
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETGID, SETUID]
+    restart: unless-stopped
+    mem_limit: 512m
+    logging: *fc-logging
+
+networks:
+  default:
+    name: crawl
+    external: true
+
+volumes:
+  nuq-pgdata:
+  searxng-etc:
+  searxng-cache:

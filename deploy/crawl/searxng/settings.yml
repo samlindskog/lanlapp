@@ -1,0 +1,35 @@
+# SearXNG for the crawl stack (deploy/crawl/compose.yaml), mounted read-only and selected with
+# SEARXNG_SETTINGS_PATH. Internal only: the instance is reachable on the `crawl` docker network alone, so the
+# bot limiter and public-instance features are off. `json` in formats is what Firecrawl (SEARXNG_ENDPOINT)
+# and the app (SEARXNG_URL, /search?format=json) need; the default settings allow html only.
+use_default_settings: true
+
+general:
+  instance_name: "crawl"
+  debug: false
+  enable_metrics: false
+
+server:
+  bind_address: "0.0.0.0"       # overridden by SEARXNG_BIND_ADDRESS / SEARXNG_PORT anyway
+  port: 8080
+  base_url: "http://searxng:8080/"
+  secret_key: "overwritten-by-SEARXNG_SECRET"
+  limiter: false
+  public_instance: false
+  image_proxy: false
+  method: "GET"
+
+search:
+  formats: [html, json]
+  safe_search: 0
+  autocomplete: ""
+  default_lang: "en-US"
+
+ui:
+  static_use_hash: true
+
+outgoing:
+  request_timeout: 6.0
+  max_request_timeout: 15.0
+  pool_connections: 50
+  pool_maxsize: 10

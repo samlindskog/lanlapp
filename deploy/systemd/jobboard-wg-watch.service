@@ -1,0 +1,13 @@
+# Installed by deploy/bootstrap.sh (placeholders substituted). Driven by jobboard-wg-watch.timer.
+[Unit]
+Description=jobboard: restart WireGuard when the hub stops answering
+After=wg-quick@@WG_IF@.service
+ConditionPathExists=/etc/wireguard/@WG_IF@.conf
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/jobboard-wg-watch @HUB_IP@ @WG_IF@
+RuntimeDirectory=jobboard-wg-watch
+RuntimeDirectoryPreserve=yes
+StandardOutput=journal
+StandardError=journal
