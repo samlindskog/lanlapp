@@ -110,7 +110,7 @@
         <td>${statusSelect(j, a)}${j.action_date ? `<br><small>${j.action_date}</small>` : ""}</td>
         <td class="title">${state.semantic ? `<span class="score" title="similarity">${(state.semantic[j.id] * 100).toFixed(0)}% · </span>` : ""}${esc(j.title)}<small>${esc(j.series || "")}${j.announcement_no ? " · " + esc(j.announcement_no) : ""}</small></td>
         <td class="hide-sm">${esc(gradeOf(j))}</td>
-        <td class="hide-sm" title="${esc(j.place_name ? `${j.board_name} · ${j.board_platform}` : j.board_platform || j.source)}">${esc((j.place_name || j.board_name || j.source || "").slice(0, 40))}<br><small class="muted">${esc(j.place_name ? "geographic" : j.board_platform || j.source)}</small></td>
+        <td class="hide-sm" title="${esc(j.place_name ? `${j.board_name} · ${j.board_platform}` : j.board_platform || j.source)}">${esc((j.place_name || j.board_name || j.source || "").slice(0, 40))}<br><small class="muted">${esc(j.board_origin === "geo" ? "geographic" : j.board_platform || j.source)}</small></td>
         <td class="hide-sm">${esc((j.location || placeAddress(j) || "").slice(0, 60))}</td>
         <td class="hide-sm fetched" title="${esc(fmtLocal(j.last_fetched))}">${esc(fmtAgo(j.last_fetched))}</td>
         <td class="hide-sm">${link ? `<a href="${esc(link)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">open ↗</a>` : ""}</td>

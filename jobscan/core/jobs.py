@@ -131,7 +131,7 @@ SELECT j.*, v.verdict, v.eligible_grades, v.reason AS verdict_reason, v.assessed
        p.phone AS place_phone
 FROM jobs j
 LEFT JOIN boards b ON b.id = j.board_id
-LEFT JOIN places p ON p.id = (SELECT MIN(id) FROM places WHERE board_id = b.id)
+LEFT JOIN places p ON p.board_id = b.id AND (SELECT COUNT(*) FROM places WHERE board_id = b.id) = 1
 LEFT JOIN verdicts v ON v.id = (SELECT MAX(id) FROM verdicts WHERE job_id = j.id)
 LEFT JOIN verdicts c ON c.id = (SELECT MAX(id) FROM verdicts WHERE job_id = j.id AND author = 'claude')
 LEFT JOIN actions  a ON a.id = (SELECT MAX(id) FROM actions  WHERE job_id = j.id)
@@ -143,7 +143,9 @@ def list_jobs(conn, verdict=None, action=None, open_only=False, source=None, day
     """Filters are ANDed. verdict/action: comma lists ('none' = unset). closing: 'open' (no close
     date or not yet closed), 'closed', or 'week' (closes within 7 days); open_only is 'open'.
     run: jobs first stored by that scan run (jobs.run_id). origin: the board's origin (manual |
-    geo); a geo board's place (name, address, website...) rides along as place_* fields."""
+    geo); a geo board's place (name, address, website...) rides along as place_* fields when
+    exactly one place has that board (several businesses can share a corporate careers page;
+    then no place is right for every job and the fields stay NULL)."""
     where, params = ["TRUE"], []
     if source:
         where.append("j.source=%s"); params.append(source)

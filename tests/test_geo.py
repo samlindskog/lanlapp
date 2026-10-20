@@ -168,9 +168,14 @@ class FakeConn:
                              "board_url": b.get("url"), "board_enabled": b.get("enabled")}])
         if "MAX(id)" in s and "FROM boards" in s:
             return _Result([{"m": max(self.boards, default=0)}])
+        if s.startswith("SELECT COUNT(*) AS n FROM places WHERE board_id="):
+            return _Result([{"n": sum(1 for r in self.places.values() if r.get("board_id") == params[0] and r["id"] != params[1])}])
         if s.startswith("SELECT * FROM boards WHERE id="):
             b = self.boards.get(params[0])
             return _Result([dict(b)] if b else [])
+        if s.startswith("UPDATE boards SET name="):            # core.boards.update_board
+            self.boards[params[-1]].update(name=params[0], enabled=params[1], params=params[2])
+            return _Result([])
         raise AssertionError(f"unexpected SQL: {s[:90]}")
 
     def commit(self):
@@ -195,6 +200,7 @@ PAGES = {
     "https://shop.example.com/": _page("Shop"),
     "https://bad.example.com/": _page("Bad") + '<a href="/careers">Careers</a>',
     "https://bad.example.com/careers": _page("Careers at Bad"),
+    "https://acme-branch.example.com/": _page("Acme Branch") + '<a href="https://acme.example.com/about/careers">Careers</a>',
 }
 PLACES = [
     {"name": "Acme Corp", "lat": 35.0, "lon": -106.0, "website": "https://acme.example.com/", "category": "finance", "finder_id": "node/1"},
@@ -206,6 +212,7 @@ PLACES = [
     {"name": "Bad Co", "lat": 35.05, "lon": -106.0, "website": "https://bad.example.com/", "category": "finance", "finder_id": "node/7"},
     {"name": "Nowhere Ltd", "lat": 35.06, "lon": -106.0, "city": "Albuquerque", "category": "finance", "finder_id": "node/8"},
     {"name": "Acme Corp", "lat": 35.5, "lon": -106.0, "category": "finance", "finder_id": "node/9"},   # 55 km away: another place
+    {"name": "Acme Branch", "lat": 35.07, "lon": -106.0, "website": "https://acme-branch.example.com/", "category": "retail", "finder_id": "node/10"},  # shares Acme's careers page
 ]
 SEARCH = {'"First Community Bank" Albuquerque NM': [{"url": "https://www.yelp.com/biz/fcb", "title": "First Community Bank - Yelp"},
                                                    {"url": "https://bank.example.com/", "title": "First Community Bank - Home"}],
@@ -277,11 +284,16 @@ def check_pipeline():
         sm = J.geo_scan(conn, params, s, log=lines.append, progress=p, check=lambda: None, run_id=42)
         assert FakeFinder.calls == [((35.0, -106.0), 5000.0, ["finance", "retail"], "acme", [])], FakeFinder.calls
         assert phases == ["discovering", "resolving", "careers", "scanning", "done"], phases
-        want = {"discovered": 8, "new_places": 8, "resolved": 1, "no_site": 2, "with_careers": 4, "boards_new": 3, "boards_scanned": 3, "new": 4}
+        want = {"discovered": 9, "new_places": 9, "resolved": 1, "no_site": 2, "with_careers": 5, "boards_new": 3, "boards_scanned": 3, "new": 4}
         assert {k: sm[k] for k in want} == want, sm
         rows = {r["name"]: r for r in conn.places.values()}
         acme = [r for r in conn.places.values() if r["name"] == "Acme Corp"]
         assert acme[0]["phone"] == "555" and acme[0]["careers_kind"] == "adapter:workday", acme[0]
+        # Two places, one board: both keep the link; the board, named after the first business,
+        # is renamed to the careers page's host so it is not misleading for the other's jobs.
+        assert rows["Acme Branch"]["board_id"] == acme[0]["board_id"] == 1 and rows["Acme Branch"]["careers_kind"] == "adapter:workday"
+        assert conn.boards[1]["name"] == "acme.example.com" and conn.boards[2]["name"] == "First Community Bank", conn.boards
+        assert any("shared by 2 places" in ln for ln in lines), lines[-12:]
         assert len(acme) == 2 and {r["categories"] for r in acme} == {'["finance"]', '["finance", "retail"]'}, acme
         assert acme[0]["finder_ids"] == '{"fake": "node/1"}', acme[0]["finder_ids"]      # the first sighting's id stays
         assert rows["First Community Bank"]["website"] == "https://bank.example.com/"       # by title, not host
@@ -294,7 +306,8 @@ def check_pipeline():
         assert maps == [(u, "map", {"search": "careers jobs employment", "limit": 20})
                         for u in ("https://clinic.example.com", "https://shop.example.com")], maps   # only after links and paths failed
         assert [a["url"] for a in added] == ["https://acme.example.com/about/careers", "https://bank.example.com/jobs",
-                                             "https://clinic.example.com/join-the-team", "https://bad.example.com/careers"], added
+                                             "https://clinic.example.com/join-the-team", "https://bad.example.com/careers",
+                                             "https://acme.example.com/about/careers"], added
         assert all(a["origin"] == "geo" and a["fallback_adapter"] == "firecrawl" and a["session"] is s for a in added), added
         assert all(b["origin"] == "geo" for b in conn.boards.values())
         assert rows["First Community Bank"]["careers_kind"] == "adapter:firecrawl"   # found at the common path /jobs
@@ -302,19 +315,20 @@ def check_pipeline():
         sb = scanned[0]["boards"]
         assert [b["adapter"] for b in sb] == ["workday", "firecrawl", "firecrawl"] and all(b["params"] == {"include": "analyst"} for b in sb), sb
         assert "https://shop.example.com/careers" in fetched and "https://bank.example.com/jobs" in fetched
-        assert any("not configured" in ln for ln in lines) and any("discovered 8 place(s) (9 before dedup)" in ln for ln in lines), lines
+        assert any("not configured" in ln for ln in lines) and any("discovered 9 place(s) (10 before dedup)" in ln for ln in lines), lines
         # A repeat: nothing new, resolved places are left alone, the two unresolved ones are retried.
         fetched.clear(); added.clear(); scanned.clear(); maps.clear(); phases.clear()
         sm2 = J.geo_scan(conn, params, s, log=lines.append, progress=p, check=lambda: None, run_id=43)
         assert {k: sm2[k] for k in ("discovered", "new_places", "resolved", "no_site", "with_careers", "boards_new", "boards_scanned")} \
-            == {"discovered": 8, "new_places": 0, "resolved": 0, "no_site": 0, "with_careers": 0, "boards_new": 0, "boards_scanned": 0}, sm2
+            == {"discovered": 9, "new_places": 0, "resolved": 0, "no_site": 0, "with_careers": 0, "boards_new": 0, "boards_scanned": 0}, sm2
         assert [a["url"] for a in added] == ["https://bad.example.com/careers"] and not scanned and not maps, (added, scanned)
         assert fetched == ["https://down.example.com/"], fetched
         assert all(r["last_run_id"] == 43 and r["first_run_id"] == 42 for r in conn.places.values())
         # rediscover: every site is fetched again and every board re-registered (then scanned).
         fetched.clear(); added.clear()
         sm3 = J.geo_scan(conn, {**params, "rediscover": True}, s, log=lines.append, progress=p, check=lambda: None, run_id=44)
-        assert sm3["boards_new"] == 0 and sm3["boards_scanned"] == 3 and len(added) == 4 and "https://acme.example.com/" in fetched, (sm3, added)
+        assert sm3["boards_new"] == 0 and sm3["boards_scanned"] == 3 and len(added) == 5 and "https://acme.example.com/" in fetched, (sm3, added)
+        assert conn.boards[1]["name"] == "acme.example.com"                   # a rename happens once, not every run
         # Cancel lands at the first check.
         try:
             J.geo_scan(conn, params, s, log=lines.append, progress=p, check=lambda: (_ for _ in ()).throw(J.browser.Cancelled("stop")), run_id=45)

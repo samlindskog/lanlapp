@@ -4,7 +4,7 @@ with origin 'geo' (core/boards.py), registered here with the configured fallback
 import json
 
 import browser
-from core.boards import add_board, get_board
+from core.boards import add_board, get_board, update_board
 from core.db import now
 from core.geo import DEDUP_M, distance_m, host_of, norm_name, web_url
 
@@ -105,7 +105,9 @@ def fallback_adapter():
 
 def register_place_board(conn, row, url, session, log=lambda m: None):
     """Make the place's careers page a board (origin 'geo'): the board, or None when registration
-    failed (logged; careers_kind 'unresolved' so the next run tries again)."""
+    failed (logged; careers_kind 'unresolved' so the next run tries again). Several places may
+    share one board (branches of one company, one corporate careers page): the board was named
+    after the first business, so once a second place joins it is renamed to the page's host."""
     try:
         b = add_board(conn, url, name=row["name"], fallback_adapter=fallback_adapter(), session=session, origin="geo")
     except browser.Cancelled:
@@ -116,6 +118,11 @@ def register_place_board(conn, row, url, session, log=lambda m: None):
         set_fields(conn, row, careers_url=url, careers_kind="unresolved")
         return None
     set_fields(conn, row, careers_url=url, careers_kind=f"adapter:{b['adapter']}", board_id=b["id"])
+    others = conn.execute("SELECT COUNT(*) AS n FROM places WHERE board_id=%s AND id<>%s", (b["id"], row["id"])).fetchone()["n"]
+    host = host_of(b["url"])
+    if others and host and b["name"] != host:
+        log(f"  board [{b['id']}] is shared by {others + 1} places; renamed {b['name']!r} -> {host!r}")
+        b = update_board(conn, b["id"], name=host)
     return b
 
 
