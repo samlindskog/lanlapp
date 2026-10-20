@@ -257,6 +257,7 @@ if [ ! -d "$APP/.git" ]; then
   su - deploy -c "git clone --quiet $REPO_SSH $APP"
 fi
 su - deploy -c "cd $APP && git fetch --quiet origin && git reset --hard --quiet $DEPLOY_REF"
+git config --system --add safe.directory "$APP" 2>/dev/null || true   # root reads the deploy-owned checkout below
 echo "at $(cd "$APP" && git rev-parse --short HEAD): $(cd "$APP" && git log -1 --pretty=%s)"
 # Root-owned copies of the deploy scripts: a push cannot change how deploys run.
 install -m 755 -o root -g root "$APP/deploy/deploy.sh" /usr/local/bin/jobboard-deploy
@@ -265,7 +266,6 @@ cat > /etc/sudoers.d/jobboard-deploy <<'EOF'
 deploy ALL=(root) NOPASSWD: /usr/local/sbin/jobboard-compose-up
 EOF
 chmod 440 /etc/sudoers.d/jobboard-deploy; visudo -c >/dev/null
-git config --system --add safe.directory "$APP" 2>/dev/null || true
 
 log "secrets -> $APP/.env"
 ADOPTED=0
