@@ -37,13 +37,13 @@ import browser  # noqa: E402,F401
 from core.db import (DSN, SCHEMA, EMBED_MODEL, EMBED_DIMS, _schema_done, now, today, db, _migrate_boards, pack_html, unpack_html, _store_documents, _update_fields)  # noqa: E402,F401
 from core.text import (_TextExtractor, html_to_text, generic_sections)  # noqa: E402,F401
 from core.adapters import (load_source, list_sources, _platforms, platform_name, source_meta, document_sections, primary_document, get_section)  # noqa: E402,F401
-from core.boards import (_board_row, list_boards, get_board, add_board, update_board, delete_board, check_regex, _title_filter, _session)  # noqa: E402,F401
+from core.boards import (_board_row, list_boards, get_board, add_board, update_board, delete_board, check_regex, _title_filter, _location_filter, _card_filter, _session)  # noqa: E402,F401
 from core.scan import (Progress, scan_board, scan_boards, scan_source, refresh_job, _refresh_job)  # noqa: E402,F401
 from core.jobs import (latest_verdicts, latest_actions, grade_str, record_verdict, record_action, add_job, JOBS_VIEW_SQL, list_jobs, job_detail, search_documents, store_resume, list_resumes, get_resume, resume_url)  # noqa: E402,F401
 from core.embed import (_ssl_context, SSL_CTX, embed_texts, embedding_text, _vec, embed_if_possible, embed_jobs, semantic_search)  # noqa: E402,F401
 from core import geocode, websearch  # noqa: E402,F401
 import finders  # noqa: E402,F401
-from core.geo import (CATEGORIES, DEFAULT_CATEGORIES, parse_center, norm_name, dedup)  # noqa: E402,F401
+from core.geo import (CATEGORIES, DEFAULT_CATEGORIES, US_STATES, parse_center, norm_name, dedup, location_regex, state_forms)  # noqa: E402,F401
 from core.places import (get_place, list_places, update_place, fallback_adapter)  # noqa: E402,F401
 from core.geoscan import geo_scan  # noqa: E402,F401
 from core.cli import (cmd_scan, cmd_boards, _filter_args, cmd_pending, cmd_show, cmd_raw, cmd_autoreject, cmd_verdict, cmd_report, cmd_mark, cmd_add, cmd_refresh, cmd_search, cmd_apps, cmd_stats, main)  # noqa: E402,F401

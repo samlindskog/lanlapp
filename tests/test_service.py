@@ -116,7 +116,10 @@ def test_runs_list_and_repeat():
 def test_geo_doors():
     """The geographic operations validate before touching the browser slot or the network
     (coordinates and Maps links are parsed, never geocoded), and repeat_run replays a stored
-    geo_scan request through call() like any other operation."""
+    geo_scan request through call() like any other operation. Nominatim's reverse lookup is
+    stubbed throughout: nothing here may touch the network."""
+    real_reverse0 = service.J.geocode.reverse
+    service.J.geocode.reverse = lambda lat, lon: (_ for _ in ()).throw(AssertionError("reverse geocoding reached before validation"))
     assert service.call("resolve_center", {"center": "35.0844, -106.6504"}) == {"lat": 35.0844, "lon": -106.6504, "label": "35.08440, -106.65040"}
     assert service.call("resolve_center", {"center": "https://www.google.com/maps/@35.08,-106.65,15z"})["lat"] == 35.08
     cats = service.call("geo_categories", {})
@@ -148,9 +151,11 @@ def test_geo_doors():
     assert out == {"run_id": 99, "status": "running", "repeated_from": 7, "dropped": []} and seen == [{"center": "35, -106", "finders": [], "radius_km": 3}], (out, seen)
     # What geo_scan hands runs.start: the run's args carry the resolved centre; the stored request
     # has center replaced by the coordinates (a repeat never geocodes again) and center_text as typed.
-    real_start, real_check, starts = runs.start, service.capacity.check, []
+    # The centre's city/state (one Nominatim reverse call) ride in the stored request too.
+    real_start, real_check, real_reverse, starts, reversed_ = runs.start, service.capacity.check, service.J.geocode.reverse, [], []
     runs.start = lambda kind, args, work, persist=True, request=None: starts.append((kind, args, request)) or 77
     service.capacity.check = lambda: None
+    service.J.geocode.reverse = lambda lat, lon: reversed_.append((lat, lon)) or {"city": "Albuquerque", "state": "New Mexico"}
     try:
         out = service.call("geo_scan", {"center": "https://maps.google.com/?q=35.0844,-106.6504", "finders": [], "radius_km": 3})
     finally:
@@ -158,15 +163,26 @@ def test_geo_doors():
     kind, a, req = starts[0]
     assert out["run_id"] == 77 and kind == "geo" and a["lat"] == 35.0844 and a["lon"] == -106.6504, (out, a)
     assert a["center"] == "35.08440, -106.65040" and a["center_text"] == "https://maps.google.com/?q=35.0844,-106.6504", a
+    assert a["location"] is None and a["center_place"] == {"city": "Albuquerque", "state": "New Mexico"} and reversed_ == [(35.0844, -106.6504)], a
     assert req == {"op": "geo_scan", "args": {"center": "35.08440, -106.65040", "center_text": "https://maps.google.com/?q=35.0844,-106.6504",
-                                              "finders": [], "radius_km": 3}}, req
+                                              "center_place": {"city": "Albuquerque", "state": "New Mexico"}, "finders": [], "radius_km": 3}}, req
     starts.clear()
     runs.start, service.capacity.check = (lambda kind, args, work, persist=True, request=None: starts.append((kind, args, request)) or 78), (lambda: None)
+    service.J.geocode.reverse = lambda lat, lon: (_ for _ in ()).throw(AssertionError("a repeat must not reverse-geocode"))
     try:
-        service.call("geo_scan", req["args"])                        # the repeat: coordinates in, center_text kept
+        service.call("geo_scan", req["args"])                        # the repeat: coordinates and centre place in, center_text kept
+        service.call("geo_scan", {**req["args"], "location": r"\b(Santa Fe|NM)\b"})
+        try:
+            service.call("geo_scan", {**req["args"], "location": "(a+)+$"})
+            raise AssertionError("a bad location regex was accepted")
+        except ValueError:
+            pass
     finally:
-        runs.start, service.capacity.check = real_start, real_check
+        runs.start, service.capacity.check, service.J.geocode.reverse = real_start, real_check, real_reverse
     assert starts[0][1]["center_text"] == "https://maps.google.com/?q=35.0844,-106.6504" and starts[0][2] == req, starts[0]
+    assert starts[1][1]["location"] == r"\b(Santa Fe|NM)\b" and starts[1][2]["args"]["location"] == r"\b(Santa Fe|NM)\b", starts[1]
+    assert "location" in service.OPERATIONS["geo_scan"][2]["properties"] and "location" in service.OPERATIONS["update_board"][2]["properties"]
+    service.J.geocode.reverse = real_reverse0
 
 
 def main():

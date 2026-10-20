@@ -12,10 +12,11 @@ Agent API  : JSON over HTTP, documented at GET /api  (also in .claude/skills/job
                                   /view.html?f=job/<job_id>/<name> renders a PDF in-page
                                   (uploads happen only through the MCP tool upload_resume)
   GET  /api/boards                registered job boards: id, adapter, name, url, enabled, params, jobs, last_scan
-  POST /api/boards                {urls: [url | {url, name?, include?, exclude?}]}  -> per URL: board or error
+  POST /api/boards                {urls: [url | {url, name?, include?, exclude?, location?}]}  -> per URL: board or error
                                   (the adapter is detected from the URL, then by probing the page;
-                                   include/exclude are title regexes applied at scan time)
-  POST /api/boards/<id>           {name?, enabled?, include?, exclude?}
+                                   include/exclude are title regexes and location a card-location regex,
+                                   all applied at scan time; cards with no or only a count of locations pass)
+  POST /api/boards/<id>           {name?, enabled?, include?, exclude?, location?}
   POST /api/boards/<id>/delete    remove a board (its jobs stay, detached)
   GET  /api/adapters              adapters available: name, display_name, kind (family | site)
   GET  /api/sources               adapters with their last scan (older name for /api/adapters)
@@ -38,9 +39,11 @@ Agent API  : JSON over HTTP, documented at GET /api  (also in .claude/skills/job
                                   (boards = ids; source = every board of one adapter; neither = all enabled)
   POST /api/refresh               {ids?:[..]} or {filter:"open-qualifying"}       -> {run_id}
   POST /api/geo/scan              {center, radius_km?:10, categories?, keywords?, tags?, finders?, include?, exclude?,
-                                   max_places?:300, recheck_days?:30, rediscover?:false, days?:7} -> {run_id, center}
+                                   location?, max_places?:300, recheck_days?:30, rediscover?:false, days?:7} -> {run_id, center}
                                   (a geographic scan: businesses around the centre from OpenStreetMap, their
-                                   careers pages registered as boards with origin geo and scanned; run kind 'geo')
+                                   careers pages registered as boards with origin geo and scanned for postings whose
+                                   location matches `location`, by default the places' and the centre's city/state;
+                                   run kind 'geo')
   GET  /api/geo/categories        the category registry (key, label, default) and finders, with what is configured
   GET  /api/geo/center?center=    'lat, lng' / a Google Maps link parsed, an address geocoded -> {lat, lon, label}
   GET  /api/places?run=&status=&careers_kind=&bbox=s,w,n,e&q=&limit=100&before=<id>   places found, newest first

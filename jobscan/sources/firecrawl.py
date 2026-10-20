@@ -28,10 +28,14 @@ KEY_SECTION = None
 FIELDS = ("title", "url", "location", "posted", "closes", "snippet")
 SCHEMA = {"type": "object", "properties": {"openings": {"type": "array", "items": {
     "type": "object", "properties": {k: {"type": "string"} for k in FIELDS}, "required": ["title"]}}}}
-JSON_OPTIONS = {"schema": SCHEMA, "prompt": "Extract every job opening listed on this page: its title, the "
-               "link to the posting (absolute URL), location, posted and closing dates as written, and a "
-               "one-sentence snippet. Skip navigation and unrelated links."}
+JSON_OPTIONS = {"schema": SCHEMA, "prompt": "Extract only the concrete job openings listed on this page, each with "
+               "a specific job title (e.g. 'Branch Manager', 'Budget Analyst'): the title, the link to the posting "
+               "(absolute URL), location, posted and closing dates as written, and a one-sentence snippet. Never "
+               "include navigation, search, category or location links such as 'View all jobs', 'Search jobs', "
+               "'Careers' or a city name. If the page lists no concrete openings, return an empty list."}
 LIST_FORMATS = ["markdown", "links", "json"]
+# What the extraction still returns now and then: a link to the list, not an opening on it.
+JUNK_TITLE_RE = re.compile(r"^(view|see|search|browse|explore|all)\b.*\bjobs?\b|^(jobs?|careers?|openings?|positions?)$", re.I)
 LISTING_RE = re.compile(r"/(careers?|jobs?|openings?|positions?)(/|$)", re.I)
 HEADING_RE = re.compile(r"^#{1,3}\s+(.+?)\s*#*\s*$")
 
@@ -50,9 +54,12 @@ def verify(board, session):
 
 
 def _openings(page):
+    """The page's extracted openings with a real title; junk ('View all jobs') is dropped here,
+    so a front door whose extraction yielded only junk still falls through to the crawl."""
     j = page.get("json") if isinstance(page, dict) else None
     ops = j.get("openings") if isinstance(j, dict) else None
-    return [o for o in (ops or []) if isinstance(o, dict) and (o.get("title") or "").strip()]
+    return [o for o in (ops or []) if isinstance(o, dict) and (o.get("title") or "").strip()
+            and not JUNK_TITLE_RE.search(o["title"].strip())]
 
 
 def _page_url(page, default):

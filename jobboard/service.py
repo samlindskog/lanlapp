@@ -132,7 +132,7 @@ def sources(args):
 
 # ------------------------------------------------------------------ boards
 def add_boards(args):
-    """items: [url | {url, name?, include?, exclude?, adapter?}] -> per URL the board or the error.
+    """items: [url | {url, name?, include?, exclude?, location?, adapter?}] -> per URL the board or the error.
     One browser Session for the whole request; holds the browser slot."""
     items = args.get("urls")
     if not isinstance(items, list):
@@ -151,7 +151,7 @@ def add_boards(args):
             try:
                 adapter = it.get("adapter")
                 b = J.add_board(conn, url, name=it.get("name"), include=it.get("include"), exclude=it.get("exclude"),
-                                adapter=adapter, session=s,
+                                location=it.get("location"), adapter=adapter, session=s,
                                 fallback_adapter="firecrawl" if adapter == "firecrawl" else fallback)
                 out.append({"url": url, "board": b})
                 log_event("info", f"board added: [{b['id']}] {b['name']} ({b['adapter']}) {b['url']}")
@@ -165,7 +165,8 @@ def add_boards(args):
 def update_board(args):
     with db() as conn:
         return {"board": J.update_board(conn, int(args["id"]), name=args.get("name"), enabled=args.get("enabled"),
-                                        include=args.get("include"), exclude=args.get("exclude"))}
+                                        include=args.get("include"), exclude=args.get("exclude"),
+                                        location=args.get("location"))}
 
 
 def delete_board(args):
@@ -376,7 +377,9 @@ def geo_scan(args):
     """Start a geographic scan (a persisted run of kind 'geo'): businesses around the centre ->
     their careers pages become boards (origin geo) -> those boards are scanned. The stored
     request (what repeat_run replays) carries the centre as resolved coordinates, so a repeat
-    is deterministic and needs no geocoder; what was typed is kept as center_text for display."""
+    is deterministic and needs no geocoder; what was typed is kept as center_text for display.
+    Postings on the boards found are kept only when their location matches `location` (a regex;
+    by default built from the places' and the centre's city/state)."""
     lat, lon, label = _resolve_center(args.get("center"))
     center, center_text = f"{lat:.5f}, {lon:.5f}", (args.get("center_text") or args.get("center") or "").strip()
     radius = 10.0 if args.get("radius_km") in (None, "") else float(args["radius_km"])
@@ -400,14 +403,21 @@ def geo_scan(args):
                 "tags": _strs(args.get("tags")) or [], "finders": finders,
                 "include": J.check_regex(args.get("include"), "include"),
                 "exclude": J.check_regex(args.get("exclude"), "exclude"),
+                "location": J.check_regex(args.get("location"), "location"),
                 "max_places": max_places, "recheck_days": max(0, _int(args.get("recheck_days"), 30)),
                 "rediscover": _bool(args.get("rediscover")), "days": _int(args.get("days"), 7)}
+    # The centre's city and state feed the automatic location filter. Looked up once, after every
+    # argument is known good; the stored request carries the answer, so a repeat never asks again.
+    place = args.get("center_place") if isinstance(args.get("center_place"), dict) else None
+    if place is None:
+        place = J.geocode.reverse(lat, lon) if J.geocode.configured() else {}
+    resolved["center_place"] = place
     capacity.check()
 
     def work(conn, run):
         with J.browser.Session(run.log, check=run.check) as s:
             return J.geo_scan(conn, resolved, s, log=run.log, progress=run.progress, check=run.check, run_id=run.id)
-    rid = runs.start("geo", resolved, work, request={"op": "geo_scan", "args": {**args, "center": center, "center_text": center_text}})
+    rid = runs.start("geo", resolved, work, request={"op": "geo_scan", "args": {**args, "center": center, "center_text": center_text, "center_place": place}})
     return {"run_id": rid, "status": "running", "center": {"lat": lat, "lon": lon, "label": label}}
 
 
@@ -524,17 +534,18 @@ def list_resumes(args):
 # name -> (function, MCP description or None when HTTP-only, MCP input schema)
 _S = lambda **props: {"type": "object", "properties": props}  # noqa: E731
 _str, _intt, _boolt = {"type": "string"}, {"type": "integer"}, {"type": "boolean"}
-FILTER = r"include/exclude are title regexes applied at scan time (e.g. include 'analyst|account')"
+FILTER = (r"include/exclude are title regexes applied at scan time (e.g. include 'analyst|account'); location is a regex "
+          r"a card's location must match (e.g. '\\b(Albuquerque|New Mexico|NM)\\b'; cards with no or only a count of locations pass)")
 
 OPERATIONS = {
     "stats": (stats, "Counts of jobs, verdicts, embeddings; available adapters; active run.", _S()),
     "adapters": (adapters, "Adapters (hosting platforms) available: name, display_name, kind (family = many employers, site = one board).", _S()),
     "sources": (sources, "Adapters with boards registered and last scan (older name for adapters).", _S()),
     "boards": (boards, "Registered job boards: id, adapter, name, url, enabled, params (incl. include/exclude title regexes), jobs stored, last scan.", _S()),
-    "add_boards": (add_boards, "Register job boards by URL (many at once). The backend picks the adapter for each URL (Workday, Oracle HCM, iCIMS, UKG, NEOGOV, Greenhouse, Eightfold, Yello/USACE ...), verifies the endpoint answers, and stores the board. URLs no adapter recognises are registered as generic Firecrawl boards when Firecrawl is configured (adapter 'firecrawl' forces that). Each item is a URL or {url, name, include, exclude, adapter}; " + FILTER + ". Returns per URL the board or the error.",
-                   {"type": "object", "properties": {"urls": {"type": "array", "items": {"anyOf": [_str, {"type": "object", "properties": {"url": _str, "name": _str, "include": _str, "exclude": _str, "adapter": _str}, "required": ["url"]}]}}}, "required": ["urls"]}),
-    "update_board": (update_board, "Rename, enable/disable, or change the title filters of a board.",
-                     {"type": "object", "properties": {"id": _intt, "name": _str, "enabled": _boolt, "include": _str, "exclude": _str}, "required": ["id"]}),
+    "add_boards": (add_boards, "Register job boards by URL (many at once). The backend picks the adapter for each URL (Workday, Oracle HCM, iCIMS, UKG, NEOGOV, Greenhouse, Eightfold, Yello/USACE ...), verifies the endpoint answers, and stores the board. URLs no adapter recognises are registered as generic Firecrawl boards when Firecrawl is configured (adapter 'firecrawl' forces that). Each item is a URL or {url, name, include, exclude, location, adapter}; " + FILTER + ". Returns per URL the board or the error.",
+                   {"type": "object", "properties": {"urls": {"type": "array", "items": {"anyOf": [_str, {"type": "object", "properties": {"url": _str, "name": _str, "include": _str, "exclude": _str, "location": _str, "adapter": _str}, "required": ["url"]}]}}}, "required": ["urls"]}),
+    "update_board": (update_board, "Rename, enable/disable, or change the card filters of a board; " + FILTER + ".",
+                     {"type": "object", "properties": {"id": _intt, "name": _str, "enabled": _boolt, "include": _str, "exclude": _str, "location": _str}, "required": ["id"]}),
     "delete_board": (delete_board, "Remove a board; its jobs stay (detached from the board).", {"type": "object", "properties": {"id": _intt}, "required": ["id"]}),
     "list_jobs": (list_jobs, "List jobs with latest verdict and action. Filters are ANDed.",
                   _S(verdict={"type": "string", "description": "comma list of yes,maybe,no,none"},
@@ -556,14 +567,16 @@ OPERATIONS = {
     "scan": (scan, "Start a background scan: boards = list of board ids, or source = every board of one adapter, or neither = every enabled board. New/changed postings are embedded automatically. Returns a run id to poll with run_status.",
              _S(boards={"type": "array", "items": _intt}, source=_str, days={"type": "integer", "default": 7},
                 all={"type": "boolean", "default": False}, refetch={"type": "boolean", "default": False})),
-    "geo_scan": (geo_scan, "Start a geographic scan (background run of kind 'geo'): businesses around a point are discovered from OpenStreetMap, their websites and careers pages found, each careers page registered as a board (origin geo) and scanned. center: 'lat, lng', a Google Maps link, or an address (geocoded). Returns a run id to poll with run_status; places lists what was found.",
+    "geo_scan": (geo_scan, "Start a geographic scan (background run of kind 'geo'): businesses around a point are discovered from OpenStreetMap, their websites and careers pages found, each careers page registered as a board (origin geo) and scanned for postings in the area (location filter). center: 'lat, lng', a Google Maps link, or an address (geocoded). Returns a run id to poll with run_status; places lists what was found.",
                  _S(center={"type": "string", "description": "'35.0844, -106.6504', a Google Maps URL (@lat,lng / ?q=lat,lng / !3dlat!4dlng), or an address (geocoded once; the stored request keeps the coordinates)"},
                     radius_km={"type": "number", "default": 10},
                     categories={"type": "array", "items": _str, "description": "registry keys (geo_categories); default " + ", ".join(J.DEFAULT_CATEGORIES)},
                     keywords={"type": "string", "description": "match place names (comma-separated alternatives)"},
                     tags={"type": "array", "items": _str, "description": "raw OSM tag lines, e.g. shop=bakery or [\"office\"=\"it\"]"},
                     finders={"type": "array", "items": _str, "description": "finder names; default every configured one"},
-                    include=_str, exclude=_str, max_places={"type": "integer", "default": 300},
+                    include=_str, exclude=_str,
+                    location={"type": "string", "description": "regex a posting's location must match; default: built from the places' and the centre's city/state, e.g. \\b(Albuquerque|New Mexico|NM)\\b (postings with no location, or only a count of locations, pass)"},
+                    max_places={"type": "integer", "default": 300},
                     recheck_days={"type": "integer", "default": 30, "description": "re-check a place's careers page after this many days"},
                     rediscover={"type": "boolean", "default": False, "description": "re-check every place now"},
                     days={"type": "integer", "default": 7, "description": "postings within the last N days on the boards scanned"}) | {"required": ["center"]}),

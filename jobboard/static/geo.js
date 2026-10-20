@@ -23,12 +23,15 @@
   }
   const mapsLink = (lat, lon) => `https://www.google.com/maps/search/?api=1&query=${lat},${lon}`;
   const fmtCoord = (lat, lon) => `${Number(lat).toFixed(5)}, ${Number(lon).toFixed(5)}`;
+  // " (Albuquerque, New Mexico)": the centre's place as the run resolved it, for the automatic location filter.
+  const placeLabel = (cp) => { const s = [cp && cp.city, cp && cp.state].filter(Boolean).join(", "); return s ? ` (${s})` : ""; };
   // One line for a geo run's resolved args (runs.args): what was asked, without the centre.
   function describeArgs(a) {
     return [`${a.radius_km ?? 10} km`, (a.categories || []).join(", ") || "no categories",
             a.keywords ? `names ~ ${a.keywords}` : "", (a.tags || []).length ? `${a.tags.length} tag line(s)` : "",
             `finders: ${(a.finders || []).join(", ") || "none"}`,
             a.include ? `include ${a.include}` : "", a.exclude ? `exclude ${a.exclude}` : "",
+            a.location ? `location ~ ${a.location}` : `location: auto${placeLabel(a.center_place)}`,
             `≤ ${a.max_places ?? 300} places`, `re-check after ${a.recheck_days ?? 30} d${a.rediscover ? " (all now)" : ""}`,
             `postings from the last ${a.days ?? 7} days`].filter(Boolean).join(" · ");
   }
@@ -63,11 +66,12 @@
       <div><span class="muted">Finders</span><div class="chips" id="geoFinders"></div></div>
       <div class="muted" id="geoServices"></div>
       <div class="geo-row">Title filters: include <input type="text" id="geoInclude" placeholder="analyst|account" style="width:11em"> exclude <input type="text" id="geoExclude" placeholder="senior|director" style="width:11em"></div>
+      <label title="A careers page is often a nationwide board: only postings whose location matches this regex are kept (postings with no location pass)">Location filter<input type="text" id="geoLocation" placeholder="auto: city and state of the centre" autocomplete="off"></label>
     </div>`,
     mount(panel) {
       const saved = recall() || {};
       const text = { geoCenter: "center", geoRadius: "radius_km", geoMax: "max_places", geoRecheck: "recheck_days",
-                     geoKeywords: "keywords", geoTags: "tags", geoInclude: "include", geoExclude: "exclude" };
+                     geoKeywords: "keywords", geoTags: "tags", geoInclude: "include", geoExclude: "exclude", geoLocation: "location" };
       Object.entries(text).forEach(([id, k]) => { if (saved[k] != null) $("#" + id).value = saved[k]; });
       const save = () => remember(this.values(panel));
       panel.addEventListener("change", save);
@@ -113,7 +117,7 @@
       return { center: $("#geoCenter").value.trim(), radius_km: Number($("#geoRadius").value || 10),
                categories: checked("geocat"), keywords: $("#geoKeywords").value.trim(),
                tags: $("#geoTags").value.split("\n").map((x) => x.trim()).filter(Boolean), finders: checked("geofinder"),
-               include: $("#geoInclude").value.trim(), exclude: $("#geoExclude").value.trim(),
+               include: $("#geoInclude").value.trim(), exclude: $("#geoExclude").value.trim(), location: $("#geoLocation").value.trim(),
                max_places: Number($("#geoMax").value || 300), recheck_days: Number($("#geoRecheck").value || 0),
                rediscover: $("#geoRediscover").checked };
     },
@@ -124,7 +128,7 @@
       $("#geoMax").value = a.max_places ?? 300; $("#geoRecheck").value = a.recheck_days ?? 30;
       $("#geoRediscover").checked = !!a.rediscover; $("#geoKeywords").value = a.keywords || "";
       $("#geoTags").value = Array.isArray(a.tags) ? a.tags.join("\n") : (a.tags || "");
-      $("#geoInclude").value = a.include || ""; $("#geoExclude").value = a.exclude || "";
+      $("#geoInclude").value = a.include || ""; $("#geoExclude").value = a.exclude || ""; $("#geoLocation").value = a.location || "";
       const cats = a.categories || meta.categories.filter((c) => c.default).map((c) => c.key);
       panel.querySelectorAll('input[name="geocat"]').forEach((i) => { i.checked = cats.includes(i.value); });
       const finders = a.finders || meta.finders.filter((f) => f.configured).map((f) => f.name);
@@ -136,7 +140,7 @@
       if (!v.center) throw new Error("geographic scan: a centre is required");
       if (!v.categories.length && !v.tags.length) throw new Error("geographic scan: pick a category or type a tag line");
       if (!v.finders.length) throw new Error("geographic scan: no finder selected");
-      const body = { ...v, keywords: v.keywords || undefined, include: v.include || undefined, exclude: v.exclude || undefined };
+      const body = { ...v, keywords: v.keywords || undefined, include: v.include || undefined, exclude: v.exclude || undefined, location: v.location || undefined };
       const where = resolved ? resolved.label : v.center;
       return { url: "/api/geo/scan", body, label: `geographic scan ${v.radius_km} km around ${where}` };
     },

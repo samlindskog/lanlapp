@@ -59,6 +59,7 @@
     if (r.kind === "geo" && sm.discovered != null) {
       const failed = (sm.failed || []).length;
       return `${esc(JB.geo.describeSummary(sm))} · <b>${sm.new ?? 0} new jobs</b>${failed ? ` · <span style="color:var(--no)">${failed} failed</span>` : ""}
+        ${sm.location ? `<small>location filter ${esc(sm.location)}</small>` : ""}
         ${sm.need_judgment && sm.need_judgment.length ? `<small>${sm.need_judgment.length} need judgment</small>` : ""}`;
     }
     if (r.kind === "refresh" && sm.refreshed != null) return `${sm.refreshed} refreshed${sm.failed ? ` · <span style="color:var(--no)">${sm.failed} failed</span>` : ""}`;

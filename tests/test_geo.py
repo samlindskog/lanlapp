@@ -52,24 +52,52 @@ def check_names_and_dedup():
 def check_websites():
     assert careers.is_aggregator("https://www.yelp.com/biz/x") and careers.is_aggregator("https://m.facebook.com/x")
     assert careers.is_aggregator("https://yelp.ca/x") and careers.is_aggregator("https://www.bbb.org/x")
-    assert not careers.is_aggregator("https://firstcommunitybank.example.com/")
+    assert not careers.is_aggregator("https://firstcommunitybank.com/")
     assert not careers.is_aggregator("https://yelp.example.com/") and not careers.is_aggregator("https://notyelp.com/")
     assert not careers.is_aggregator("https://bbb.example.org/")       # a label is not a domain
     assert geo.web_url("https://Acme.example.com/jobs?x=1#top") == "https://Acme.example.com/jobs?x=1"
     assert geo.web_url(" http://a.example.com ") == "http://a.example.com"
     for bad in ("javascript:alert(1)", "mailto:hr@acme.example.com", "www.acme.example.com", "/careers", "ftp://x.example.com/", "", None, "https://"):
         assert geo.web_url(bad) is None, bad
-    assert careers.resembles("First Community Bank", "https://www.firstcommunitybank.example.com/", "")
-    assert careers.resembles("First Community Bank", "https://fcb.example.com/", "First Community Bank | Home")
-    assert not careers.resembles("First Community Bank", "https://fcb.example.com/", "Some other bank")
-    assert careers.resembles("Walmart", "https://walmart.com/store/123", "")
+    assert careers.registrable_domain("https://www.riograndecu.org/careers") == "riograndecu"
+    assert careers.registrable_domain("https://jobs.first-community.co.uk/") == "firstcommunity" and careers.registrable_domain("http://localhost/") == ""
+    assert careers.key_tokens("State Farm - Monica Valdez") == ["monica", "valdez"] and careers.key_tokens("The Aragon Agency") == ["aragon"]
+    assert careers.key_tokens("First Community Bank") == ["first", "community", "bank"]       # all generic: the whole name counts
+    # Rule 1: the domain is built from the name.
+    assert careers.domain_matches("Rio Grande Credit Union", "https://www.riograndecu.org/")
+    assert careers.domain_matches("First Community Bank", "https://www.firstcommunitybank.com/")
+    assert careers.domain_matches("Walmart", "https://walmart.com/store/123")
+    assert not careers.domain_matches("First Community Bank", "https://fcb.example.com/")
+    assert not careers.domain_matches("State Farm - Monica Valdez", "https://weloans.com/store/monica-valdez-state-farm-insurance-agent-2bdfbef9")
+    assert not careers.domain_matches("The Aragon Agency", "https://www.enqa.eu/membership-database/acpua-aragon-agency-for-quality-assurance")
+    assert not careers.domain_matches("Albuquerque Insurance Agency", "https://www.agency.example.com/")   # generic words only, not all present
+    # Rule 2: the place named, with a distinctive word.
+    assert careers.mentions_place("Monica Valdez - State Farm agent in Albuquerque, NM", "Albuquerque", "New Mexico")
+    assert careers.mentions_place("Serving all of New Mexico", "Santa Fe", "NM") and careers.mentions_place("Taos, NM office", None, "New Mexico")
+    assert not careers.mentions_place("Monica Valdez - State Farm Insurance Agent", "Albuquerque", "NM")
+    assert not careers.mentions_place("the nm value", None, "NM")                                        # the abbreviation is a word, upper-case
+    # The two false positives from the first real run return None; a right answer is found.
+    valdez = [{"url": "https://weloans.com/store/monica-valdez-state-farm-insurance-agent-2bdfbef9",
+               "title": "Monica Valdez - State Farm Insurance Agent | WeLoans", "snippet": "Compare loans and insurance agents."},
+              {"url": "https://www.statefarm.com/agent/us/nm/albuquerque/monica-valdez-x1", "title": "Monica Valdez - State Farm Insurance Agent in Albuquerque, NM"}]
+    assert careers.pick_website("State Farm - Monica Valdez", valdez[:1], "Albuquerque", "NM") is None
+    assert careers.pick_website("State Farm - Monica Valdez", valdez, "Albuquerque", "NM") == valdez[1]["url"]   # rule 2
+    aragon = [{"url": "https://www.enqa.eu/membership-database/acpua-aragon-agency-for-quality-assurance-and-accreditation-acpua/",
+               "title": "ACPUA - Aragon Agency for Quality Assurance and Accreditation | ENQA", "snippet": "Member since 2012."}]
+    assert careers.pick_website("The Aragon Agency", aragon, "Albuquerque", "NM") is None
+    rgcu = [{"url": "https://www.yelp.com/biz/rio-grande-credit-union-albuquerque", "title": "Rio Grande Credit Union - Albuquerque, NM - Yelp"},
+            {"url": "https://www.nerdwallet.example.com/best-credit-unions", "title": "Best credit unions in New Mexico", "snippet": "Rio Grande Credit Union and others"},
+            {"url": "https://www.riograndecu.org/", "title": "Home"}]
+    assert careers.pick_website("Rio Grande Credit Union", rgcu, "Albuquerque", "NM") == "https://www.riograndecu.org/"   # rule 1 beats an earlier rule-2 hit
+    assert careers.pick_website("Rio Grande Credit Union", rgcu[:2], "Albuquerque", "NM") == rgcu[1]["url"]             # rule 2 alone
     results = [{"url": "https://www.yelp.com/biz/first-community-bank", "title": "First Community Bank - Yelp"},
                {"url": "https://www.randomnews.example.com/story", "title": "A story"},
                {"url": "javascript:alert(1)", "title": "First Community Bank"},
-               {"url": "https://www.firstcommunitybank.example.com/#top", "title": "Home"},
+               {"url": "https://www.firstcommunitybank.com/#top", "title": "Home"},
                {"url": "https://other.example.com/", "title": "First Community Bank"}]
-    assert careers.pick_website("First Community Bank", results) == "https://www.firstcommunitybank.example.com/"
+    assert careers.pick_website("First Community Bank", results) == "https://www.firstcommunitybank.com/"
     assert careers.pick_website("First Community Bank", results[:3]) is None
+    assert careers.pick_website("First Community Bank", results[:3], "Albuquerque", "NM") is None       # no place named anywhere
 
 
 SAMPLE = """<html><head><title>Acme</title></head><body><nav>
@@ -91,6 +119,46 @@ def check_careers_links():
     m = careers.careers_from_links(["https://c.example.com/about", "https://c.example.com/join-the-team", "javascript:jobs()",
                                     {"url": "https://c.example.com/x", "title": "Careers"}], "https://c.example.com")
     assert m == ["https://c.example.com/x", "https://c.example.com/join-the-team"], m
+
+
+def check_card_filter():
+    """A board's include/exclude title rules and its location rule, as scan_board applies them;
+    a card whose location says nothing (missing, or only a count) passes the location rule."""
+    board = {"params": {"include": "analyst|budget", "exclude": "senior", "location": r"\b(Albuquerque|Rio Rancho|New Mexico|NM)\b"}}
+    keep = J._card_filter(board)
+    assert keep({"title": "Budget Analyst", "location": "Albuquerque, NM"})
+    assert keep({"title": "Financial Analyst", "location": "Rio Rancho, New Mexico"})
+    assert not keep({"title": "Senior Analyst", "location": "Albuquerque, NM"})           # exclude
+    assert not keep({"title": "Teller", "location": "Albuquerque, NM"})                    # include
+    assert not keep({"title": "Analyst", "location": "Minneapolis, MN"})                   # location
+    assert not keep({"title": "Analyst", "location": "Nome, Alaska"})                      # \bNM\b does not match "Nome"
+    for unknown in (None, "", "3 Locations", "12 locations", "Multiple Locations", "Multiple", "Various Locations"):
+        assert keep({"title": "Analyst", "location": unknown}), unknown
+    assert not keep({"title": "Analyst", "location": "Remote - US"})                       # a real place that is not ours
+    assert J._card_filter({"params": {}})({"title": None, "location": None})               # no rules: everything passes
+    assert J._card_filter({"params": {"location": "NM"}})({"title": "x", "location": "Santa Fe, NM"})
+    loc_ok = J._location_filter(board)
+    assert loc_ok("Albuquerque, NM") and loc_ok("3 Locations") and not loc_ok("Denver, CO")
+
+
+def check_location_regex():
+    from core import geocode
+    assert J.state_forms("NM") == ("NM", "New Mexico") and J.state_forms("new mexico") == ("NM", "New Mexico")
+    assert J.state_forms("Baja California") == (None, "Baja California") and J.state_forms("") == (None, None)
+    rx = J.location_regex(["Albuquerque", "Rio Rancho", "albuquerque", None, ""], ["NM", "New Mexico", "Colorado"])
+    assert rx == r"\b(Albuquerque|Rio Rancho|New Mexico|NM|Colorado|CO)\b", rx
+    import re
+    assert re.search(rx, "Rio Rancho, NM", re.I) and re.search(rx, "Denver, Colorado", re.I) and not re.search(rx, "Nome, AK", re.I)
+    assert J.location_regex([], []) is None and J.location_regex([None], [None]) is None
+    assert J.location_regex(["St. Louis (Downtown)"], []) == r"\b(St\. Louis \(Downtown\))\b"
+    assert len(J.location_regex([f"City{i}" for i in range(80)], []).split("|")) == 30      # bounded
+    assert J.check_regex(J.location_regex(["Albuquerque", "Rio Rancho"], ["NM"]), "location")  # passes the API's own guard
+    canned = {"place_id": 1, "address": {"road": "Central Ave", "city": "Albuquerque", "county": "Bernalillo County",
+                                         "state": "New Mexico", "ISO3166-2-lvl4": "US-NM", "postcode": "87102", "country": "United States"}}
+    assert geocode.parse_reverse(canned) == {"city": "Albuquerque", "state": "New Mexico"}
+    assert geocode.parse_reverse({"address": {"town": "Los Lunas", "state": "New Mexico"}}) == {"city": "Los Lunas", "state": "New Mexico"}
+    assert geocode.parse_reverse({"address": {"county": "Valencia County"}}) == {"city": "Valencia County"}
+    assert geocode.parse_reverse({"error": "Unable to geocode"}) == {} and geocode.parse_reverse([]) == {} and geocode.parse_reverse(None) == {}
 
 
 def check_registry_and_osm():
@@ -215,7 +283,7 @@ PLACES = [
     {"name": "Acme Branch", "lat": 35.07, "lon": -106.0, "website": "https://acme-branch.example.com/", "category": "retail", "finder_id": "node/10"},  # shares Acme's careers page
 ]
 SEARCH = {'"First Community Bank" Albuquerque NM': [{"url": "https://www.yelp.com/biz/fcb", "title": "First Community Bank - Yelp"},
-                                                   {"url": "https://bank.example.com/", "title": "First Community Bank - Home"}],
+                                                   {"url": "https://bank.example.com/", "title": "First Community Bank - Albuquerque, NM"}],
           '"Nowhere Ltd" Albuquerque': [{"url": "https://www.yellowpages.com/x", "title": "Nowhere Ltd"}]}
 
 
@@ -280,7 +348,8 @@ def check_pipeline():
         p = J.Progress(lambda st: phases.append(st.get("phase")) if phases[-1:] != [st.get("phase")] else None)
         s = FakeSession(fetch, firecrawl=firecrawl)
         params = {"lat": 35.0, "lon": -106.0, "radius_km": 5, "categories": ["finance", "retail"], "keywords": "acme",
-                  "finders": None, "include": "analyst", "max_places": 300, "recheck_days": 30, "days": 14}
+                  "finders": None, "include": "analyst", "max_places": 300, "recheck_days": 30, "days": 14,
+                  "center_place": {"city": "Rio Rancho", "state": "NM"}}
         sm = J.geo_scan(conn, params, s, log=lines.append, progress=p, check=lambda: None, run_id=42)
         assert FakeFinder.calls == [((35.0, -106.0), 5000.0, ["finance", "retail"], "acme", [])], FakeFinder.calls
         assert phases == ["discovering", "resolving", "careers", "scanning", "done"], phases
@@ -296,7 +365,7 @@ def check_pipeline():
         assert any("shared by 2 places" in ln for ln in lines), lines[-12:]
         assert len(acme) == 2 and {r["categories"] for r in acme} == {'["finance"]', '["finance", "retail"]'}, acme
         assert acme[0]["finder_ids"] == '{"fake": "node/1"}', acme[0]["finder_ids"]      # the first sighting's id stays
-        assert rows["First Community Bank"]["website"] == "https://bank.example.com/"       # by title, not host
+        assert rows["First Community Bank"]["website"] == "https://bank.example.com/"       # rule 2: the title names the city
         assert rows["Nowhere Ltd"]["careers_kind"] == "no_site" and rows["Shop"]["careers_kind"] == "none"
         assert rows["Down Inc"]["careers_kind"] == "unresolved" and rows["Down Inc"]["careers_url"] is None
         assert rows["Bad Co"]["careers_kind"] == "unresolved" and rows["Bad Co"]["careers_url"] == "https://bad.example.com/careers"
@@ -313,7 +382,11 @@ def check_pipeline():
         assert rows["First Community Bank"]["careers_kind"] == "adapter:firecrawl"   # found at the common path /jobs
         assert len(scanned) == 1 and scanned[0]["session"] is s and scanned[0]["days"] == 14 and scanned[0]["run_id"] == 42
         sb = scanned[0]["boards"]
-        assert [b["adapter"] for b in sb] == ["workday", "firecrawl", "firecrawl"] and all(b["params"] == {"include": "analyst"} for b in sb), sb
+        # The automatic location filter: the centre's city/state plus the places' (First Community
+        # Bank and Nowhere Ltd are in Albuquerque, NM), state in both forms, on every board scanned.
+        auto = r"\b(Rio Rancho|Albuquerque|New Mexico|NM)\b"
+        assert [b["adapter"] for b in sb] == ["workday", "firecrawl", "firecrawl"] and all(b["params"] == {"include": "analyst", "location": auto} for b in sb), sb
+        assert sm["location"] == auto and any(ln == f"location filter: {auto}" for ln in lines), lines[-8:]
         assert "https://shop.example.com/careers" in fetched and "https://bank.example.com/jobs" in fetched
         assert any("not configured" in ln for ln in lines) and any("discovered 9 place(s) (10 before dedup)" in ln for ln in lines), lines
         # A repeat: nothing new, resolved places are left alone, the two unresolved ones are retried.
@@ -326,12 +399,15 @@ def check_pipeline():
         assert all(r["last_run_id"] == 43 and r["first_run_id"] == 42 for r in conn.places.values())
         # rediscover: every site is fetched again and every board re-registered (then scanned).
         fetched.clear(); added.clear()
-        sm3 = J.geo_scan(conn, {**params, "rediscover": True}, s, log=lines.append, progress=p, check=lambda: None, run_id=44)
+        sm3 = J.geo_scan(conn, {**params, "rediscover": True, "location": r"\bSanta Fe\b"}, s, log=lines.append, progress=p, check=lambda: None, run_id=44)
         assert sm3["boards_new"] == 0 and sm3["boards_scanned"] == 3 and len(added) == 5 and "https://acme.example.com/" in fetched, (sm3, added)
+        assert sm3["location"] == r"\bSanta Fe\b" and all(b["params"]["location"] == r"\bSanta Fe\b" for b in scanned[-1]["boards"])   # explicit wins
+        sm4 = J.geo_scan(conn, {**params, "center_place": {}, "rediscover": True}, s, log=lines.append, progress=p, check=lambda: None, run_id=45)
+        assert sm4["location"] == r"\b(Albuquerque|New Mexico|NM)\b", sm4["location"]                 # no centre place: the places' alone
         assert conn.boards[1]["name"] == "acme.example.com"                   # a rename happens once, not every run
         # Cancel lands at the first check.
         try:
-            J.geo_scan(conn, params, s, log=lines.append, progress=p, check=lambda: (_ for _ in ()).throw(J.browser.Cancelled("stop")), run_id=45)
+            J.geo_scan(conn, params, s, log=lines.append, progress=p, check=lambda: (_ for _ in ()).throw(J.browser.Cancelled("stop")), run_id=46)
             raise AssertionError("cancel did not propagate")
         except J.browser.Cancelled:
             pass
@@ -367,6 +443,10 @@ def main():
     print("website picking: aggregators skipped, name resemblance: ok")
     check_careers_links()
     print("careers links: ok")
+    check_card_filter()
+    print("card filter: title include/exclude + location, unknown locations kept: ok")
+    check_location_regex()
+    print("location_regex + state forms + Nominatim reverse parsing: ok")
     check_registry_and_osm()
     print("category registry + Overpass query/parse: ok")
     check_pipeline()

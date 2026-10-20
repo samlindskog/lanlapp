@@ -5,7 +5,7 @@ import os
 import re
 import time
 from core.client import Pacer, request
-from core.geo import CATEGORIES, ql_string, tag_selector, web_url
+from core.geo import CATEGORIES, ql_string, rx_escape, tag_selector, web_url
 
 NAME = "osm"
 DISPLAY_NAME = "OpenStreetMap (Overpass)"
@@ -27,8 +27,7 @@ def _name_filter(keywords):
     words = [w.strip() for w in re.split(r"[,|]", keywords or "") if w.strip()]
     if not words:
         return ""
-    rx = "|".join(re.sub(r"([.^$*+?()\[\]{}\\])", r"\\\1", w) for w in words)   # only regex metacharacters
-    return f'["name"~"{ql_string(rx)}",i]'
+    return f'["name"~"{ql_string("|".join(rx_escape(w) for w in words))}",i]'
 
 
 def build_query(center, radius_m, selectors, keywords=None):
