@@ -17,7 +17,7 @@ _live = {}               # id -> Run: every running run, plus finished transient
 _seq = 0
 
 
-def _parsed(v):
+def parsed(v):
     """A JSON column (args, request, summary) as an object; whatever is not JSON stays as is."""
     if not isinstance(v, str):
         return v
@@ -207,7 +207,7 @@ def recent(kind=None, status=None, limit=20, before=None):
     out = sorted(transient + rows, key=lambda r: r.get("started_at") or "", reverse=True)[:limit]
     for r in out:
         for k in ("args", "request", "summary"):
-            r[k] = _parsed(r.get(k))
+            r[k] = parsed(r.get(k))
     return out
 
 

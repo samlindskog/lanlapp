@@ -120,7 +120,9 @@
       if (state.logs.has(id)) state.logs.delete(id); else state.logs.add(id);
       render(); return;
     }
-    if (act === "edit") { scanDlg.open((r.request || {}).args || {}); return; }
+    // A scan asked for by source or "every enabled board" stored no ids: the boards it resolved to
+    // (args.boards) are the selection to edit; an explicit request keeps its own.
+    if (act === "edit") { scanDlg.open({ boards: (r.args || {}).boards, ...((r.request || {}).args || {}) }); return; }
     b.disabled = true;
     try {
       if (act === "cancel") { await post(`/api/runs/${encodeURIComponent(id)}/cancel`); }

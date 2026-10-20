@@ -45,16 +45,6 @@ def _ints(v):
     return [int(x) for x in (v or [])]
 
 
-def _json(v):
-    """A JSON column as an object (runs.get hands rows back as stored)."""
-    if not isinstance(v, str):
-        return v
-    try:
-        return json.loads(v)
-    except ValueError:
-        return None
-
-
 # ------------------------------------------------------------------ info
 def stats(args):
     with db() as conn:
@@ -351,7 +341,7 @@ def repeat_run(args):
     r = runs.get(rid)
     if not r:
         raise KeyError(f"run {rid}")
-    req = _json(r.get("request"))
+    req = runs.parsed(r.get("request"))          # runs.get hands the row back as stored
     if not isinstance(req, dict) or not req.get("op"):
         raise ValueError(f"run {rid} has no stored request to repeat")
     op, rargs, dropped = req["op"], dict(req.get("args") or {}), []
