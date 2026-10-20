@@ -389,11 +389,12 @@ def check_pipeline():
         assert sm["location"] == auto and any(ln == f"location filter: {auto}" for ln in lines), lines[-8:]
         assert "https://shop.example.com/careers" in fetched and "https://bank.example.com/jobs" in fetched
         assert any("not configured" in ln for ln in lines) and any("discovered 9 place(s) (10 before dedup)" in ln for ln in lines), lines
-        # A repeat: nothing new, resolved places are left alone, the two unresolved ones are retried.
+        # A repeat: nothing new, resolved places are left alone, the two unresolved ones are retried,
+        # and the places' known boards are scanned again for the area.
         fetched.clear(); added.clear(); scanned.clear(); maps.clear(); phases.clear()
         sm2 = J.geo_scan(conn, params, s, log=lines.append, progress=p, check=lambda: None, run_id=43)
         assert {k: sm2[k] for k in ("discovered", "new_places", "resolved", "no_site", "with_careers", "boards_new", "boards_scanned")} \
-            == {"discovered": 9, "new_places": 0, "resolved": 0, "no_site": 0, "with_careers": 0, "boards_new": 0, "boards_scanned": 0}, sm2
+            == {"discovered": 9, "new_places": 0, "resolved": 0, "no_site": 0, "with_careers": 0, "boards_new": 0, "boards_scanned": 3}, sm2
         assert [a["url"] for a in added] == ["https://bad.example.com/careers"] and not scanned and not maps, (added, scanned)
         assert fetched == ["https://down.example.com/"], fetched
         assert all(r["last_run_id"] == 43 and r["first_run_id"] == 42 for r in conn.places.values())

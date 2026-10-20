@@ -120,7 +120,7 @@ def geo_scan(conn, params, session, log=print, progress=None, check=None, run_id
         if not url:                                        # a recent 'none'
             continue
         if row.get("board_id") and not rediscover:
-            b = get_board(conn, row["board_id"]) if rechecked else None   # re-checked: scan it; otherwise the normal scan covers it
+            b = get_board(conn, row["board_id"])        # known board: every run scans it for the area
             if b:
                 boards[b["id"]] = b
             continue
@@ -133,7 +133,7 @@ def geo_scan(conn, params, session, log=print, progress=None, check=None, run_id
         boards[b["id"]] = b
         log(f"{row['name']}: board [{b['id']}] {b['name']} ({b['adapter']})")
 
-    # 5. scan what this run touched, keeping only postings in the area: a business's careers page
+    # 5. scan the boards of the places found, keeping only postings in the area: a business's careers page
     # is often a nationwide board, so each card's location must match the run's location regex
     # (given, or built from the places' and the centre's city/state).
     cp = params.get("center_place") or {}
