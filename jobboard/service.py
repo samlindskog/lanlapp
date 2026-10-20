@@ -131,9 +131,10 @@ def add_boards(args):
     if not isinstance(items, list):
         items = [args]
     out = []
-    # a URL nothing recognises becomes a generic Firecrawl board, but only when a Firecrawl is configured
-    fallback = "firecrawl" if J.browser.Config().firecrawl else None
     with capacity.hold("add_boards"), db() as conn, J.browser.Session(lambda m: log_event("info", m.strip())) as s:
+        # a URL nothing recognises becomes a generic Firecrawl board when the Session has a Firecrawl;
+        # an explicit adapter "firecrawl" wins even without one (the Session then reports the missing FIRECRAWL_URL)
+        fallback = "firecrawl" if s.cfg.firecrawl else None
         for it in items:
             it = {"url": it} if isinstance(it, str) else dict(it or {})
             url = (it.get("url") or "").strip()
@@ -144,7 +145,7 @@ def add_boards(args):
                 adapter = it.get("adapter")
                 b = J.add_board(conn, url, name=it.get("name"), include=it.get("include"), exclude=it.get("exclude"),
                                 adapter=adapter, session=s,
-                                fallback_adapter="firecrawl" if adapter == "firecrawl" else fallback)   # forced: regardless
+                                fallback_adapter="firecrawl" if adapter == "firecrawl" else fallback)
                 out.append({"url": url, "board": b})
                 log_event("info", f"board added: [{b['id']}] {b['name']} ({b['adapter']}) {b['url']}")
             except Exception as e:  # noqa: BLE001
