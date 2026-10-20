@@ -15,8 +15,10 @@
 #     prerouting nat                        [flag] eth0 443 from Cloudflare -> 10.88.0.2:443; 2222 -> 10.88.0.2:1025
 #                                           only if no other table already has that DNAT (it predates this script)
 #     forward (policy accept)               MSS clamp; established; eth0->wg0 to the desktop {443,1025};
-#                                           laptop->desktop {1025,8090} wg0->wg0 (routed, not NATed); peer ping
-#     postrouting nat                       masquerade the DNAT'd public flows towards the desktop (source = 10.88.0.1)
+#                                           laptop->desktop {1025,8090} wg0->wg0 (routed, not NATed); peer ping;
+#                                           desktop -> eth0 (its containers' egress, policy-routed there)
+#     postrouting nat                       masquerade the DNAT'd public flows towards the desktop (source = 10.88.0.1);
+#                                           masquerade 10.88.0.2 out of eth0 (the containers exit as this host)
 #   /etc/nftables.conf                      marked block: include line + accept rules inserted into OTHER tables'
 #                                           drop-policy forward chains (see "evaluation semantics" below)
 #   /usr/local/sbin/jobboard-hub-accepts    + .service: the same accepts for drop chains NOT defined in
@@ -192,6 +194,7 @@ FWD_RULES=(
   "iifname \"$WAN_IF\" oifname \"$WG_IF\" ip daddr $DESKTOP_IP tcp dport { $HTTPS_PORT, $DESKTOP_SSH_PORT } accept"
   "iifname \"$WG_IF\" oifname \"$WG_IF\" ip saddr $LAPTOP_IP ip daddr $DESKTOP_IP tcp dport { $DESKTOP_SSH_PORT, $MCP_PORT } accept"
   "iifname \"$WG_IF\" oifname \"$WG_IF\" ip saddr { $DESKTOP_IP, $LAPTOP_IP } icmp type echo-request accept"
+  "iifname \"$WG_IF\" oifname \"$WAN_IF\" ip saddr $DESKTOP_IP accept"
 )
 INS_CONF=()   # "family table chain|rule": chains defined in $NFT_MAIN -> persisted in its marked block
 INS_LIVE=()   # chains that exist live but not in $NFT_MAIN (Docker) -> re-inserted by the accepts service at boot
@@ -254,11 +257,13 @@ $([ "$SSH_DNAT_OURS" = 1 ] && printf '\t\tiifname "%s" tcp dport %s dnat ip to %
 		iifname "$WAN_IF" oifname "$WG_IF" ip daddr $DESKTOP_IP tcp dport { $HTTPS_PORT, $DESKTOP_SSH_PORT } accept comment "DNAT'd public flows -> desktop"
 		iifname "$WG_IF" oifname "$WG_IF" ip saddr $LAPTOP_IP ip daddr $DESKTOP_IP tcp dport { $DESKTOP_SSH_PORT, $MCP_PORT } accept comment "laptop -> desktop: ssh, MCP (routed, no NAT)"
 		iifname "$WG_IF" oifname "$WG_IF" ip saddr { $DESKTOP_IP, $LAPTOP_IP } icmp type echo-request accept comment "peer ping"
+		iifname "$WG_IF" oifname "$WAN_IF" ip saddr $DESKTOP_IP accept comment "desktop egress"
 	}
 
 	chain postrouting {
 		type nat hook postrouting priority srcnat; policy accept;
 		oifname "$WG_IF" ip daddr $DESKTOP_IP ip saddr != ${HUB_IP%.*}.0/24 masquerade comment "DNAT'd public flows: desktop sees $HUB_IP; peer traffic untouched"
+		ip saddr $DESKTOP_IP oifname "$WAN_IF" masquerade comment "desktop egress"
 	}
 }
 include "$1"

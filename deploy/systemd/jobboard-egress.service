@@ -1,0 +1,17 @@
+# Installed by deploy/bootstrap.sh (egress mode). oneshot + RemainAfterExit: the ip rules stay while the unit
+# is "active" and ExecStop removes them. `systemctl restart` would run remove before apply and leave a moment
+# without the prohibit rule, so a live reconcile is `jobboard-egress apply`, never a restart (the bootstrap
+# does that). wg-quick@wg0 Wants this unit (drop-in), so the rules are in place whenever the tunnel is.
+[Unit]
+Description=jobboard: route container egress through the WireGuard hub (prohibit when the tunnel is down)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/jobboard-egress apply
+ExecStop=/usr/local/sbin/jobboard-egress remove
+
+[Install]
+WantedBy=multi-user.target
