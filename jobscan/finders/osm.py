@@ -1,6 +1,6 @@
 """OpenStreetMap through the Overpass API: businesses around a point by tag, one query per
 category (the registry's tag expressions as a union), plus one for the user's raw tag lines.
-OVERPASS_URL (default: the public instance, which asks for pacing and returns 429/504 under load)."""
+OVERPASS_URL (comma-separated instances; default: three public ones, which ask for pacing and answer 429/502/504 under load)."""
 import os
 import re
 import time
@@ -9,7 +9,12 @@ from core.geo import CATEGORIES, ql_string, tag_selector, web_url
 
 NAME = "osm"
 DISPLAY_NAME = "OpenStreetMap (Overpass)"
-OVERPASS_URL = os.environ.get("OVERPASS_URL") or "https://overpass-api.de/api/interpreter"
+# One or more interpreters, comma-separated; the public instances are often at capacity (429/502/504),
+# so a busy one is retried once with a pause and then the next instance takes the query.
+OVERPASS_URLS = [u.strip() for u in (os.environ.get("OVERPASS_URL") or
+                 "https://overpass-api.de/api/interpreter,https://overpass.kumi.systems/api/interpreter,"
+                 "https://overpass.private.coffee/api/interpreter").split(",") if u.strip()]
+OVERPASS_URL = OVERPASS_URLS[0]
 _pace = Pacer(2.0)
 RETRIES = 3
 
@@ -54,22 +59,26 @@ def _place(el, category):
 
 
 def _query(ql, log):
-    """POST the query; a 429/504 (busy instance) waits and retries a few times."""
-    for attempt in range(RETRIES + 1):
-        _pace.wait()
-        try:
-            status, data = request(OVERPASS_URL, data={"data": ql}, timeout=90)
-        except OSError as e:
-            status, data = 0, {"text": str(e)}
-        if status == 200 and isinstance(data, dict):
-            return data.get("elements") or []
-        if status in (429, 504, 0) and attempt < RETRIES:
-            wait = 10 * (attempt + 1)
-            log(f"  overpass: HTTP {status or 'error'}; waiting {wait}s")
-            time.sleep(wait)
-            continue
-        raise RuntimeError(f"overpass HTTP {status}: {str((data or {}).get('text') or data)[:160]}")
-    return []
+    """POST the query. A busy instance (429/502/504 or a connection error) is retried once after a
+    pause, then the next configured instance gets the query; the last failure is raised."""
+    last = None
+    for url in OVERPASS_URLS:
+        for attempt in range(2):
+            _pace.wait()
+            try:
+                status, data = request(url, data={"data": ql}, timeout=90)
+            except OSError as e:
+                status, data = 0, {"text": str(e)}
+            if status == 200 and isinstance(data, dict):
+                return data.get("elements") or []
+            last = f"overpass HTTP {status or 'error'} ({url.split('/')[2]}): {str((data or {}).get('text') or data)[:120]}"
+            if status not in (429, 502, 504, 0):
+                raise RuntimeError(last)
+            if attempt == 0:
+                log(f"  overpass: {url.split('/')[2]} busy (HTTP {status or 'error'}); waiting 10s")
+                time.sleep(10)
+        log(f"  overpass: {url.split('/')[2]} still busy; trying the next instance")
+    raise RuntimeError(last or "overpass: no instance configured")
 
 
 def find(center, radius_m, categories, keywords, tags, log):
