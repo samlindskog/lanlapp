@@ -16,7 +16,6 @@ OVERPASS_URLS = [u.strip() for u in (os.environ.get("OVERPASS_URL") or
                  "https://overpass.private.coffee/api/interpreter").split(",") if u.strip()]
 OVERPASS_URL = OVERPASS_URLS[0]
 _pace = Pacer(2.0)
-RETRIES = 3
 
 
 def configured():
