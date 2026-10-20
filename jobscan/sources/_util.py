@@ -28,17 +28,29 @@ def qs(url):
     return {k: v[0] for k, v in urllib.parse.parse_qs(split_url(url).query).items()}
 
 
+def _date(y, m, d):
+    """'YYYY-MM-DD' when the parts make a real date, else None."""
+    try:
+        return dt.date(int(y), int(m), int(d)).isoformat()
+    except ValueError:
+        return None
+
+
 def iso_date(s):
-    """'2026-10-14', '2026-10-14T13:16:00+0000', '10/14/2026', 'October 14, 2026' -> 'YYYY-MM-DD'."""
+    """'2026-10-14', '2026-10-14T13:16:00+0000', '10/14/2026', 'October 14, 2026' -> 'YYYY-MM-DD';
+    None for anything that is not a real date (dates come from pages and LLM extraction, so an
+    impossible one must never raise out of a board walk). A slashed date is month-first as US
+    boards write it, day-first when the first part cannot be a month."""
     if not s:
         return None
     s = str(s).strip()
-    m = re.match(r"(\d{4}-\d{2}-\d{2})", s)
+    m = re.match(r"(\d{4})-(\d{2})-(\d{2})", s)
     if m:
-        return m.group(1)
+        return _date(*m.groups())
     m = re.match(r"(\d{1,2})/(\d{1,2})/(\d{4})", s)
     if m:
-        return f"{m.group(3)}-{int(m.group(1)):02d}-{int(m.group(2)):02d}"
+        a, b, y = m.groups()
+        return (_date(y, a, b) if int(a) <= 12 else None) or _date(y, b, a)
     for fmt in ("%B %d, %Y", "%b %d, %Y", "%d %B %Y", "%d %b %Y"):
         try:
             return dt.datetime.strptime(s, fmt).date().isoformat()
@@ -48,6 +60,7 @@ def iso_date(s):
 
 
 def days_since(date_s, today=None):
+    """Whole days since a date in any form iso_date reads; None when it reads none."""
     d = iso_date(date_s)
     if not d:
         return None
@@ -167,6 +180,12 @@ def base_fields(card):
             "announcement_no": card.get("req_id"), "series": None, "pay_plan": None,
             "grade_low": None, "grade_high": None, "salary": card.get("salary"),
             "open_date": card.get("open_date"), "close_date": card.get("close_date")}
+
+
+def dedupe(cards):
+    """The cards with every repeat of an earlier source_id dropped (order kept)."""
+    seen = set()
+    return [c for c in cards if c["source_id"] not in seen and not seen.add(c["source_id"])]
 
 
 def within(cards, since_days):
