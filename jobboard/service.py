@@ -21,7 +21,7 @@ SUMMARY_FIELDS = ("id", "title", "location", "series", "pay_plan", "grade_low", 
                   "open_date", "close_date", "external_url", "board_url", "announcement_no", "source",
                   "board_id", "board_name", "board_platform", "board_source_url",
                   "verdict", "eligible_grades", "verdict_reason", "verdict_author", "claude_verdict",
-                  "action", "action_date", "resume_dir", "last_fetched", "embedded")
+                  "action", "action_date", "resume_dir", "last_fetched", "embedded", "run_id")
 
 
 @contextlib.contextmanager
@@ -172,7 +172,7 @@ def list_jobs(args):
                            open_only=_bool(args.get("open_only") or args.get("open")), closing=args.get("closing"),
                            source=args.get("source") or None, board=args.get("board") or None,
                            days=_int(args.get("days")), pending_only=_bool(args.get("pending_only") or args.get("pending")),
-                           q=args.get("q") or None)
+                           q=args.get("q") or None, run=_int(args.get("run")))
         if args.get("fields") == "full":
             total = conn.execute("SELECT COUNT(*) AS n FROM jobs").fetchone()["n"]
             return {"jobs": rows, "count": len(rows), "total": total, "active_run": capacity.busy()}
@@ -244,7 +244,8 @@ def set_status(args):
 
 # ------------------------------------------------------------------ fetching
 def scan(args):
-    """boards: ids; source: every enabled board of one adapter; neither: all enabled boards."""
+    """boards: ids; source: every enabled board of one adapter; neither: all enabled boards.
+    The run stores the request as given (repeat_run replays it) and stamps new jobs with its id."""
     ids, source = _ints(args.get("boards")), args.get("source") or None
     with db() as conn:
         if ids:
@@ -268,7 +269,8 @@ def scan(args):
                               "days": days, "all": all_, "refetch": refetch},
                      lambda conn, run: J.scan_boards(conn, [J.get_board(conn, i) for i in bids], days=days,
                                                      all_=all_, refetch=refetch, log=run.log,
-                                                     progress=run.progress, check=run.check))
+                                                     progress=run.progress, check=run.check, run_id=run.id),
+                     request={"op": "scan", "args": args})
     return {"run_id": rid, "status": "running", "boards": bids}
 
 
@@ -327,7 +329,36 @@ def run_status(args):
 
 
 def recent_runs(args):
-    return {"runs": runs.recent(_int(args.get("limit"), 20))}
+    """kind/status filters, limit (max 200), before = id cursor for the next page."""
+    return {"runs": runs.recent(kind=args.get("kind") or None, status=args.get("status") or None,
+                                limit=max(1, min(_int(args.get("limit"), 20), 200)), before=_int(args.get("before")))}
+
+
+def repeat_run(args):
+    """Issue a persisted run's stored request again, as a new run. Transient runs (ids t<n>) and
+    runs from before requests were stored are refused. For a scan, boards deleted since are
+    dropped (reported as `dropped`); the result is the repeated operation's plus repeated_from."""
+    rid = str(args["run_id"])
+    if rid.startswith("t"):
+        raise ValueError(f"run {rid} is transient and cannot be repeated")
+    r = runs.get(rid)
+    if not r:
+        raise KeyError(f"run {rid}")
+    req = runs.parsed(r.get("request"))          # runs.get hands the row back as stored
+    if not isinstance(req, dict) or not req.get("op"):
+        raise ValueError(f"run {rid} has no stored request to repeat")
+    op, rargs, dropped = req["op"], dict(req.get("args") or {}), []
+    if op == "scan" and rargs.get("boards"):
+        with db() as conn:
+            keep = [b for b in _ints(rargs["boards"]) if J.get_board(conn, b)]
+        dropped = [b for b in _ints(rargs["boards"]) if b not in keep]
+        if not keep:                 # an empty list would mean "every enabled board", not what was asked
+            raise ValueError(f"none of the boards of run {rid} exist any more ({dropped})")
+        if dropped:
+            log_event("warn", f"repeat run {rid}: board(s) {dropped} no longer exist; scanning the rest")
+        rargs["boards"] = keep
+    out = call(op, rargs)
+    return {**out, "repeated_from": int(rid), "dropped": dropped}
 
 
 def cancel_run(args):
@@ -384,6 +415,7 @@ OPERATIONS = {
                      action={"type": "string", "description": "comma list of applied,drafted,none"},
                      open_only=_boolt, source={"type": "string", "description": "adapter name"},
                      board={"type": "string", "description": "board id or name"}, days=_intt, pending_only=_boolt,
+                     run={"type": "integer", "description": "scan run id: jobs that run stored first"},
                      closing={"type": "string", "enum": ["open", "closed", "week"], "description": "by close date"},
                      q={"type": "string", "description": "substring over title/location/board/series/reason"},
                      limit={"type": "integer", "default": 100})),
@@ -399,6 +431,7 @@ OPERATIONS = {
                 all={"type": "boolean", "default": False}, refetch={"type": "boolean", "default": False})),
     "run_status": (run_status, "Status, log, progress (board/posting in flight, counters) and summary of a background run (scan/refresh).", {"type": "object", "properties": {"run_id": _str}, "required": ["run_id"]}),
     "cancel_run": (cancel_run, "Cancel a running scan or refresh. It stops before its next page fetch (within one page load) and ends with status 'cancelled'; what it stored so far stays.", {"type": "object", "properties": {"run_id": _str}, "required": ["run_id"]}),
+    "repeat_run": (repeat_run, "Run a past scan again with the request it was started with (same boards, days, all, refetch), as a new run; boards deleted since are dropped and reported. Transient refresh runs (t<n>) cannot be repeated. Returns the new run_id plus repeated_from.", {"type": "object", "properties": {"run_id": _str}, "required": ["run_id"]}),
     "events": (events, None, _S(since=_intt, limit=_intt)),
     "refresh": (refresh, "Re-fetch postings now (synchronous, up to 20 ids). Refused while a scan holds the browser.",
                 {"type": "object", "properties": {"ids": {"type": "array", "items": _intt}}, "required": ["ids"]}),
@@ -415,8 +448,9 @@ OPERATIONS = {
                      {"type": "object", "properties": {"job_id": _intt}, "required": ["job_id"]}),
     "logs": (logs, "Server log (in-memory ring buffer since the last restart): request lines, 4xx/5xx, tracebacks, run outcomes, embedding results. Use level=error to see only failures.",
              _S(lines={"type": "integer", "default": 100}, level={"type": "string", "enum": ["all", "info", "warn", "error"], "default": "warn"}, q={"type": "string", "description": "substring filter"})),
-    "runs": (recent_runs, "Recent background runs (scans persisted, refreshes transient) with status and summary; use run_status for a run's full log.",
-             _S(limit={"type": "integer", "default": 20})),
+    "runs": (recent_runs, "Recent background runs, newest first (scans persisted, refreshes transient): args, request (what was asked; repeat_run replays it), status, summary. Use run_status for a run's full log.",
+             _S(kind={"type": "string", "enum": ["scan", "refresh"]}, status={"type": "string", "enum": ["running", "done", "failed", "cancelled"]},
+                limit={"type": "integer", "default": 20, "maximum": 200}, before={"type": "integer", "description": "id cursor: only runs with a smaller id (the next page)"})),
 }
 
 

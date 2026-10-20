@@ -19,12 +19,15 @@ jobboard/            shared research service over the database
                        the MCP tools; both front doors below are one line per operation
   server.py            HTTP front door: auth, static pages, file serving, a route table over service.py
   mcp.py               MCP front door (JSON-RPC over HTTP) for Claude Code, tools straight from the table
-  runs.py              background runs (scans persisted, refreshes transient): log, progress, cancel; each update is an event
+  runs.py              background runs (scans persisted with their request, refreshes transient): log, progress,
+                       cancel; each update is an event
   capacity.py          the one browser slot: a scan, a refresh or a registration at a time (409 otherwise)
   logbuf.py            in-memory log ring buffer (/api/logs, the logs tool) and the event stream (/api/events/stream)
   auth.py              password/session/token auth
-  static/              index.html + app.js (the board; filtering is the server's, the page sorts),
-                       view.html (one job), login.html
+  static/              index.html + app.js (the board; filtering is the server's, the page sorts; ?run=<id> shows
+                       one scan's new jobs), scans.html + scans.js (scan history: repeat, edit and run, log),
+                       common.js + common.css (shared: formatters, event-stream client, run line + run panel,
+                       the scan dialog with its tab strip), view.html (one job), login.html
   Dockerfile           the production image: python:3.13-slim + psycopg + jobscan/ + jobboard/, nothing else
   compose.yaml         dev stack;  compose.auth.yaml: overlay with auth + nginx;  compose.prod.yaml: VPS
   dev.sh               up | up-auth | smoke | token | logs | ps | down
@@ -62,6 +65,9 @@ curl -s -X POST localhost:8080/api/boards -H 'Content-Type: application/json' \
      -d '{"urls":["https://bernco.wd1.myworkdayjobs.com/berncocareers", {"url":"https://www.governmentjobs.com/careers/cabq","include":"analyst|fiscal|budget"}]}'
 curl -s localhost:8080/api/boards
 curl -s -X POST localhost:8080/api/scan -H 'Content-Type: application/json' -d '{"boards":[1,2],"days":7}'   # omit boards: every enabled board
+curl -s 'localhost:8080/api/runs?kind=scan&limit=20'                      # scan history; &before=<id> pages back
+curl -s -X POST localhost:8080/api/runs/42/repeat                         # the same request again, as a new run
+curl -s 'localhost:8080/api/jobs?run=42'                                  # the jobs that run stored first
 curl -s -X POST localhost:8080/api/jobs/ID/verdict -H 'Content-Type: application/json' -d '{"verdict":"yes","grades":"GS-5/7","reason":"..."}'
 curl -s -X POST localhost:8080/api/jobs/ID/action  -H 'Content-Type: application/json' -d '{"action":"applied","resume_dir":"applications/..."}'
 ```
@@ -114,7 +120,8 @@ gunzip -c jobscan-backup.sql.gz | docker compose -f jobboard/compose.yaml exec -
   Re-runnable; also restores `/tmp/jobscan-dump.sql.gz` into an empty database. Secrets: `deploy/push-secrets.sh`.
 - Claude's token lives in `~/.config/jobboard/token` on the Mac; the MCP server is registered in Claude Code as `jobboard`.
 - MCP tools: stats, list_jobs, get_job, get_section, search, sources, boards, add_boards, update_board,
-  delete_board, scan, run_status, cancel_run, refresh, set_verdict, set_status, add_job, upload_resume, list_resumes, logs, runs.
+  delete_board, scan, run_status, cancel_run, repeat_run, refresh, set_verdict, set_status, add_job, upload_resume,
+  list_resumes, logs, runs.
 
 ## Boards, adapters and the browser
 
@@ -125,6 +132,14 @@ links to its Workday board). Family adapters cover a hosting platform for any em
 adapter (USACE on Yello) covers one board. Each board can carry `include` / `exclude` regexes on
 posting titles so a 4,000-job Workday tenant only yields the analyst roles. A scan walks any set of
 boards in one run; the web page's Scan dialog lists them with checkboxes and an add-by-URL box.
+
+Every scan is a row in `runs`: `args` (what it resolved to: board ids and names, days, all, refetch),
+`request` (what the caller asked for, `{op, args}`), status, log and summary. Each job remembers the
+run that stored it first (`jobs.run_id`), so `/api/jobs?run=<id>` (the Scans page's "Jobs" link) shows
+what one scan brought in. `repeat_run` (POST `/api/runs/<id>/repeat`) issues the stored request again as
+a new run, dropping boards deleted since; the Scans page (`/scans.html`) lists runs live, with Repeat,
+Edit and run (the dialog pre-filled from the request), Cancel, Jobs and the log. Transient refresh runs
+(ids `t<n>`) have no row and cannot be repeated.
 
 All outbound traffic to career sites goes through one `browser.Session` per top-level operation
 (a scan run, one `add_boards` request, one refresh batch): it owns the Chrome, the keep-alive HTTP

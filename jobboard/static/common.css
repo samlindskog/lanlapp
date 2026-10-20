@@ -1,0 +1,89 @@
+/* Shared by index.html and scans.html: theme, header controls, the run line and run panel
+   (common.js mountRuns), the scan dialog (common.js scanDialog). Page-specific rules stay in each page. */
+:root {
+  --bg: #f7f7f5; --fg: #1c1c1c; --muted: #6b6b6b; --line: #d9d9d4; --card: #ffffff;
+  --accent: #1f5f8b; --yes: #1e7f4f; --maybe: #b26a00; --no: #9c2f2f; --none: #777;
+  --applied: #3b4cca; --chip: #ecece7;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #16181a; --fg: #e6e6e3; --muted: #9a9a96; --line: #30343a; --card: #1f2327;
+          --accent: #6fb3e0; --yes: #4fc08d; --maybe: #e0a84a; --no: #e06c6c; --none: #8a8a8a;
+          --applied: #8c9bff; --chip: #2a2f35; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg);
+       font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+header { padding: 14px 16px 10px; border-bottom: 1px solid var(--line); background: var(--card);
+         position: sticky; top: 0; z-index: 2; }
+h1 { font-size: 18px; margin: 0 0 8px; }
+h1 .nav { font-weight: 400; font-size: 12px; margin-left: 10px; }
+.controls { display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: center; }
+.group { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; }
+.group > span.label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+label.chk { display: inline-flex; align-items: center; gap: 4px; cursor: pointer;
+            padding: 2px 8px; border: 1px solid var(--line); border-radius: 999px; background: var(--chip); }
+select, input[type=search] { font: inherit; padding: 4px 8px; border: 1px solid var(--line);
+                             border-radius: 6px; background: var(--card); color: var(--fg); }
+input[type=search] { min-width: 220px; }
+button { font: inherit; padding: 4px 10px; border: 1px solid var(--line); border-radius: 6px;
+         background: var(--card); color: var(--fg); cursor: pointer; }
+button.on { background: var(--accent); color: #fff; border-color: var(--accent); }
+.count { color: var(--muted); margin-left: auto; }
+.sem { font-size: 12px; color: var(--accent); }
+.sem button { padding: 0 6px; font-size: 11px; }
+.muted { color: var(--muted); font-size: 12px; }
+a { color: var(--accent); }
+main { padding: 0 16px 40px; }
+.badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; color: #fff; }
+pre { white-space: pre-wrap; font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+      background: var(--bg); padding: 10px; border-radius: 6px; max-height: 420px; overflow: auto; }
+/* The run line: progress bar, latest line (click for the run panel), cancel. */
+.runline { display: inline-flex; align-items: center; gap: 8px; flex: 1 1 240px; min-width: 0; }
+.runstat { color: var(--muted); font-size: 13px; cursor: pointer; white-space: nowrap; overflow: hidden;
+           text-overflow: ellipsis; min-width: 0; flex: 1 1 auto; transition: opacity .6s; }
+.runstat:hover { text-decoration: underline dotted; }
+.runstat.running { color: var(--maybe); }
+.runstat.failed, .runstat.cancelled, .runstat.error { color: var(--no); }
+.runstat.done { color: var(--yes); }
+.runstat.warn { color: var(--maybe); }
+.runstat.fade { opacity: 0; }
+.bar { display: inline-block; width: 90px; height: 6px; border-radius: 3px; background: var(--chip); overflow: hidden; flex: none; }
+.bar i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .4s; }
+.bar.indeterminate i { width: 30%; animation: slide 1.2s infinite linear; }
+@keyframes slide { from { transform: translateX(-100%); } to { transform: translateX(333%); } }
+button.x { padding: 0 6px; font-size: 12px; line-height: 18px; color: var(--no); border-color: var(--no); flex: none; }
+button.x:disabled { opacity: .5; cursor: default; }
+#runPanel { position: fixed; right: 16px; bottom: 16px; width: min(680px, calc(100vw - 32px)); max-height: 72vh;
+            display: flex; flex-direction: column; gap: 8px; background: var(--card); border: 1px solid var(--line);
+            border-radius: 10px; box-shadow: 0 8px 30px rgba(0,0,0,.25); padding: 12px 14px; z-index: 5; }
+#runPanel[hidden] { display: none; }
+.rp-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.rp-head select { max-width: 55%; font-size: 13px; }
+.rp-status { font-weight: 600; text-transform: uppercase; font-size: 12px; letter-spacing: .04em; }
+.rp-status.running { color: var(--maybe); } .rp-status.done { color: var(--yes); }
+.rp-status.failed, .rp-status.cancelled { color: var(--no); }
+.rp-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 3px 14px; font-size: 13px; color: var(--muted); }
+.rp-grid b { color: var(--fg); font-weight: 600; }
+.rp-grid .span { grid-column: 1 / -1; }
+.bar.wide { width: 100%; height: 8px; }
+.rp-log { flex: 1 1 auto; min-height: 140px; margin: 0; max-height: none; overflow: auto; }
+#rpCancel { color: var(--no); border-color: var(--no); }
+/* The scan dialog: a tab strip over one panel per tab, shared options beneath. */
+dialog { border: 1px solid var(--line); border-radius: 10px; background: var(--card); color: var(--fg);
+         padding: 18px 20px; min-width: 320px; max-width: 90vw; }
+dialog::backdrop { background: rgba(0,0,0,.35); }
+dialog h3 { margin: 0 0 10px; font-size: 16px; }
+dialog form { display: flex; flex-direction: column; gap: 10px; }
+dialog select, dialog input[type=number] { font: inherit; padding: 4px 8px; border: 1px solid var(--line);
+    border-radius: 6px; background: var(--bg); color: var(--fg); }
+dialog select { width: 100%; margin-top: 4px; }
+.dlg-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 6px; }
+#scanStart { background: var(--accent); color: #fff; border-color: var(--accent); }
+#scanDlg form { min-width: min(42em, 90vw); }
+.tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--line); }
+.tabs button { border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: none; color: var(--muted); padding: 4px 10px; margin-bottom: -1px; }
+.tabs button.on { color: var(--fg); border-bottom-color: var(--accent); }
+.tabs:has(> :only-child) { display: none; }       /* one tab needs no strip */
+.tabpanel[hidden] { display: none; }
+.boardlist { max-height: 40vh; overflow: auto; border: 1px solid var(--line); padding: 4px 8px; border-radius: 6px; }
+.boardlist label.board { display: block; margin: 2px 0; }

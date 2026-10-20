@@ -17,9 +17,20 @@ _live = {}               # id -> Run: every running run, plus finished transient
 _seq = 0
 
 
+def parsed(v):
+    """A JSON column (args, request, summary) as an object; whatever is not JSON stays as is."""
+    if not isinstance(v, str):
+        return v
+    try:
+        return json.loads(v)
+    except ValueError:
+        return v
+
+
 class Run:
-    def __init__(self, run_id, kind, args, persist):
+    def __init__(self, run_id, kind, args, persist, request=None):
         self.id, self.kind, self.args, self.persist = run_id, kind, json.dumps(args), persist
+        self.request = json.dumps(request) if request is not None else None
         self.status, self.started_at, self.finished_at, self.summary = "running", J.now(), None, None
         self.lines = []
         self.cancel_requested = False
@@ -55,7 +66,7 @@ class Run:
                 summary=self.summary if self.status != "running" else None)
 
     def snapshot(self, with_log=True):
-        d = {"id": self.id, "kind": self.kind, "args": self.args, "status": self.status,
+        d = {"id": self.id, "kind": self.kind, "args": self.args, "request": self.request, "status": self.status,
              "started_at": self.started_at, "finished_at": self.finished_at, "summary": self.summary,
              "progress": dict(self.progress.state), "cancel_requested": self.cancel_requested,
              "line_count": len(self.lines)}
@@ -64,20 +75,23 @@ class Run:
         return d
 
 
-def start(kind, args, target, persist=True):
-    """target(conn, run) -> summary dict, run on a thread. Returns the run id (int, or 't<n>')."""
+def start(kind, args, target, persist=True, request=None):
+    """target(conn, run) -> summary dict, run on a thread. Returns the run id (int, or 't<n>').
+    request: {"op": <operation>, "args": <the caller's original args>}, stored with a persisted run
+    so service.repeat_run can issue the same request again (args is what the run resolved it to)."""
     global _seq
     if persist:
         conn = J.db()
-        run_id = conn.execute("INSERT INTO runs (kind, args, status, started_at, log) VALUES (%s,%s,%s,%s,%s) RETURNING id",
-                              (kind, json.dumps(args), "running", J.now(), "")).fetchone()["id"]
+        run_id = conn.execute("INSERT INTO runs (kind, args, request, status, started_at, log) VALUES (%s,%s,%s,%s,%s,%s) RETURNING id",
+                              (kind, json.dumps(args), json.dumps(request) if request is not None else None,
+                               "running", J.now(), "")).fetchone()["id"]
         conn.commit()
         conn.close()
     else:
         with _lock:
             _seq += 1
             run_id = f"t{_seq}"
-    run = Run(run_id, kind, args, persist)
+    run = Run(run_id, kind, args, persist, request)
     with _lock:
         _live[run_id] = run
     run._publish()
@@ -172,14 +186,29 @@ def get(rid):
     return dict(r) if r else None
 
 
-def recent(limit=20):
+def recent(kind=None, status=None, limit=20, before=None):
+    """Newest first, without the log; args/request/summary as objects. before: an id cursor
+    (rows with id < before; transient runs, which have no id order, only appear on the first page)."""
+    where, params = ["TRUE"], []
+    if kind:
+        where.append("kind=%s"); params.append(kind)
+    if status:
+        where.append("status=%s"); params.append(status)
+    if before:
+        where.append("id<%s"); params.append(int(before))
     conn = J.db()
     rows = [dict(r) for r in conn.execute(
-        "SELECT id, kind, args, status, started_at, finished_at, summary FROM runs ORDER BY id DESC LIMIT %s", (limit,))]
+        "SELECT id, kind, args, request, status, started_at, finished_at, summary FROM runs WHERE "
+        + " AND ".join(where) + " ORDER BY id DESC LIMIT %s", params + [limit])]
     conn.close()
     with _lock:
-        transient = [r.snapshot(with_log=False) for r in _live.values() if not r.persist]
-    return sorted(transient + rows, key=lambda r: r.get("started_at") or "", reverse=True)[:limit]
+        transient = [r.snapshot(with_log=False) for r in _live.values() if not r.persist and not before
+                     and (not kind or r.kind == kind) and (not status or r.status == status)]
+    out = sorted(transient + rows, key=lambda r: r.get("started_at") or "", reverse=True)[:limit]
+    for r in out:
+        for k in ("args", "request", "summary"):
+            r[k] = parsed(r.get(k))
+    return out
 
 
 def fail_stale(conn):

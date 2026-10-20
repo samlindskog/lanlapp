@@ -92,8 +92,13 @@ CREATE TABLE IF NOT EXISTS runs (
     started_at TEXT,
     finished_at TEXT,
     log TEXT,
-    summary TEXT
+    summary TEXT,
+    request TEXT                           -- JSON {op, args}: what was asked, so the run can be repeated
 );
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS request TEXT;
+-- The run that first stored a job (NULL for manual adds and jobs older than this column).
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS run_id INTEGER REFERENCES runs(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS jobs_run ON jobs(run_id);
 CREATE TABLE IF NOT EXISTS resumes (
     id SERIAL PRIMARY KEY,
     job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,

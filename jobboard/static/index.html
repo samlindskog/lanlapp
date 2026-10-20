@@ -4,84 +4,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Job Board</title>
+<link rel="stylesheet" href="/common.css">
 <style>
-  :root {
-    --bg: #f7f7f5; --fg: #1c1c1c; --muted: #6b6b6b; --line: #d9d9d4; --card: #ffffff;
-    --accent: #1f5f8b; --yes: #1e7f4f; --maybe: #b26a00; --no: #9c2f2f; --none: #777;
-    --applied: #3b4cca; --chip: #ecece7;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root { --bg: #16181a; --fg: #e6e6e3; --muted: #9a9a96; --line: #30343a; --card: #1f2327;
-            --accent: #6fb3e0; --yes: #4fc08d; --maybe: #e0a84a; --no: #e06c6c; --none: #8a8a8a;
-            --applied: #8c9bff; --chip: #2a2f35; }
-  }
-  * { box-sizing: border-box; }
-  body { margin: 0; background: var(--bg); color: var(--fg);
-         font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
-  header { padding: 14px 16px 10px; border-bottom: 1px solid var(--line); background: var(--card);
-           position: sticky; top: 0; z-index: 2; }
-  h1 { font-size: 18px; margin: 0 0 8px; }
-  .controls { display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: center; }
-  .group { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; }
-  .group > span.label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
-  label.chk { display: inline-flex; align-items: center; gap: 4px; cursor: pointer;
-              padding: 2px 8px; border: 1px solid var(--line); border-radius: 999px; background: var(--chip); }
-  select, input[type=search] { font: inherit; padding: 4px 8px; border: 1px solid var(--line);
-                               border-radius: 6px; background: var(--card); color: var(--fg); }
-  input[type=search] { min-width: 220px; }
-  button { font: inherit; padding: 4px 10px; border: 1px solid var(--line); border-radius: 6px;
-           background: var(--card); color: var(--fg); cursor: pointer; }
-  .count { color: var(--muted); margin-left: auto; }
-  .sem { font-size: 12px; color: var(--accent); }
-  .sem button { padding: 0 6px; font-size: 11px; }
   td.score { color: var(--muted); font-size: 12px; white-space: nowrap; }
-  button.on { background: var(--accent); color: #fff; border-color: var(--accent); }
-  /* The run line: progress bar, latest line (click for the run panel), cancel. */
-  .runline { display: inline-flex; align-items: center; gap: 8px; flex: 1 1 240px; min-width: 0; }
-  .runstat { color: var(--muted); font-size: 13px; cursor: pointer; white-space: nowrap; overflow: hidden;
-             text-overflow: ellipsis; min-width: 0; flex: 1 1 auto; transition: opacity .6s; }
-  .runstat:hover { text-decoration: underline dotted; }
-  .runstat.running { color: var(--maybe); }
-  .runstat.failed, .runstat.cancelled, .runstat.error { color: var(--no); }
-  .runstat.done { color: var(--yes); }
-  .runstat.warn { color: var(--maybe); }
-  .runstat.fade { opacity: 0; }
-  .bar { display: inline-block; width: 90px; height: 6px; border-radius: 3px; background: var(--chip); overflow: hidden; flex: none; }
-  .bar i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .4s; }
-  .bar.indeterminate i { width: 30%; animation: slide 1.2s infinite linear; }
-  @keyframes slide { from { transform: translateX(-100%); } to { transform: translateX(333%); } }
-  button.x { padding: 0 6px; font-size: 12px; line-height: 18px; color: var(--no); border-color: var(--no); flex: none; }
-  button.x:disabled { opacity: .5; cursor: default; }
-  #runPanel { position: fixed; right: 16px; bottom: 16px; width: min(680px, calc(100vw - 32px)); max-height: 72vh;
-              display: flex; flex-direction: column; gap: 8px; background: var(--card); border: 1px solid var(--line);
-              border-radius: 10px; box-shadow: 0 8px 30px rgba(0,0,0,.25); padding: 12px 14px; z-index: 5; }
-  #runPanel[hidden] { display: none; }
-  .rp-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-  .rp-head select { max-width: 55%; font-size: 13px; }
-  .rp-status { font-weight: 600; text-transform: uppercase; font-size: 12px; letter-spacing: .04em; }
-  .rp-status.running { color: var(--maybe); } .rp-status.done { color: var(--yes); }
-  .rp-status.failed, .rp-status.cancelled { color: var(--no); }
-  .rp-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 3px 14px; font-size: 13px; color: var(--muted); }
-  .rp-grid b { color: var(--fg); font-weight: 600; }
-  .rp-grid .span { grid-column: 1 / -1; }
-  .bar.wide { width: 100%; height: 8px; }
-  .rp-log { flex: 1 1 auto; min-height: 140px; margin: 0; max-height: none; overflow: auto; }
-  #rpCancel { color: var(--no); border-color: var(--no); }
-  dialog { border: 1px solid var(--line); border-radius: 10px; background: var(--card); color: var(--fg);
-           padding: 18px 20px; min-width: 320px; max-width: 90vw; }
-  dialog::backdrop { background: rgba(0,0,0,.35); }
-  dialog h3 { margin: 0 0 10px; font-size: 16px; }
-  dialog form { display: flex; flex-direction: column; gap: 10px; }
-  dialog select, dialog input[type=number] { font: inherit; padding: 4px 8px; border: 1px solid var(--line);
-      border-radius: 6px; background: var(--bg); color: var(--fg); }
-  dialog select { width: 100%; margin-top: 4px; }
-  .muted { color: var(--muted); font-size: 12px; }
-  .dlg-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 6px; }
-  #scanStart { background: var(--accent); color: #fff; border-color: var(--accent); }
-  .boardlist { max-height: 40vh; overflow: auto; border: 1px solid var(--border, #ddd); padding: 4px 8px; border-radius: 6px; }
-  .boardlist label.board { display: block; margin: 2px 0; }
-  #scanDlg form { min-width: min(42em, 90vw); }
-  main { padding: 0 16px 40px; }
   table { width: 100%; border-collapse: collapse; margin-top: 10px; }
   th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
   th { position: sticky; top: 108px; background: var(--bg); font-size: 12px; text-transform: uppercase;
@@ -92,8 +17,6 @@
   td.title { font-weight: 600; }
   td.title small { display: block; font-weight: 400; color: var(--muted); }
   td.fetched { color: var(--muted); white-space: nowrap; }
-  .badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 600;
-           color: #fff; }
   .v-yes { background: var(--yes); } .v-maybe { background: var(--maybe); }
   .v-no { background: var(--no); } .v-none { background: var(--none); }
   .a-applied { background: var(--applied); } .a-drafted { background: #6b5ca5; }
@@ -125,14 +48,11 @@
   #bulkApply { background: var(--accent); color: #fff; border-color: var(--accent); }
   @media (max-width: 800px) { #layout { flex-direction: column; } #bulk { flex-basis: auto; width: 100%; position: static; max-height: none; border-right: 0; border-bottom: 1px solid var(--line); } }
   .soon { color: var(--maybe); font-weight: 600; }
-  a { color: var(--accent); }
   tr.detail td { background: var(--card); padding: 12px 14px; }
   .detail-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 6px 18px; margin-bottom: 10px; }
   .detail-grid div { color: var(--muted); } .detail-grid div b { color: var(--fg); font-weight: 600; }
   details { margin-top: 8px; }
   summary { cursor: pointer; color: var(--accent); }
-  pre { white-space: pre-wrap; font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
-        background: var(--bg); padding: 10px; border-radius: 6px; max-height: 420px; overflow: auto; }
   pre.expanded { max-height: none; }
   pre.doc { max-height: 70vh; }
   button.more { margin: 4px 0 8px; font-size: 12px; }
@@ -162,7 +82,7 @@
 </aside>
 <div id="content">
 <header>
-  <h1>Job Board <span class="count" id="count"></span> <a href="#" id="logout" class="muted" style="font-weight:400;font-size:12px;margin-left:10px" hidden>sign out</a></h1>
+  <h1>Job Board <span class="count" id="count"></span> <a href="/scans.html" class="nav">Scans</a> <a href="#" id="logout" class="muted nav" hidden>sign out</a></h1>
   <div class="controls">
     <div class="group"><span class="label" title="None checked = all verdicts">Verdict</span>
       <label class="chk"><input type="checkbox" data-f="verdict" value="yes" checked> yes</label>
@@ -202,7 +122,8 @@
       </select>
     </div>
     <div class="group"><input type="search" id="q" placeholder="filter as you type; press Enter for semantic search">
-      <span id="semBadge" class="sem" hidden>semantic: <b id="semQuery"></b> <button id="semClear" title="back to normal order">✕</button></span></div>
+      <span id="semBadge" class="sem" hidden>semantic: <b id="semQuery"></b> <button id="semClear" title="back to normal order">✕</button></span>
+      <span id="runBadge" class="sem" hidden title="only jobs this scan stored first">run <b id="runId"></b> <button id="runClear" title="all runs">✕</button></span></div>
     <button id="reset">Reset</button>
   </div>
   <div class="controls" style="margin-top:8px">
@@ -211,43 +132,9 @@
       <button id="refreshAll" title="Re-fetch every posting currently listed (current filters) so dates and text are current">Refresh</button>
       <button id="bulkToggle" title="Enter selection mode: shows checkboxes and the bulk status panel">Select…</button>
     </div>
-    <span class="runline">
-      <span id="runBar" class="bar" hidden><i></i></span>
-      <span id="run" class="runstat" title="Click for the run's details and log"></span>
-      <button id="runCancel" class="x" title="Cancel this run" hidden>✕</button>
-    </span>
+    <span class="runline" id="runline"></span>
   </div>
 </header>
-<aside id="runPanel" hidden>
-  <div class="rp-head">
-    <select id="rpPick" title="Recent runs"></select>
-    <span id="rpStatus" class="rp-status"></span>
-    <span id="rpElapsed" class="muted"></span>
-    <span style="flex:1"></span>
-    <button id="rpCancel" hidden>Cancel run</button>
-    <button id="rpClose" title="Close">✕</button>
-  </div>
-  <div id="rpArgs" class="muted"></div>
-  <div id="rpStats" class="rp-grid"></div>
-  <div id="rpBar" class="bar wide" hidden><i></i></div>
-  <pre id="rpLog" class="rp-log"></pre>
-</aside>
-<dialog id="scanDlg">
-  <form method="dialog" id="scanForm">
-    <h3>Scan job boards</h3>
-    <div id="boardList" class="boardlist"></div>
-    <div class="muted" style="margin:4px 0 8px"><a href="#" id="boardsAll">all</a> · <a href="#" id="boardsNone">none</a></div>
-    <details id="addBoards"><summary>Add boards by URL</summary>
-      <textarea id="boardUrls" rows="3" placeholder="one board URL per line (Workday, Oracle HCM, iCIMS, UKG, NEOGOV, Greenhouse, Eightfold, Yello ...)" style="width:100%"></textarea>
-      <div class="muted">Optional title filters for the new boards: include <input type="text" id="boardInclude" placeholder="analyst|account|actuar" style="width:11em"> exclude <input type="text" id="boardExclude" placeholder="senior|director|manager" style="width:11em"></div>
-      <button type="button" id="boardAdd">Add</button> <span id="boardAddStatus" class="muted"></span>
-    </details>
-    <label>Posted within the last <input type="number" name="days" min="1" max="365" value="7" style="width:5em"> days</label>
-    <label class="chk"><input type="checkbox" name="all"> whole board (ignore days)</label>
-    <label class="chk"><input type="checkbox" name="refetch"> re-fetch postings already stored</label>
-    <div class="dlg-actions"><button value="cancel" type="button" id="scanCancel">Cancel</button><button value="start" id="scanStart">Start scan</button></div>
-  </form>
-</dialog>
 <main>
   <table>
     <thead><tr>
@@ -267,6 +154,7 @@
 </main>
 </div>
 </div>
+<script src="/common.js"></script>
 <script src="/app.js"></script>
 </body>
 </html>
