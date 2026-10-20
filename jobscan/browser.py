@@ -450,15 +450,27 @@ class ProxyRelay:
         self.port = self.sock.getsockname()[1]
         self.addr = f"127.0.0.1:{self.port}"
         self._stop = False
-        threading.Thread(target=self._serve, name="proxy-relay", daemon=True).start()
+        self._thread = threading.Thread(target=self._serve, name="proxy-relay", daemon=True)
+        self._thread.start()
 
     def _serve(self):
         while not self._stop:
             try:
                 client, peer = self.sock.accept()
             except OSError:
-                break
-            threading.Thread(target=self._handle, args=(client, peer[0]), daemon=True).start()
+                if self._stop or self.sock.fileno() == -1:   # closed: done; anything else (EMFILE...) is per-connection
+                    break
+                time.sleep(0.05)
+                continue
+            try:
+                threading.Thread(target=self._handle, args=(client, peer[0]), daemon=True).start()
+            except Exception as e:  # noqa: BLE001  (thread limit): drop this connection, keep serving
+                self.log(f"  ! relay: cannot serve {peer[0]}: {e}")
+                client.close()
+
+    def alive(self):
+        """Still accepting: the listening socket is open and the accept thread runs."""
+        return not self._stop and self.sock.fileno() != -1 and self._thread.is_alive()
 
     def _peer_ok(self, peer):
         ip = ipaddress.ip_address(peer)
@@ -609,6 +621,14 @@ def _reply(status, text):
             f"Connection: close\r\n\r\n").encode() + body
 
 
+def tunnel_error(exc):
+    """The net::ERR_PROXY_*/ERR_TUNNEL_* code in a Chrome exception, or None: these mean the relay
+    answered the tunnel with a refusal (or is not there), not that Chrome itself is broken."""
+    m = re.search(r"net::(ERR_[A-Z_]+)", str(exc))
+    code = m.group(1) if m else ""
+    return code if code.startswith("ERR_PROXY") or code.startswith("ERR_TUNNEL") else None
+
+
 def _basic_auth(proxy):
     """Proxy-Authorization value for a proxy URL's credentials, or None."""
     import base64
@@ -721,7 +741,7 @@ class Chrome:
     def __init__(self, cfg, log=_stderr):
         self.cfg = cfg
         self.log = log
-        self.proxy = None             # the relay's URL, set by the Session once the relay is up
+        self.relay = None             # the Session's ProxyRelay, set once it is up; every request goes through it
         self._lock = threading.RLock()
         self._drv = None
         self._dir = None
@@ -743,7 +763,7 @@ class Chrome:
 
     def _start(self):
         import undetected_chromedriver as uc
-        if not self.proxy:
+        if self.relay is None:
             raise RuntimeError("no relay to route through: the Session must be entered (with-block) first")
         self._dir = tempfile.mkdtemp(prefix="jobscan-chrome-", dir=self.cfg.browser_dir)
         # The library patches the driver binary in place and keeps its profile under $HOME:
@@ -769,7 +789,7 @@ class Chrome:
         opts.add_argument("--disable-remote-fonts")
         # Everything, loopback included, goes to the relay: it routes per host and refuses what
         # the service must not reach, so Chrome itself has no way around the policy.
-        opts.add_argument(f"--proxy-server={self.proxy}")
+        opts.add_argument(f"--proxy-server=http://{self.relay.addr}")
         opts.add_argument("--proxy-bypass-list=<-loopback>")
         driver_path = None
         if self.cfg.chromedriver:
@@ -789,7 +809,7 @@ class Chrome:
             self._drv.switch_to.window(self._drv.window_handles[0])
         except Exception:  # noqa: BLE001
             pass
-        self.log(f"  browser: chrome {major or '?'} started (via relay {self.proxy})")
+        self.log(f"  browser: chrome {major or '?'} started (via relay {self.relay.addr})")
 
     def _driver(self):
         if self._drv is None:
@@ -907,10 +927,12 @@ class Chrome:
                         return self._xhr(drv, url, method, data, headers, accept)
                     return self._page(drv, url)
                 except Exception as e:  # noqa: BLE001
-                    m = re.search(r"net::(ERR_[A-Z_]+)", str(e))
-                    if m and (m.group(1).startswith("ERR_PROXY") or m.group(1).startswith("ERR_TUNNEL")):
-                        return 0, f"net::{m.group(1)}"     # the proxy refused: Chrome itself is fine
-                    self._failed(f"{e.__class__.__name__}: {str(e)[:160]}")
+                    code = tunnel_error(e)
+                    if code and self.relay is not None and self.relay.alive():
+                        return 0, f"net::{code}"           # the relay refused this tunnel: Chrome itself is fine
+                    # A tunnel error with no relay to answer it is a browser failure, not a route
+                    # decision: counting it lets MAX_FAILURES hand the session to plain HTTP.
+                    self._failed(f"relay down (net::{code})" if code else f"{e.__class__.__name__}: {str(e)[:160]}")
                     if attempt or not self.available():
                         raise
 
@@ -947,7 +969,7 @@ class Session:
         # The relay is the way out for Chrome and for Firecrawl; plain HTTP uses the proxies itself.
         if self.cfg.enabled or self.cfg.firecrawl:
             self.relay = ProxyRelay(self.access, self.cfg, self.log, self.dest_check)
-            self.chrome.proxy = f"http://{self.relay.addr}"
+            self.chrome.relay = self.relay
         self._token = _current_log.set(self.log)
         return self
 

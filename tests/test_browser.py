@@ -6,6 +6,7 @@ import os
 import socket
 import sys
 import threading
+import time
 
 os.environ["JOBSCAN_BROWSER"] = "0"
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -215,7 +216,7 @@ def check_relay():
     cfg = B.Config(env)
     allow = lambda host, port: [host]                           # the real guard refuses loopback and odd ports  # noqa: E731
     with B.Session(lambda m: None, cfg, dest_check=allow) as s:
-        assert s.relay is not None and s.chrome.proxy == f"http://127.0.0.1:{s.relay.port}"
+        assert s.relay is not None and s.chrome.relay is s.relay and s.relay.alive()
         port = s.relay.port
         status, body = _tunnel_get(port, oport)
         assert status == 200 and b"origin ok /" in body and not heads, (status, body)   # level 0: direct
@@ -370,6 +371,50 @@ def check_firecrawl():
     srv.shutdown()
 
 
+class _StubDriver:
+    """Stands in for the Selenium driver: get() raises what chromedriver raises on a tunnel error."""
+    current_url = ""
+    window_handles = ["w"]
+
+    def get(self, url):
+        raise RuntimeError("Message: unknown error: net::ERR_TUNNEL_CONNECTION_FAILED")
+
+    def quit(self):
+        pass
+
+
+def check_relay_down():
+    """A tunnel error while the relay is up is a route decision (0, net::ERR_...), not a browser
+    failure; the same error once the relay's listening socket is gone counts as a failure, so the
+    MAX_FAILURES breaker can hand the session to plain HTTP."""
+    import browser as B
+    assert B.tunnel_error(RuntimeError("net::ERR_PROXY_CONNECTION_FAILED")) == "ERR_PROXY_CONNECTION_FAILED"
+    assert B.tunnel_error(RuntimeError("net::ERR_TUNNEL_CONNECTION_FAILED")) == "ERR_TUNNEL_CONNECTION_FAILED"
+    assert B.tunnel_error(RuntimeError("net::ERR_NAME_NOT_RESOLVED")) is None and B.tunnel_error(RuntimeError("timeout")) is None
+    env = {"JOBSCAN_BROWSER": "1", "JOBSCAN_RELAY_PORT": "0", "JOBSCAN_RELAY_BIND": "127.0.0.1"}
+    with B.Session(lambda m: None, B.Config(env)) as s:
+        s.chrome._drv = _StubDriver()                              # no real Chrome: the driver is a stub
+        s.chrome._start = lambda: (_ for _ in ()).throw(RuntimeError("no chrome in tests"))
+        assert s.chrome.request("https://fine.example.com/") == (0, "net::ERR_TUNNEL_CONNECTION_FAILED")
+        assert s.chrome._failures == 0 and s.relay.alive()
+        s.relay.sock.close()                                       # the relay dies mid-session
+        for _ in range(20):
+            if not s.relay.alive():
+                break
+            time.sleep(0.05)
+        assert not s.relay.alive()
+        s.chrome._drv = _StubDriver()
+        try:
+            s.chrome.request("https://fine.example.com/")
+        except Exception:  # noqa: BLE001  (the restart attempt fails: no Chrome here)
+            pass
+        assert s.chrome._failures >= 1, s.chrome._failures
+    with B.Session(lambda m: None, B.Config(env)) as s:            # the accept loop survives a bad connection
+        c = socket.create_connection(("127.0.0.1", s.relay.port))
+        c.close()
+        assert _relay_request(s.relay.port, b"CONNECT localhost:443 HTTP/1.1\r\n\r\n")[0] == 403 and s.relay.alive()
+
+
 def main():
     check_guards()
     print("url/regex guards: ok")
@@ -377,6 +422,8 @@ def main():
     print("proxy escalation: ok")
     check_relay()
     print("relay routing: ok")
+    check_relay_down()
+    print("relay liveness: ok")
     check_firecrawl()
     print("firecrawl: ok")
 
