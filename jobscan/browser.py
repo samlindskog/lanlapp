@@ -528,7 +528,10 @@ class ProxyRelay:
                 return
             verdict, upstream, addrs = self.route(req.host, req.port)
             if verdict == "refuse":
-                self.log(f"  ! relay: refused {req.host}:{req.port}: {upstream}")
+                if not (ipaddress.ip_address(peer).is_loopback and req.port not in RELAY_PORTS):
+                    # Chrome's own background chatter (push service on 5228 and the like) is refused
+                    # silently; a refusal from another peer or on a web port is worth a line.
+                    self.log(f"  ! relay: refused {req.host}:{req.port}: {upstream}")
                 client.sendall(_reply(403, f"refused {req.host}:{req.port}: {upstream}"))
                 return
             try:
