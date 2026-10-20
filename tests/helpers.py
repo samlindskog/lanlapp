@@ -3,9 +3,10 @@
 
 class FakeSession:
     """Stands in for browser.Session in offline tests. fetch is the stub the test supplies (same
-    signature as Session.fetch); check() and log are no-ops. firecrawl is a placeholder for the
-    Session.firecrawl method the fetch-layer work adds (the firecrawl adapter calls it); here it is
-    refused so an adapter that reaches for it fails loudly instead of touching the network."""
+    signature as Session.fetch); check() and log are no-ops. firecrawl mirrors Session.firecrawl
+    (url, op="scrape", **options) -> (status, data), the firecrawl adapter's door to a self-hosted
+    Firecrawl; here it is refused so an adapter that reaches for it fails loudly instead of
+    touching the network (tests/test_browser.py exercises the real one against a fake Firecrawl)."""
 
     def __init__(self, fetch, log=None):
         self.fetch = fetch

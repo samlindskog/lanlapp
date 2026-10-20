@@ -1,5 +1,7 @@
 """Offline checks of the fetch layer (jobscan/browser.py) and the input guards: refused targets,
-title-filter regex validation, and per-host proxy escalation inside one Session (fake transport)."""
+title-filter regex validation, per-host proxy escalation inside one Session (fake transport), the
+Session's relay routing (fake origin and upstream proxy on loopback) and Session.firecrawl (fake
+Firecrawl API on loopback). No Chrome, no network."""
 import os
 import socket
 import sys
@@ -244,6 +246,108 @@ def check_relay():
     upstream.close()
 
 
+def _firecrawl_server():
+    """A fake Firecrawl v1 API on loopback: scrape (a 'blocked' target answers 403 once, then 200),
+    crawl (two polls of 'scraping', then completed; a 'forever' target never completes), delete."""
+    import json
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    seen = {"scrape": [], "crawl": [], "polls": 0, "deleted": []}
+
+    class H(BaseHTTPRequestHandler):
+        def _send(self, code, obj):
+            body = json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self):
+            req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            if self.path == "/v1/scrape":
+                seen["scrape"].append(req)
+                first = sum(1 for r in seen["scrape"] if r["url"] == req["url"]) == 1
+                if "blocked" in req["url"] and first:
+                    return self._send(200, {"success": True, "data": {"markdown": "Access denied", "metadata": {"statusCode": 403}}})
+                if "flaky" in req["url"] and first:
+                    return self._send(500, {"success": False, "error": "engine failed"})
+                return self._send(200, {"success": True, "data": {"markdown": "# Jobs", "metadata": {"statusCode": 200, "url": req["url"]}}})
+            if self.path == "/v1/map":
+                return self._send(200, {"success": True, "links": [req["url"] + "a", req["url"] + "b"]})
+            if self.path == "/v1/crawl":
+                seen["crawl"].append(req)
+                return self._send(200, {"success": True, "id": f"job{len(seen['crawl'])}"})
+            self._send(404, {"success": False, "error": "no such op"})
+
+        def do_GET(self):
+            seen["polls"] += 1
+            forever = "forever" in seen["crawl"][-1]["url"]
+            if seen["polls"] < 3 or forever:
+                return self._send(200, {"status": "scraping", "completed": 1, "total": 3})
+            self._send(200, {"status": "completed", "data": [{"markdown": "p1"}, {"markdown": "p2"}]})
+
+        def do_DELETE(self):
+            seen["deleted"].append(self.path.rsplit("/", 1)[1])
+            self._send(200, {"success": True})
+
+        def log_message(self, *a):
+            pass
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, srv.server_address[1], seen
+
+
+def check_firecrawl():
+    """Session.firecrawl against a fake Firecrawl: a scrape returns the target's status and data,
+    a blocked scrape escalates the host and retries, Firecrawl errors retry, a crawl is polled to
+    completion, a cancel mid-poll deletes the job, a private target never reaches Firecrawl, and
+    without FIRECRAWL_URL the call fails loudly."""
+    import browser as B
+    B._host_ok.update({"fine.example.com", "blocked.example.com", "flaky.example.com", "forever.example.com", "gone.example.com"})
+    srv, port, seen = _firecrawl_server()
+    cfg = B.Config({"JOBSCAN_BROWSER": "0", "FIRECRAWL_URL": f"http://127.0.0.1:{port}/", "JOBSCAN_RELAY_PORT": "0",
+                    "JOBSCAN_RELAY_BIND": "127.0.0.1", "JOBSCAN_PROXY": "http://u:p@gw.example.net:7000", "JOBSCAN_PROXY_TRIES": "2"})
+    with B.Session(lambda m: None, cfg) as s:
+        assert s.relay is not None                                                       # Firecrawl needs the relay
+        status, data = s.firecrawl("https://fine.example.com/jobs", delay=0, formats=["markdown"])
+        assert status == 200 and data["markdown"] == "# Jobs" and seen["scrape"][-1]["formats"] == ["markdown"]
+        status, data = s.firecrawl("https://blocked.example.com/jobs", delay=0)
+        assert status == 200 and data["markdown"] == "# Jobs" and s.access.level("https://blocked.example.com/") == 1
+        assert [r["url"] for r in seen["scrape"] if "blocked" in r["url"]] == ["https://blocked.example.com/jobs"] * 2
+        status, data = s.firecrawl("https://flaky.example.com/", delay=0)                # 500 once, then fine
+        assert status == 200 and data["markdown"] == "# Jobs"
+        assert s.firecrawl("https://fine.example.com/", op="map")[1]["links"] == ["https://fine.example.com/a", "https://fine.example.com/b"]
+        status, data = s.firecrawl("https://fine.example.com/", op="crawl", poll=0.01, limit=3)
+        assert status == 200 and data["status"] == "completed" and [p["markdown"] for p in data["data"]] == ["p1", "p2"]
+        assert seen["polls"] == 3 and seen["crawl"][-1]["limit"] == 3 and not seen["deleted"] and not s._crawls
+        assert s.firecrawl("http://127.0.0.1:1/") == (0, {}) and s.firecrawl("http://localhost/") == (0, {})
+        s.access.blocked.add("gone.example.com")
+        assert s.firecrawl("https://gone.example.com/") == (403, {})
+        assert len(seen["scrape"]) == 5                                                  # none of those reached Firecrawl
+    calls = []
+
+    def check():
+        calls.append(1)
+        if len(calls) > 4:                                                               # mid-poll
+            raise B.Cancelled()
+    with B.Session(lambda m: None, cfg, check=check) as s:
+        try:
+            s.firecrawl("https://forever.example.com/", op="crawl", poll=0.01)
+        except B.Cancelled:
+            pass
+        else:
+            raise AssertionError("cancel did not propagate")
+        assert seen["deleted"] == ["job2"] and not s._crawls
+    with B.Session(lambda m: None, B.Config({"JOBSCAN_BROWSER": "0"})) as s:
+        try:
+            s.firecrawl("https://fine.example.com/")
+        except RuntimeError as e:
+            assert "FIRECRAWL_URL" in str(e)
+        else:
+            raise AssertionError("firecrawl() without FIRECRAWL_URL did not fail")
+    srv.shutdown()
+
+
 def main():
     check_guards()
     print("url/regex guards: ok")
@@ -251,6 +355,8 @@ def main():
     print("proxy escalation: ok")
     check_relay()
     print("relay routing: ok")
+    check_firecrawl()
+    print("firecrawl: ok")
 
 
 if __name__ == "__main__":

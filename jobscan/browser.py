@@ -17,12 +17,16 @@ Layers (each testable on its own):
                 in-page fetch; cleanup is scoped to this session's own process tree
   HttpPool      plain HTTP with keep-alive: curl_cffi impersonating Chrome's TLS fingerprint when
                 installed, else http.client tunnels (uses the per-level proxy itself, no relay)
-  Session       fetch(): the escalation loop over the transports; close(): tear everything down.
-                Nothing outlives the session: the next operation starts direct with new sessions
-                and a fresh relay.
+  Session       fetch(): the escalation loop over the transports; firecrawl(): the same loop for
+                a self-hosted Firecrawl (scrape, map, crawl with polling), whose own traffic comes
+                back in through the relay; close(): tear everything down. Nothing outlives the
+                session: the next operation starts direct with new sessions, a fresh relay and no
+                crawl jobs left running.
 
 Env (Config):
   JOBSCAN_BROWSER=0        plain HTTP only (CI, offline tests)
+  FIRECRAWL_URL            a self-hosted Firecrawl API, e.g. http://firecrawl-api:3002 (unset: the
+                           firecrawl adapter fails at scan time); point its PROXY_SERVER at the relay
   JOBSCAN_RELAY_PORT       the relay's port (default 8899; 0 = ephemeral); one Session at a time
                            (the capacity slot), so a port in use is an error, not a retry
   JOBSCAN_RELAY_BIND       the relay's address (default 0.0.0.0: a Firecrawl container on the same
@@ -893,11 +897,15 @@ class Session:
     (status, body). data (dict/list -> JSON, or str/bytes) makes it a POST; 404/410 come back as
     (code, ""); a host blocked at every level returns (403, "") at once; network failures retry
     and finally return (0, ""). Every request to a career site goes through here, so the
-    escalation policy is the same for scans, board registration and refreshes."""
+    escalation policy is the same for scans, board registration and refreshes.
+
+    firecrawl(url, op="scrape", **options): (status, data), the same loop for a self-hosted
+    Firecrawl (FIRECRAWL_URL) whose own traffic runs through this Session's relay."""
 
     def __init__(self, log=None, cfg=None, check=None, dest_check=check_host):
         self.cfg = cfg or Config()
         self.log = log or _stderr
+        self._crawls = set()                     # live Firecrawl crawl ids, deleted on close/cancel
         self.check = check or (lambda: None)     # raises Cancelled to stop the operation; run before every fetch
         self.dest_check = dest_check             # the relay's destination guard; tests swap it to allow loopback
         self.pool = ProxyPool(self.cfg.proxy, self.cfg.proxy_tries, self.cfg.countries)
@@ -920,9 +928,11 @@ class Session:
         return False
 
     def close(self):
-        """Tear everything down: Chrome and its process tree, the relay, pooled connections,
-        escalation state."""
+        """Tear everything down: Chrome and its process tree, live crawls, the relay, pooled
+        connections, escalation state."""
         self.chrome.close()
+        for cid in list(self._crawls):
+            self._crawl_delete(cid)
         if self.relay is not None:
             self.relay.close()
             self.relay = None
@@ -979,3 +989,133 @@ class Session:
             time.sleep(1.5 * (attempt + 1))
         self.log(f"  ! fetch failed {url}: {last}")
         return 0, ""
+
+    # ------------------------------------------------------------- firecrawl
+    def firecrawl(self, url, op="scrape", retries=2, delay=0.4, wait=600, poll=1.0, **options):
+        """(status, data) from the self-hosted Firecrawl at FIRECRAWL_URL: POST /v1/{op} with
+        {"url": url, **options}. data is Firecrawl's parsed JSON for the operation ({} on failure):
+        the "data" object of a scrape, the whole {"links": [...]} reply of a map, and for a crawl
+        the finished job ({"status": "completed", "data": [pages]}), polled with check() between
+        polls (poll seconds apart, wait seconds in all) and deleted on cancel or close. A scrape's
+        status is the target's (metadata.statusCode); a blocked one escalates the host and retries,
+        which takes effect because Firecrawl's traffic runs through this Session's relay (set
+        PROXY_SERVER on the Firecrawl side to the relay). Firecrawl's own base URL is an internal
+        service and is not subject to check_url; only the target is. Firecrawl 5xx, timeouts and
+        connection errors retry with backoff like fetch; a 4xx from Firecrawl is final."""
+        if not self.cfg.firecrawl:
+            raise RuntimeError("FIRECRAWL_URL is not set: the firecrawl adapter needs a self-hosted Firecrawl "
+                               "(e.g. http://firecrawl-api:3002) that routes through this service's relay")
+        self.check()
+        try:
+            check_url(url)
+        except UnsafeURL as e:
+            self.log(f"  ! {e}")
+            return 0, {}
+        if self.access.host(url) in self.access.blocked:
+            return 403, {}
+        last = None
+        for attempt in range(retries + 1 + self.pool.tries):
+            self.check()
+            try:
+                code, reply = self._api("POST", f"/v1/{op}", {"url": url, **options}, timeout=wait)
+                if code >= 500:
+                    last = f"firecrawl HTTP {code}: {str(reply.get('error') or reply)[:160]}"
+                elif code >= 400 or not reply.get("success", True):
+                    self.log(f"  ! firecrawl {op} refused {url}: HTTP {code} {str(reply.get('error') or '')[:160]}")
+                    return 0, {}
+                elif op == "crawl":
+                    return self._crawl_wait(reply.get("id"), wait, poll)
+                else:
+                    data = reply.get("data") if op == "scrape" else reply
+                    status, content = self._target_status(data) if op == "scrape" else (200, "")
+                    if status in (404, 410):
+                        return status, {}
+                    if looks_blocked(status, content):
+                        if self.access.escalate(url, f"blocked (HTTP {status})"):
+                            continue
+                        return 403, {}
+                    time.sleep(delay)
+                    return status, data or {}
+            except Cancelled:
+                raise
+            except Exception as e:  # noqa: BLE001
+                last = e
+            time.sleep(1.5 * (attempt + 1))
+        self.log(f"  ! firecrawl {op} failed {url}: {last}")
+        return 0, {}
+
+    @staticmethod
+    def _target_status(data):
+        """A scrape's outcome as the target saw it: (HTTP status, the content the challenge
+        check reads). Firecrawl reports the target's status in metadata.statusCode."""
+        data = data or {}
+        try:
+            status = int((data.get("metadata") or {}).get("statusCode") or 200)
+        except (TypeError, ValueError):
+            status = 200
+        return status, data.get("markdown") or data.get("html") or ""
+
+    def _api(self, method, path, body=None, timeout=120):
+        """One request to Firecrawl: (HTTP status, parsed JSON or {})."""
+        u = urllib.parse.urlsplit(self.cfg.firecrawl)
+        conn = (http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection)(
+            u.hostname, u.port, timeout=timeout)
+        try:
+            conn.request(method, (u.path or "") + path, body=json.dumps(body) if body is not None else None,
+                         headers={"Content-Type": "application/json", "Accept": "application/json"})
+            r = conn.getresponse()
+            raw = r.read().decode("utf-8", errors="replace")
+        finally:
+            conn.close()
+        try:
+            data = json.loads(raw) if raw else {}
+        except ValueError:
+            data = {"error": raw[:200]}
+        return r.status, data if isinstance(data, dict) else {"data": data}
+
+    def _crawl_wait(self, cid, wait, poll):
+        """Poll a crawl job to completion; cancel (check raising) or the time cap deletes it."""
+        if not cid:
+            return 0, {}
+        self._crawls.add(cid)
+        end = time.time() + wait
+        try:
+            while True:
+                self.check()
+                code, job = self._api("GET", f"/v1/crawl/{cid}")
+                state = job.get("status")
+                if code == 200 and state == "completed":
+                    self._crawls.discard(cid)
+                    return 200, self._crawl_pages(job)
+                if code == 404 or state in ("failed", "cancelled"):
+                    self.log(f"  ! firecrawl crawl {cid}: {state or f'HTTP {code}'}")
+                    self._crawls.discard(cid)
+                    return 0, {}
+                if time.time() > end:
+                    self.log(f"  ! firecrawl crawl {cid}: still {state} after {wait}s; cancelled")
+                    return 0, {}
+                time.sleep(poll)
+        finally:
+            if cid in self._crawls:            # cancelled, timed out or failed: stop Firecrawl's work
+                self._crawl_delete(cid)
+
+    def _crawl_pages(self, job):
+        """A finished crawl's reply with every page: Firecrawl pages large results ("next")."""
+        pages = list(job.get("data") or [])
+        nxt = job.get("next")
+        while nxt:
+            self.check()
+            u = urllib.parse.urlsplit(nxt)   # Firecrawl's idea of its own address; ours is FIRECRAWL_URL
+            code, more = self._api("GET", u.path + (f"?{u.query}" if u.query else ""))
+            if code != 200:
+                break
+            pages += list(more.get("data") or [])
+            nxt = more.get("next")
+        return dict(job, data=pages, next=None)
+
+    def _crawl_delete(self, cid):
+        self._crawls.discard(cid)
+        try:
+            self._api("DELETE", f"/v1/crawl/{cid}", timeout=10)
+        except Exception as e:  # noqa: BLE001
+            self.log(f"  ! firecrawl crawl {cid}: delete failed: {e}")
