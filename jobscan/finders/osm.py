@@ -84,9 +84,16 @@ def find(center, radius_m, categories, keywords, tags, log):
     custom = [tag_selector(line) for line in (tags or []) if line.strip()]
     if custom:
         groups.append(("custom", custom))
-    out, seen = [], set()
+    out, seen, failed = [], set(), []
     for cat, selectors in groups:
-        els = _query(build_query(center, radius_m, selectors, keywords), log)
+        try:
+            els = _query(build_query(center, radius_m, selectors, keywords), log)
+        except RuntimeError as e:
+            # One category timing out on every instance must not throw the others away: the run
+            # goes on with what was found and says what is missing.
+            log(f"  ! osm: {cat}: {str(e).splitlines()[0][:160]}; skipped")
+            failed.append(cat)
+            continue
         n = 0
         for el in els:
             p = _place(el, cat)
@@ -95,4 +102,8 @@ def find(center, radius_m, categories, keywords, tags, log):
                 out.append(p)
                 n += 1
         log(f"osm: {cat}: {len(els)} element(s), {n} named place(s)")
+    if failed and len(failed) == len(groups):
+        raise RuntimeError(f"overpass answered no category ({', '.join(failed)})")
+    if failed:
+        log(f"  ! osm: skipped {', '.join(failed)}; the rest was found")
     return out
