@@ -3,8 +3,9 @@
 #   tests/smoke.sh <web-url> <mcp-url> <password>
 #   tests/smoke.sh http://127.0.0.1:8081 http://127.0.0.1:8091 dev
 # Checks the credential gate (anonymous, forged, cookie, token), the cross-site guard, login throttling
-# wiring, the MCP transport, and a job + resume round trip. Needs curl and python3. Idempotent: reuses
-# the "Smoke test job" and the identical resume bytes on re-runs.
+# wiring, the MCP transport, the geographic scan's endpoints (a run with no finder enabled, so no
+# network), and a job + resume round trip. Needs curl and python3. Idempotent: reuses the "Smoke test
+# job" and the identical resume bytes on re-runs (each run adds one empty geo run to the history).
 set -euo pipefail
 WEB=${1:?web url}; MCP=${2:?mcp url}; PW=${3:?password}
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT; TOKEN=
@@ -75,6 +76,32 @@ expect 404 -X POST "$WEB/api/runs/999999/repeat" "${AUTH[@]}" "${JSON[@]}" -d '{
 expect 302 "$WEB/scans.html"
 expect 200 -b "$CJ" "$WEB/scans.html"
 expect 200 -b "$CJ" "$WEB/common.js"
+expect 200 -b "$CJ" "$WEB/geo.js"
+
+echo "== geographic scan: the registry, centre parsing, places behind the gate, a run with no finder enabled"
+expect 401 "$WEB/api/geo/categories"
+expect 401 "$WEB/api/places"
+expect 401 -X POST "$WEB/api/geo/scan" "${JSON[@]}" -d '{"center":"35.08,-106.65"}'
+expect 200 "$WEB/api/geo/categories" "${AUTH[@]}"
+curl -sf "$WEB/api/geo/categories" "${AUTH[@]}" | jq 'any(c["key"]=="government" for c in d["categories"]) and "osm" in [f["name"] for f in d["finders"]]' | grep -qx True || { echo "FAIL: /api/geo/categories"; exit 1; }
+expect 200 "$WEB/api/geo/center?center=35.08,-106.65" "${AUTH[@]}"
+curl -sf "$WEB/api/geo/center?center=35.08,-106.65" "${AUTH[@]}" | jq 'abs(d["lat"]-35.08)<1e-9 and abs(d["lon"]+106.65)<1e-9' | grep -qx True || { echo "FAIL: /api/geo/center"; exit 1; }
+expect 400 -X POST "$WEB/api/geo/scan" "${AUTH[@]}" "${JSON[@]}" -d '{"center":"35.08,-106.65","categories":["nope"]}'
+expect 200 "$WEB/api/places?limit=1" "${AUTH[@]}"
+expect 404 "$WEB/api/places/999999999" "${AUTH[@]}"
+OUT=$(curl -s -w '\n%{http_code}' -X POST "$WEB/api/geo/scan" "${AUTH[@]}" "${JSON[@]}" -d '{"center":"35.0844, -106.6504","finders":[]}')
+CODE=${OUT##*$'\n'}; BODY=${OUT%$'\n'*}
+[ "$CODE" = 202 ] || { echo "FAIL: POST /api/geo/scan: $CODE $BODY"; exit 1; }
+RID=$(printf '%s' "$BODY" | jq 'd["run_id"]')
+echo "ok 202 geo run $RID started"
+ST=running
+for i in $(seq 1 90); do
+  ST=$(curl -sf "$WEB/api/runs/$RID" "${AUTH[@]}" | jq 'd["status"]'); [ "$ST" != running ] && break; sleep 1
+done
+[ "$ST" = done ] || { echo "FAIL: geo run $RID ended '$ST'"; curl -s "$WEB/api/runs/$RID" "${AUTH[@]}" | jq 'd.get("log")'; exit 1; }
+curl -sf "$WEB/api/runs/$RID" "${AUTH[@]}" | jq 'd["kind"]=="geo" and json.loads(d["summary"])["discovered"]==0 and json.loads(d["summary"])["boards_scanned"]==0' | grep -qx True || { echo "FAIL: geo run summary"; curl -s "$WEB/api/runs/$RID" "${AUTH[@]}"; exit 1; }
+curl -sf "$WEB/api/runs?kind=geo&limit=1" "${AUTH[@]}" | jq 'd["runs"][0]["request"]["op"]=="geo_scan" and d["runs"][0]["args"]["lat"]==35.0844 and d["runs"][0]["args"]["finders"]==[]' | grep -qx True || { echo "FAIL: geo run listed with its request"; exit 1; }
+echo "ok geo run $RID done: 0 places, 0 boards"
 
 echo "== job + resume round trip"
 JID=$(curl -sf "$WEB/api/jobs?q=Smoke+test+job" "${AUTH[@]}" | jq '(d["jobs"] or [{}])[0].get("id","")')

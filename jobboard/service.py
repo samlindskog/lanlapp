@@ -19,7 +19,8 @@ from logbuf import log_event, read_log, status as log_status
 
 SUMMARY_FIELDS = ("id", "title", "location", "series", "pay_plan", "grade_low", "grade_high", "salary",
                   "open_date", "close_date", "external_url", "board_url", "announcement_no", "source",
-                  "board_id", "board_name", "board_platform", "board_source_url",
+                  "board_id", "board_name", "board_platform", "board_source_url", "board_origin",
+                  "place_name", "place_website",
                   "verdict", "eligible_grades", "verdict_reason", "verdict_author", "claude_verdict",
                   "action", "action_date", "resume_dir", "last_fetched", "embedded", "run_id")
 
@@ -61,7 +62,13 @@ def stats(args):
     return {"jobs": tot, "pending": tot - len(v), "verdicts": by, "actioned": len(acts),
             "documents": docs, "embedded": emb, "embeddings_enabled": bool(os.environ.get("OPENAI_API_KEY")),
             "dsn": J.DSN.split("@")[-1], "sources": srcs, "adapters": J.list_sources(),
-            "active_run": capacity.busy(), "auth": auth.AUTH_ON, "resumes": res}
+            "active_run": capacity.busy(), "auth": auth.AUTH_ON, "resumes": res, "geo": _geo_services()}
+
+
+def _geo_services():
+    """What a geographic scan can use here: finders and the optional side services."""
+    return {"finders": J.finders.configured(), "websearch": J.websearch.configured(),
+            "firecrawl": bool(J.browser.Config().firecrawl), "geocode": J.geocode.configured()}
 
 
 def adapters(args):
@@ -77,7 +84,7 @@ def _last_scans(conn, limit=300):
     """board_id -> {run_id, started_at, status, cards, new, known | error} from the most recent
     scan that covered the board (summary.boards / summary.failed carry one entry per board)."""
     out = {}
-    for r in conn.execute("SELECT id, started_at, status, summary FROM runs WHERE kind='scan' "
+    for r in conn.execute("SELECT id, started_at, status, summary FROM runs WHERE kind IN ('scan', 'geo') "
                           "ORDER BY id DESC LIMIT %s", (limit,)):
         try:
             sm = json.loads(r["summary"]) if r["summary"] else {}
@@ -177,7 +184,7 @@ def list_jobs(args):
                            open_only=_bool(args.get("open_only") or args.get("open")), closing=args.get("closing"),
                            source=args.get("source") or None, board=args.get("board") or None,
                            days=_int(args.get("days")), pending_only=_bool(args.get("pending_only") or args.get("pending")),
-                           q=args.get("q") or None, run=_int(args.get("run")))
+                           q=args.get("q") or None, run=_int(args.get("run")), origin=args.get("origin") or None)
         if args.get("fields") == "full":
             total = conn.execute("SELECT COUNT(*) AS n FROM jobs").fetchone()["n"]
             return {"jobs": rows, "count": len(rows), "total": total, "active_run": capacity.busy()}
@@ -326,6 +333,120 @@ def refresh_run(args):
     return {"run_id": rid, "status": "running", "count": len(ids)}
 
 
+# ------------------------------------------------------------------ geographic scans
+def _resolve_center(text):
+    """(lat, lon, label) from coordinates or a Maps link (parse_center), else geocoded."""
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("center required: 'lat, lng', a Google Maps link, or an address")
+    c = J.parse_center(text)
+    if c:
+        return c[0], c[1], f"{c[0]:.5f}, {c[1]:.5f}"
+    if not J.geocode.configured():
+        raise ValueError("center is not coordinates and geocoding is not configured")
+    g = J.geocode.geocode(text)
+    if not g:
+        raise ValueError(f"center could not be geocoded: {text[:80]}")
+    return g
+
+
+def _strs(v):
+    if v is None:
+        return None
+    if isinstance(v, str):
+        v = v.split("\n") if "\n" in v else v.split(",")
+    return [str(x).strip() for x in v if str(x).strip()]
+
+
+def resolve_center(args):
+    lat, lon, label = _resolve_center(args.get("center"))
+    return {"lat": lat, "lon": lon, "label": label}
+
+
+def geo_categories(args):
+    """The category registry and the finders, with what is configured here."""
+    svc = _geo_services()
+    fs = [{"name": n, "display_name": getattr(J.finders.load(n), "DISPLAY_NAME", n), "configured": c}
+          for n, c in svc["finders"].items()]
+    return {"categories": [{"key": k, "label": c["label"], "default": k in J.DEFAULT_CATEGORIES} for k, c in J.CATEGORIES.items()],
+            "finders": fs, "websearch": svc["websearch"], "firecrawl": svc["firecrawl"], "geocode": svc["geocode"]}
+
+
+def geo_scan(args):
+    """Start a geographic scan (a persisted run of kind 'geo'): businesses around the centre ->
+    their careers pages become boards (origin geo) -> those boards are scanned. The stored
+    request (what repeat_run replays) carries the centre as resolved coordinates, so a repeat
+    is deterministic and needs no geocoder; what was typed is kept as center_text for display."""
+    lat, lon, label = _resolve_center(args.get("center"))
+    center, center_text = f"{lat:.5f}, {lon:.5f}", (args.get("center_text") or args.get("center") or "").strip()
+    radius = 10.0 if args.get("radius_km") in (None, "") else float(args["radius_km"])
+    if not 0 < radius <= 200:
+        raise ValueError("radius_km must be between 0 and 200")
+    cats = _strs(args.get("categories")) or list(J.DEFAULT_CATEGORIES)
+    bad = [c for c in cats if c not in J.CATEGORIES]
+    if bad:
+        raise ValueError(f"unknown categories {bad}; available: {list(J.CATEGORIES)}")
+    finders = _strs(args.get("finders"))              # None = every configured finder; [] = none
+    if finders is None:
+        finders = [n for n, ok in J.finders.configured().items() if ok]
+    bad = [f for f in finders if f not in J.finders.names()]
+    if bad:
+        raise ValueError(f"unknown finders {bad}; available: {J.finders.names()}")
+    max_places = _int(args.get("max_places"), 300)
+    if not 1 <= max_places <= 5000:
+        raise ValueError("max_places must be between 1 and 5000")
+    resolved = {"center": center, "center_text": center_text, "lat": lat, "lon": lon, "label": label,
+                "radius_km": radius, "categories": cats, "keywords": (args.get("keywords") or "").strip() or None,
+                "tags": _strs(args.get("tags")) or [], "finders": finders,
+                "include": J.check_regex(args.get("include"), "include"),
+                "exclude": J.check_regex(args.get("exclude"), "exclude"),
+                "max_places": max_places, "recheck_days": max(0, _int(args.get("recheck_days"), 30)),
+                "rediscover": _bool(args.get("rediscover")), "days": _int(args.get("days"), 7)}
+    capacity.check()
+
+    def work(conn, run):
+        with J.browser.Session(run.log, check=run.check) as s:
+            return J.geo_scan(conn, resolved, s, log=run.log, progress=run.progress, check=run.check, run_id=run.id)
+    rid = runs.start("geo", resolved, work, request={"op": "geo_scan", "args": {**args, "center": center, "center_text": center_text}})
+    return {"run_id": rid, "status": "running", "center": {"lat": lat, "lon": lon, "label": label}}
+
+
+def places(args):
+    """Places a geographic scan discovered: run, status, careers_kind (or 'adapter' for any
+    board), bbox 'south,west,north,east', q, limit, before (id cursor)."""
+    bbox = _strs(args.get("bbox"))
+    if bbox and len(bbox) != 4:
+        raise ValueError("bbox must be south,west,north,east")
+    with db() as conn:
+        rows = J.list_places(conn, run=_int(args.get("run")), status=args.get("status") or None,
+                             careers_kind=args.get("careers_kind") or None, bbox=bbox, q=args.get("q") or None,
+                             limit=max(1, min(_int(args.get("limit"), 100), 1000)), before=_int(args.get("before")))
+    return {"places": rows, "count": len(rows)}
+
+
+def get_place(args):
+    with db() as conn:
+        p = J.get_place(conn, int(args["id"]))
+    if not p:
+        raise KeyError(f"place {args['id']}")
+    return {"place": p}
+
+
+def set_place(args):
+    """status (active | ignored), website, careers_url (registers the board at once, so it takes
+    the browser slot; '' forgets the page and its board)."""
+    pid, url = int(args["id"]), args.get("careers_url")
+    log = lambda m: log_event("info", f"place {pid}: {str(m).strip()}")  # noqa: E731
+    if url:
+        with capacity.hold("set_place"), db() as conn, J.browser.Session(log) as s:
+            p = J.update_place(conn, pid, status=args.get("status"), website=args.get("website"), careers_url=url,
+                               session=s, log=log)
+    else:
+        with db() as conn:
+            p = J.update_place(conn, pid, status=args.get("status"), website=args.get("website"), careers_url=url, log=log)
+    return {"place": p}
+
+
 def run_status(args):
     r = runs.get(str(args["run_id"]))
     if not r:
@@ -421,6 +542,7 @@ OPERATIONS = {
                      open_only=_boolt, source={"type": "string", "description": "adapter name"},
                      board={"type": "string", "description": "board id or name"}, days=_intt, pending_only=_boolt,
                      run={"type": "integer", "description": "scan run id: jobs that run stored first"},
+                     origin={"type": "string", "enum": ["manual", "geo"], "description": "boards registered by URL, or found by a geographic scan (jobs then carry place_name/place_website)"},
                      closing={"type": "string", "enum": ["open", "closed", "week"], "description": "by close date"},
                      q={"type": "string", "description": "substring over title/location/board/series/reason"},
                      limit={"type": "integer", "default": 100})),
@@ -434,9 +556,29 @@ OPERATIONS = {
     "scan": (scan, "Start a background scan: boards = list of board ids, or source = every board of one adapter, or neither = every enabled board. New/changed postings are embedded automatically. Returns a run id to poll with run_status.",
              _S(boards={"type": "array", "items": _intt}, source=_str, days={"type": "integer", "default": 7},
                 all={"type": "boolean", "default": False}, refetch={"type": "boolean", "default": False})),
+    "geo_scan": (geo_scan, "Start a geographic scan (background run of kind 'geo'): businesses around a point are discovered from OpenStreetMap, their websites and careers pages found, each careers page registered as a board (origin geo) and scanned. center: 'lat, lng', a Google Maps link, or an address (geocoded). Returns a run id to poll with run_status; places lists what was found.",
+                 _S(center={"type": "string", "description": "'35.0844, -106.6504', a Google Maps URL (@lat,lng / ?q=lat,lng / !3dlat!4dlng), or an address (geocoded once; the stored request keeps the coordinates)"},
+                    radius_km={"type": "number", "default": 10},
+                    categories={"type": "array", "items": _str, "description": "registry keys (geo_categories); default " + ", ".join(J.DEFAULT_CATEGORIES)},
+                    keywords={"type": "string", "description": "match place names (comma-separated alternatives)"},
+                    tags={"type": "array", "items": _str, "description": "raw OSM tag lines, e.g. shop=bakery or [\"office\"=\"it\"]"},
+                    finders={"type": "array", "items": _str, "description": "finder names; default every configured one"},
+                    include=_str, exclude=_str, max_places={"type": "integer", "default": 300},
+                    recheck_days={"type": "integer", "default": 30, "description": "re-check a place's careers page after this many days"},
+                    rediscover={"type": "boolean", "default": False, "description": "re-check every place now"},
+                    days={"type": "integer", "default": 7, "description": "postings within the last N days on the boards scanned"}) | {"required": ["center"]}),
+    "geo_categories": (geo_categories, "The category registry for geographic scans (key, label, default) and the finders, with what is configured here (web search for websites, Firecrawl for careers pages).", _S()),
+    "resolve_center": (resolve_center, "Resolve a geographic scan centre: 'lat, lng' or a Google Maps link are parsed, anything else geocoded -> lat, lon, label.", {"type": "object", "properties": {"center": _str}, "required": ["center"]}),
+    "places": (places, "Places found by geographic scans (newest first): name, address, website, careers_url, careers_kind (adapter:<name> | none | no_site | unresolved), status, board. Filters: run, status, careers_kind ('adapter' = any board), bbox, q, limit, before.",
+               _S(run=_intt, status={"type": "string", "enum": ["active", "ignored"]}, careers_kind=_str,
+                  bbox={"type": "string", "description": "south,west,north,east"}, q=_str, limit={"type": "integer", "default": 100},
+                  before={"type": "integer", "description": "id cursor: places with a smaller id"})),
+    "get_place": (get_place, "One place with the text of its careers page.", {"type": "object", "properties": {"id": _intt}, "required": ["id"]}),
+    "set_place": (set_place, "Edit a place: status ignored|active (ignored places are skipped by later scans), website, careers_url (registers it as a board at once; '' forgets the page).",
+                  {"type": "object", "properties": {"id": _intt, "status": {"type": "string", "enum": ["active", "ignored"]}, "website": _str, "careers_url": _str}, "required": ["id"]}),
     "run_status": (run_status, "Status, log, progress (board/posting in flight, counters) and summary of a background run (scan/refresh).", {"type": "object", "properties": {"run_id": _str}, "required": ["run_id"]}),
     "cancel_run": (cancel_run, "Cancel a running scan or refresh. It stops before its next page fetch (within one page load) and ends with status 'cancelled'; what it stored so far stays.", {"type": "object", "properties": {"run_id": _str}, "required": ["run_id"]}),
-    "repeat_run": (repeat_run, "Run a past scan again with the request it was started with (same boards, days, all, refetch), as a new run; boards deleted since are dropped and reported. Transient refresh runs (t<n>) cannot be repeated. Returns the new run_id plus repeated_from.", {"type": "object", "properties": {"run_id": _str}, "required": ["run_id"]}),
+    "repeat_run": (repeat_run, "Run a past scan (or geographic scan) again with the request it was started with, as a new run; boards deleted since are dropped and reported. Transient refresh runs (t<n>) cannot be repeated. Returns the new run_id plus repeated_from.", {"type": "object", "properties": {"run_id": _str}, "required": ["run_id"]}),
     "events": (events, None, _S(since=_intt, limit=_intt)),
     "refresh": (refresh, "Re-fetch postings now (synchronous, up to 20 ids). Refused while a scan holds the browser.",
                 {"type": "object", "properties": {"ids": {"type": "array", "items": _intt}}, "required": ["ids"]}),
@@ -454,7 +596,7 @@ OPERATIONS = {
     "logs": (logs, "Server log (in-memory ring buffer since the last restart): request lines, 4xx/5xx, tracebacks, run outcomes, embedding results. Use level=error to see only failures.",
              _S(lines={"type": "integer", "default": 100}, level={"type": "string", "enum": ["all", "info", "warn", "error"], "default": "warn"}, q={"type": "string", "description": "substring filter"})),
     "runs": (recent_runs, "Recent background runs, newest first (scans persisted, refreshes transient): args, request (what was asked; repeat_run replays it), status, summary. Use run_status for a run's full log.",
-             _S(kind={"type": "string", "enum": ["scan", "refresh"]}, status={"type": "string", "enum": ["running", "done", "failed", "cancelled"]},
+             _S(kind={"type": "string", "enum": ["scan", "geo", "refresh"]}, status={"type": "string", "enum": ["running", "done", "failed", "cancelled"]},
                 limit={"type": "integer", "default": 20, "maximum": 200}, before={"type": "integer", "description": "id cursor: only runs with a smaller id (the next page)"})),
 }
 

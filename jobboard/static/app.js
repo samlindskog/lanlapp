@@ -36,6 +36,7 @@
     const src = $("#source").value;
     if (src.startsWith("board:")) p.set("board", src.slice(6));
     if (src.startsWith("source:")) p.set("source", src.slice(7));
+    if (src.startsWith("origin:")) p.set("origin", src.slice(7));
     const q = $("#q").value.trim();
     if (q && !state.semantic) p.set("q", q);
     if (state.run) p.set("run", state.run);
@@ -56,7 +57,7 @@
       if (k === "close_date") return j.close_date || "9999-99-99";
       if (k === "grade_low") return j.grade_low ?? 99;
       if (k === "first_seen") return j.first_seen || "";
-      if (k === "board") return (j.board_name || j.source || "").toLowerCase();
+      if (k === "board") return (j.place_name || j.board_name || j.source || "").toLowerCase();
       if (k === "last_fetched") return j.last_fetched ? new Date(j.last_fetched).getTime() : 0;
       return (j.title || "").toLowerCase();
     };
@@ -109,17 +110,27 @@
         <td>${statusSelect(j, a)}${j.action_date ? `<br><small>${j.action_date}</small>` : ""}</td>
         <td class="title">${state.semantic ? `<span class="score" title="similarity">${(state.semantic[j.id] * 100).toFixed(0)}% · </span>` : ""}${esc(j.title)}<small>${esc(j.series || "")}${j.announcement_no ? " · " + esc(j.announcement_no) : ""}</small></td>
         <td class="hide-sm">${esc(gradeOf(j))}</td>
-        <td class="hide-sm" title="${esc(j.board_platform || j.source)}">${esc((j.board_name || j.source || "").slice(0, 40))}<br><small class="muted">${esc(j.board_platform || j.source)}</small></td>
-        <td class="hide-sm">${esc((j.location || "").slice(0, 60))}</td>
+        <td class="hide-sm" title="${esc(j.place_name ? `${j.board_name} · ${j.board_platform}` : j.board_platform || j.source)}">${esc((j.place_name || j.board_name || j.source || "").slice(0, 40))}<br><small class="muted">${esc(j.board_origin === "geo" ? "geographic" : j.board_platform || j.source)}</small></td>
+        <td class="hide-sm">${esc((j.location || placeAddress(j) || "").slice(0, 60))}</td>
         <td class="hide-sm fetched" title="${esc(fmtLocal(j.last_fetched))}">${esc(fmtAgo(j.last_fetched))}</td>
         <td class="hide-sm">${link ? `<a href="${esc(link)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">open ↗</a>` : ""}</td>
       </tr>` + (state.open === j.id ? detailRow(j) : "");
     }).join("");
   }
 
+  // A geo board's place: street, city and state as one line (the job's own location wins).
+  const placeAddress = (j) => [j.place_address, [j.place_city, j.place_state].filter(Boolean).join(", ")].filter(Boolean).join(", ");
+  function placeCells(j) {
+    if (!j.place_name) return "";
+    // The server stores only http(s) URLs; anything else is shown as text, never linked.
+    const site = (u) => /^https?:\/\//i.test(u) ? `<a href="${esc(u)}" target="_blank" rel="noopener">${esc(u.replace(/^https?:\/\//i, "").replace(/\/$/, "").slice(0, 50))}</a>` : `<b>${esc(u.slice(0, 50))}</b>`;
+    const maps = j.place_lat != null && j.place_lon != null ? `<a href="${esc(JB.geo.mapsLink(j.place_lat, j.place_lon))}" target="_blank" rel="noopener">Google Maps</a>` : "";
+    return `<div>Place: <b>${esc(j.place_name)}</b> <small>(found by a geographic scan)</small>${placeAddress(j) ? ` · ${esc(placeAddress(j))}` : ""}${maps ? ` · ${maps}` : ""}</div>
+      <div>Website: ${j.place_website ? site(j.place_website) : "<b>—</b>"} · careers page: ${j.place_careers_url ? site(j.place_careers_url) : "<b>—</b>"}${j.place_phone ? ` · phone <b>${esc(j.place_phone)}</b>` : ""}</div>`;
+  }
   function detailRow(j) {
     return `<tr class="detail"><td colspan="10">
-      <div class="detail-grid">
+      <div class="detail-grid">${placeCells(j)}
         <div>Verdict: ${verdictSelect(j, verdictOf(j), "big")} ${j.eligible_grades ? `(${esc(j.eligible_grades)})` : ""}${j.verdict_author === "user" ? ` <small>set by you</small>` : ""}</div>
         <div>${overridden(j)
           ? `<details class="reason"><summary>Claude's verdict: ${esc(j.claude_verdict)}${j.claude_grades ? ` (${esc(j.claude_grades)})` : ""} — reason minimized</summary><b>${esc(j.claude_reason || "—")}</b></details>`
@@ -220,8 +231,10 @@
   async function loadBoardFilter() {
     const d = await (await fetch("/api/boards")).json();
     const cur = $("#source").value;
+    // Geo boards (often hundreds) are one entry, "Geographic" (origin=geo), not a line each.
     $("#source").innerHTML = '<option value="">all</option>'
-      + d.boards.map((b) => `<option value="board:${esc(b.name)}">${esc(b.name)}</option>`).join("")
+      + d.boards.filter((b) => b.origin !== "geo").map((b) => `<option value="board:${esc(b.name)}">${esc(b.name)}</option>`).join("")
+      + (d.boards.some((b) => b.origin === "geo") ? '<option value="origin:geo">Geographic</option>' : "")
       + '<option value="source:manual">manual</option>';
     $("#source").value = cur;
   }
