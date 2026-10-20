@@ -9,8 +9,9 @@ services:
       FIRECRAWL_URL: http://firecrawl-api:3002
       SEARXNG_URL: http://searxng:8080
       JOBSCAN_RELAY_PORT: "8899"             # Firecrawl's PROXY_SERVER=http://jobboard:8899 (container name)
+      JOBSCAN_RELAY_PEERS: 172.31.0.0/24     # the relay trusts the `crawl` network's fixed subnet (dev.sh up-fc creates it so)
     networks: [default, crawl]
 
 networks:
   crawl:
-    external: true
+    external: true                           # docker network create --subnet 172.31.0.0/24 crawl

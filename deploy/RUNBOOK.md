@@ -18,8 +18,9 @@ git fetch origin && git log --oneline -3 origin/next          # the branch the d
 ls ~/.ssh/jobboard_deploy ~/.config/jobboard/token             # deploy key, Claude's token
 ```
 
-The branch `next` holds all of this; the desktop deploys `origin/next` until cutover (`DEPLOY_REF` in
-`deploy/bootstrap.sh`), then `master` once `next` is merged.
+The branch `next` holds all of this; the desktop deploys `origin/next` until cutover (a staged `deploy-ref`
+file overrides the bootstrap's default `origin/master`), then `master` once `next` is merged and the file
+is deleted.
 
 ## 1. Read before write (changes nothing)
 
@@ -66,6 +67,7 @@ ssh uscentral1 'rm -f /home/sam/jobboard-bootstrap/{origin.pem,origin.key,cloudf
 ssh sldesktoplocal 'mkdir -p /home/sam/jobboard-bootstrap && chmod 700 /home/sam/jobboard-bootstrap'
 scp /tmp/jobboard-cutover/* sldesktoplocal:/home/sam/jobboard-bootstrap/
 WEB_PASSWORD='<the login password>' OPENAI_API_KEY='sk-...' deploy/push-secrets.sh sldesktoplocal   # writes secrets.env
+ssh sldesktoplocal 'echo origin/next > /home/sam/jobboard-bootstrap/deploy-ref'   # deploy next until cutover (default: origin/master)
 scp deploy/bootstrap.sh sldesktoplocal:/home/sam/jobboard-bootstrap/bootstrap.sh
 ssh -t sldesktoplocal 'sudo bash /home/sam/jobboard-bootstrap/bootstrap.sh'
 ```
@@ -73,7 +75,8 @@ ssh -t sldesktoplocal 'sudo bash /home/sam/jobboard-bootstrap/bootstrap.sh'
 (`jobboard_deploy.pub` must list Claude's and GitHub Actions' public keys, one per line; it is the hub's
 `deploy_keys.pub`, so the same keys keep working.)
 
-The bootstrap: requires docker; creates `deploy`; clones `/opt/jobboard` at `origin/next`; writes `.env`;
+The bootstrap: requires docker; creates `deploy`; clones `/opt/jobboard` at `origin/next` (the `deploy-ref`
+file; it prints the ref in use at the deploy step); writes `.env`;
 installs nginx on 10.88.0.2:443 / :8090 with the certs; installs `table inet jobboard` (filters wg0 only);
 enables the WireGuard watchdog; deploys; starts the crawl stack; mints `claude-mac` into
 `/home/sam/jobboard-bootstrap/claude-token`.
@@ -154,6 +157,10 @@ ssh -t sldesktoplocal 'sudo bash /home/sam/jobboard-bootstrap/bootstrap.sh'     
 ssh -t sldesktoplocal 'touch /home/sam/jobboard-bootstrap/restore && sudo bash /home/sam/jobboard-bootstrap/bootstrap.sh'   # drop, recreate, restore, health check
 ```
 
+If the restore fails it says so, leaves the app container stopped (a half-restored database must not
+serve) and keeps the dump: fix the cause and re-run the restore mode, or start the app by hand with the
+command it prints.
+
 Now the desktop holds the hub's data and tokens: Claude's existing token (`~/.config/jobboard/token`)
 works against it. Check through the second MCP registration or directly:
 
@@ -185,6 +192,7 @@ ssh -i ~/.ssh/jobboard_deploy -p 2222 deploy@72.14.178.40 jobboard-deploy origin
 
 # 6g. merge next -> master: the workflow tests and deploys origin/master to the desktop
 git checkout master && git merge --ff-only next && git push origin master
+ssh sldesktoplocal 'rm -f /home/sam/jobboard-bootstrap/deploy-ref'                 # right away: a later bootstrap re-run must track master, not next
 gh run watch                                                                       # then: curl -sI https://jobs.slindskog.net/login.html
 
 # 6h. unfreeze; stop the hub's stack (data volume kept until step 7)

@@ -9,6 +9,8 @@
 #   secrets.env                    WEB_PASSWORD=..., OPENAI_API_KEY=... (deploy/push-secrets.sh); deleted after use
 #     or jobboard.env              a complete .env exported from the old host (export-secrets mode): adopted verbatim
 #   jobscan-dump.sql.gz            optional: restored into an EMPTY database on the full run (dump mode on the old host)
+#   deploy-ref                     optional: one line, the ref to check out and deploy instead of origin/master
+#                                  (origin/next before cutover); delete it once that branch has merged
 # Idempotent where practical.
 #
 # Does: require docker; create `deploy` user; clone the repo to /opt/jobboard at DEPLOY_REF; write or adopt
@@ -40,13 +42,29 @@ WG_IP=10.88.0.2                            # this host on the tunnel: nginx bind
 HUB_IP=10.88.0.1                           # uscentral1: source of every DNAT'd (masqueraded) public flow
 LAPTOP_IP=10.88.0.3                        # the Mac: ssh and MCP, routed (not NATed) through the hub
 MCP_PORT=8090
-DEPLOY_REF=origin/next                     # first deploy and re-runs; GitHub Actions deploys origin/master after cutover
+DEPLOY_REF=origin/master                   # what the checkout and the first deploy track; GitHub Actions deploys origin/master
 CRAWL=1                                    # 1: also run deploy/crawl/compose.yaml (Firecrawl + SearXNG) as project `crawl`
+CRAWL_SUBNET=172.31.0.0/24                 # fixed, so the app's relay can trust the crawl containers (JOBSCAN_RELAY_PEERS)
 WG_NET="${WG_IP%.*}.0/24"
+# A staged `deploy-ref` file overrides the ref (one line, e.g. origin/next before cutover). Delete it once the
+# branch has merged, or a re-run of this script for an nginx/crawl change would reset the checkout to it.
+if [ -f "$HERE/deploy-ref" ]; then
+  DEPLOY_REF=$(head -1 "$HERE/deploy-ref" | tr -d '[:space:]')
+  [[ "$DEPLOY_REF" =~ ^(origin/[A-Za-z0-9._/-]+|[0-9a-f]{7,40})$ ]] || { echo "refusing ref in $HERE/deploy-ref: $DEPLOY_REF"; exit 1; }
+fi
 log() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 # Every compose call for the production stack; the deploy helper uses the same files (deploy/compose-up.sh).
 C() { (cd "$APP" && docker compose -f jobboard/compose.prod.yaml --env-file .env "$@"); }
 psql_db() { C exec -T db psql -U jobscan -d "${1:-jobscan}" -tAq "${@:2}"; }
+# The crawl network has a fixed subnet (the relay trusts it); an existing network with another subnet is kept, with a warning.
+ensure_crawl_network() {
+  if docker network inspect crawl >/dev/null 2>&1; then
+    local have; have=$(docker network inspect crawl -f '{{(index .IPAM.Config 0).Subnet}}' 2>/dev/null || true)
+    [ "$have" = "$CRAWL_SUBNET" ] || echo "WARNING: network crawl has subnet ${have:-?}, not $CRAWL_SUBNET; kept (JOBSCAN_RELAY_PEERS in compose.prod.yaml must match)"
+  else
+    docker network create --subnet "$CRAWL_SUBNET" crawl >/dev/null && echo "network crawl created ($CRAWL_SUBNET)"
+  fi
+}
 wait_app() {
   for _ in $(seq 1 40); do
     [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/login.html || true)" = 200 ] && return 0
@@ -141,19 +159,24 @@ if [ -f "$HERE/restore" ]; then
   gzip -t "$DUMP" || { echo "$DUMP is not a valid gzip file"; exit 1; }
   echo "before: jobs=$(psql_db jobscan -c 'SELECT COUNT(*) FROM jobs' 2>/dev/null | tail -1 || echo '?')"
   C stop jobboard
-  # jobscan is the container's superuser; connect to the maintenance db to drop its own.
-  psql_db postgres -v ON_ERROR_STOP=1 -c 'DROP DATABASE IF EXISTS jobscan WITH (FORCE)' -c 'CREATE DATABASE jobscan OWNER jobscan'
-  if gunzip -c "$DUMP" | C exec -T db psql -U jobscan -d jobscan -q -v ON_ERROR_STOP=1 >/tmp/jobscan-restore.log 2>&1; then
-    C start jobboard
-    wait_app
-    echo "restored: jobs=$(psql_db jobscan -c 'SELECT COUNT(*) FROM jobs' | tail -1) tokens=$(psql_db jobscan -c 'SELECT COUNT(*) FROM auth_tokens WHERE revoked_at IS NULL' | tail -1) (log: /tmp/jobscan-restore.log)"
-    rm -f "$DUMP"
-  else
-    echo "RESTORE FAILED; database left as the restore got it, dump kept. Last lines of /tmp/jobscan-restore.log:"
-    tail -20 /tmp/jobscan-restore.log
-    C start jobboard || true
+  # From here on the app stays stopped unless every step succeeds: a half-restored database must not serve.
+  restore_failed() {
+    echo "RESTORE FAILED ($1): app left stopped, database as the restore got it, dump kept at $DUMP."
+    [ -f /tmp/jobscan-restore.log ] && { echo "last lines of /tmp/jobscan-restore.log:"; tail -20 /tmp/jobscan-restore.log; }
+    echo "fix and re-run restore (touch $HERE/restore), or start the app by hand with:"
+    echo "  cd $APP && docker compose -f jobboard/compose.prod.yaml --env-file .env start jobboard"
     exit 1
-  fi
+  }
+  rm -f /tmp/jobscan-restore.log
+  # jobscan is the container's superuser; connect to the maintenance db to drop its own.
+  psql_db postgres -v ON_ERROR_STOP=1 -c 'DROP DATABASE IF EXISTS jobscan WITH (FORCE)' -c 'CREATE DATABASE jobscan OWNER jobscan' \
+    || restore_failed "drop/create database"
+  gunzip -c "$DUMP" | C exec -T db psql -U jobscan -d jobscan -q -v ON_ERROR_STOP=1 >/tmp/jobscan-restore.log 2>&1 \
+    || restore_failed "psql restore"
+  C start jobboard || restore_failed "container start"
+  wait_app || restore_failed "health check"
+  echo "restored: jobs=$(psql_db jobscan -c 'SELECT COUNT(*) FROM jobs' | tail -1) tokens=$(psql_db jobscan -c 'SELECT COUNT(*) FROM auth_tokens WHERE revoked_at IS NULL' | tail -1) (log: /tmp/jobscan-restore.log)"
+  rm -f "$DUMP"
   exit 0
 fi
 
@@ -386,8 +409,8 @@ systemctl daemon-reload
 systemctl enable --now jobboard-wg-watch.timer >/dev/null
 echo "every 2 min: ping $HUB_IP over $WG_IF; 3 failing runs -> systemctl restart wg-quick@$WG_IF (journalctl -u jobboard-wg-watch)"
 
-log "deploy $DEPLOY_REF"
-docker network inspect crawl >/dev/null 2>&1 || docker network create crawl >/dev/null   # compose.prod.yaml joins it (external)
+log "deploy $DEPLOY_REF$([ -f "$HERE/deploy-ref" ] && echo " (from $HERE/deploy-ref; delete it once that branch has merged)")"
+ensure_crawl_network                                 # compose.prod.yaml joins it (external)
 su - deploy -c "/usr/local/bin/jobboard-deploy $DEPLOY_REF"
 systemctl reload nginx
 echo "nginx reloaded: jobs.slindskog.net on $WG_IP:443 -> 127.0.0.1:8080 (login paths open, everything else needs a cookie or token),"

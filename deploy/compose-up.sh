@@ -6,8 +6,16 @@
 set -euo pipefail
 cd /opt/jobboard
 C="docker compose -f jobboard/compose.prod.yaml --env-file .env"
-# The app joins the external network `crawl` (the crawl stack's); compose refuses to start without it.
-docker network inspect crawl >/dev/null 2>&1 || docker network create crawl >/dev/null
+# The app joins the external network `crawl` (the crawl stack's); compose refuses to start without it. The subnet
+# is fixed because the app's relay trusts it (JOBSCAN_RELAY_PEERS in compose.prod.yaml); a network that already
+# exists with another subnet is kept, with a warning.
+CRAWL_SUBNET=172.31.0.0/24
+if docker network inspect crawl >/dev/null 2>&1; then
+  have=$(docker network inspect crawl -f '{{(index .IPAM.Config 0).Subnet}}' 2>/dev/null || true)
+  [ "$have" = "$CRAWL_SUBNET" ] || echo "WARNING: network crawl has subnet ${have:-?}, not $CRAWL_SUBNET; kept (JOBSCAN_RELAY_PEERS must match)"
+else
+  docker network create --subnet "$CRAWL_SUBNET" crawl >/dev/null
+fi
 # The app image is built from the checkout (code baked in), so --build picks up the new commit.
 $C up -d --build --remove-orphans
 for _ in $(seq 1 40); do

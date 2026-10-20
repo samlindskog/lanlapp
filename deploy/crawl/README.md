@@ -5,10 +5,13 @@ meta-search engine without any public exposure. It ships through the bootstrap (
 `CRAWL=1`), not through a push: a deploy rebuilds the app only.
 
 ```
-network crawl (external, created once: docker network create crawl)
+network crawl (external, fixed subnet, created once: docker network create --subnet 172.31.0.0/24 crawl)
   jobboard          the app container (jobboard/compose.prod.yaml joins `crawl` next to its own network)
                       FIRECRAWL_URL=http://firecrawl-api:3002   SEARXNG_URL=http://searxng:8080
                       JOBSCAN_RELAY_PORT=8899  -> the app's proxy relay, used by Firecrawl as PROXY_SERVER
+                      JOBSCAN_RELAY_PEERS=172.31.0.0/24 -> the relay accepts loopback plus these CIDRs only,
+                      which is why the network's subnet is fixed (bootstrap, compose-up.sh and dev.sh create it so;
+                      an existing `crawl` network with another subnet is kept with a warning and must match)
   firecrawl-api     ghcr.io/firecrawl/firecrawl:2.11.560  API + workers in one container (harness.js --start-docker)
   playwright-service ghcr.io/firecrawl/playwright-service  headless Chromium renderer for the API (BLOCK_MEDIA=true)
   redis             cache + rate limits (no persistence)
@@ -20,7 +23,9 @@ network crawl (external, created once: docker network create crawl)
 No service publishes a port. The only clients are containers on `crawl`: the app calls Firecrawl and
 SearXNG by service name, Firecrawl calls SearXNG (`SEARXNG_ENDPOINT`) for `/v2/search`, and both Firecrawl
 and Playwright send their outbound requests through the app's relay (`PROXY_SERVER=http://jobboard:8899`),
-so the app's one egress policy (direct first, Decodo on block) applies to crawled pages too.
+so the app's one egress policy (direct first, Decodo on block) applies to crawled pages too. The relay only
+serves peers inside `JOBSCAN_RELAY_PEERS` (the `crawl` subnet) and loopback, so nothing else on the host can
+borrow the app's proxy credentials.
 
 ## Environment
 

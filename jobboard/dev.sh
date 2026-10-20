@@ -17,7 +17,7 @@ export SEARXNG_SECRET="${SEARXNG_SECRET:-dev-searxng-secret-not-for-production}"
 case "${1:-}" in
   up)      "${BASE[@]}" up -d --build --remove-orphans ;;
   up-auth) "${AUTH[@]}" up -d --build --remove-orphans ;;
-  up-fc)   docker network inspect crawl >/dev/null 2>&1 || docker network create crawl >/dev/null
+  up-fc)   docker network inspect crawl >/dev/null 2>&1 || docker network create --subnet 172.31.0.0/24 crawl >/dev/null   # JOBSCAN_RELAY_PEERS in compose.crawl.yaml
            "${CRAWL[@]}" up -d --remove-orphans
            "${FC[@]}" up -d --build --remove-orphans ;;
   down)    "${AUTH[@]}" down
