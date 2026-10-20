@@ -1,4 +1,4 @@
-"""Offline checks of the geographic scan (jobscan/core/geo.py, finders/): centre parsing, name
+"""Offline checks of the geographic scan (jobscan/core/geo.py, careers.py, places.py, geoscan.py, finders/): centre parsing, name
 normalisation and dedup, website picking (directories skipped, name resemblance), careers-link
 extraction, the registry and the Overpass query builder, then two pipeline runs over fakes: a
 FakeSession serving business homepages and careers pages by URL (and a canned Firecrawl map), a
@@ -14,7 +14,7 @@ sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, "..", "jobscan"))
 import jobscan as J  # noqa: E402
 import finders  # noqa: E402
-from core import geo  # noqa: E402
+from core import careers, geo, geoscan, places  # noqa: E402
 from helpers import FakeSession  # noqa: E402
 
 
@@ -50,19 +50,19 @@ def check_names_and_dedup():
 
 
 def check_websites():
-    assert geo.is_aggregator("https://www.yelp.com/biz/x") and geo.is_aggregator("https://m.facebook.com/x")
-    assert geo.is_aggregator("https://yelp.ca/x") and geo.is_aggregator("https://www.bbb.org/x")
-    assert not geo.is_aggregator("https://firstcommunitybank.example.com/")
-    assert geo.resembles("First Community Bank", "https://www.firstcommunitybank.example.com/", "")
-    assert geo.resembles("First Community Bank", "https://fcb.example.com/", "First Community Bank | Home")
-    assert not geo.resembles("First Community Bank", "https://fcb.example.com/", "Some other bank")
-    assert geo.resembles("Walmart", "https://walmart.com/store/123", "")
+    assert careers.is_aggregator("https://www.yelp.com/biz/x") and careers.is_aggregator("https://m.facebook.com/x")
+    assert careers.is_aggregator("https://yelp.ca/x") and careers.is_aggregator("https://www.bbb.org/x")
+    assert not careers.is_aggregator("https://firstcommunitybank.example.com/")
+    assert careers.resembles("First Community Bank", "https://www.firstcommunitybank.example.com/", "")
+    assert careers.resembles("First Community Bank", "https://fcb.example.com/", "First Community Bank | Home")
+    assert not careers.resembles("First Community Bank", "https://fcb.example.com/", "Some other bank")
+    assert careers.resembles("Walmart", "https://walmart.com/store/123", "")
     results = [{"url": "https://www.yelp.com/biz/first-community-bank", "title": "First Community Bank - Yelp"},
                {"url": "https://www.randomnews.example.com/story", "title": "A story"},
                {"url": "https://www.firstcommunitybank.example.com/#top", "title": "Home"},
                {"url": "https://other.example.com/", "title": "First Community Bank"}]
-    assert geo.pick_website("First Community Bank", results) == "https://www.firstcommunitybank.example.com/"
-    assert geo.pick_website("First Community Bank", results[:2]) is None
+    assert careers.pick_website("First Community Bank", results) == "https://www.firstcommunitybank.example.com/"
+    assert careers.pick_website("First Community Bank", results[:2]) is None
 
 
 SAMPLE = """<html><head><title>Acme</title></head><body><nav>
@@ -75,12 +75,12 @@ SAMPLE = """<html><head><title>Acme</title></head><body><nav>
 
 
 def check_careers_links():
-    links = geo.careers_links(SAMPLE, "https://acme.example.com/")
+    links = careers.careers_links(SAMPLE, "https://acme.example.com/")
     assert links[0] == "https://acme.example.com/about/careers", links
     assert set(links) == {"https://acme.example.com/about/careers", "https://acme.example.com/employment",
                           "https://acme.wd1.myworkdayjobs.com/External"}, links
-    assert geo.careers_links("<a href='/x'>Contact</a>", "https://a.example.com") == []
-    m = geo.careers_from_links(["https://c.example.com/about", "https://c.example.com/join-the-team",
+    assert careers.careers_links("<a href='/x'>Contact</a>", "https://a.example.com") == []
+    m = careers.careers_from_links(["https://c.example.com/about", "https://c.example.com/join-the-team",
                                {"url": "https://c.example.com/x", "title": "Careers"}], "https://c.example.com")
     assert m == ["https://c.example.com/x", "https://c.example.com/join-the-team"], m
 
@@ -125,7 +125,7 @@ class _Result:
 
 
 class FakeConn:
-    """The places table in memory, answering exactly the statements geo.py issues."""
+    """The places table in memory, answering exactly the statements places.py issues."""
 
     def __init__(self):
         self.places, self.boards, self.next_id, self.commits = {}, {}, 1, 0
@@ -133,7 +133,7 @@ class FakeConn:
     def execute(self, sql, params=()):
         s = " ".join(sql.split())
         if s.startswith("INSERT INTO places"):
-            row = dict(zip(("id",) + geo.PLACE_COLS, (self.next_id,) + tuple(params)))
+            row = dict(zip(("id",) + places.PLACE_COLS, (self.next_id,) + tuple(params)))
             self.places[row["id"]] = row
             self.next_id += 1
             return _Result([dict(row)])
@@ -251,13 +251,13 @@ def check_pipeline():
     import inspect
     from core import boards as B                      # the stub below mirrors the real signature; keep them in step
     assert {"fallback_adapter", "origin", "session", "name"} <= set(inspect.signature(B.add_board).parameters)
-    assert "session" in inspect.signature(geo.scan_boards).parameters
-    saved = (finders.names, finders.load, geo.add_board, geo.scan_boards, geo.websearch.configured, geo.websearch.search)
+    assert "session" in inspect.signature(geoscan.scan_boards).parameters
+    saved = (finders.names, finders.load, places.add_board, geoscan.scan_boards, geoscan.websearch.configured, geoscan.websearch.search)
     finders.names = lambda: ["fake", "nope"]
     finders.load = lambda n: {"fake": FakeFinder, "nope": Unconfigured}[n]
-    geo.add_board, geo.scan_boards = add_board, scan_boards
-    geo.websearch.configured = lambda: True
-    geo.websearch.search = lambda q, n=5: SEARCH.get(q, [])
+    places.add_board, geoscan.scan_boards = add_board, scan_boards
+    geoscan.websearch.configured = lambda: True
+    geoscan.websearch.search = lambda q, n=5: SEARCH.get(q, [])
     try:
         conn, lines, phases = FakeConn(), [], []
         p = J.Progress(lambda st: phases.append(st.get("phase")) if phases[-1:] != [st.get("phase")] else None)
@@ -329,7 +329,7 @@ def check_pipeline():
         except KeyError:
             pass
     finally:
-        finders.names, finders.load, geo.add_board, geo.scan_boards, geo.websearch.configured, geo.websearch.search = saved
+        finders.names, finders.load, places.add_board, geoscan.scan_boards, geoscan.websearch.configured, geoscan.websearch.search = saved
 
 
 def main():

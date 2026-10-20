@@ -10,9 +10,10 @@ jobscan/             job posting tracker (PostgreSQL + pgvector, runs in the com
   jobscan.py           facade: re-exports core/ so callers write `import jobscan as J`; also the CLI entry
   core/                db (schema, migrations), text (extraction, sections), adapters (registry), boards,
                        scan (scans + refreshes), jobs (verdicts, actions, listing, search, resumes), embed, cli,
-                       geo (geographic scans: category registry, centre parsing, dedup, careers-page heuristics,
-                       the places table, the pipeline), geocode (Nominatim), websearch (SearXNG), client (the
-                       plain HTTP call those side services share)
+                       geo (geographic scans, the pure part: category registry, centre parsing, dedup),
+                       careers (website + careers-page heuristics), places (the places table), geoscan (the
+                       pipeline), geocode (Nominatim), websearch (SearXNG), client (the plain HTTP call those
+                       side services share)
   browser.py           fetch layer: Chrome via Selenium + undetected-chromedriver, optional proxy; urllib fallback
   sources/             one adapter per hosting platform: families (workday, oracle_hcm, icims, icims_jibe,
                        ukg, neogov, greenhouse, eightfold), single sites (usace_yellogov) and firecrawl (any
