@@ -49,10 +49,11 @@ def fallback_board(adapter, url):
     return {"key": f"{adapter}:{key}", "name": None, "url": url, "params": {}}
 
 def add_board(conn, url, name=None, include=None, exclude=None, adapter=None, params=None, session=None,
-              fallback_adapter=None, origin="manual"):
+              fallback_adapter=None, origin="manual", location=None):
     """Register a job board by URL. The adapter is detected (URL pattern, then a page probe);
     an already-registered board (same key) is returned unchanged except for the fields given.
-    include/exclude: regexes on posting titles applied at scan time (None = no filter).
+    include/exclude: regexes on posting titles applied at scan time (None = no filter);
+    location: a regex a card's location must match (unknown locations pass).
     session: the caller's browser.Session (one per add_boards request); opened here if absent.
     fallback_adapter: the adapter a URL nothing recognises goes to (the generic firecrawl one when
     a Firecrawl is configured); forcing adapter= to it skips detection, which could never pick it.
@@ -79,10 +80,7 @@ def add_board(conn, url, name=None, include=None, exclude=None, adapter=None, pa
             s.close()
     p = dict(board.get("params") or {})
     p.update(params or {})
-    if include is not None:
-        p["include"] = check_regex(include, "include")
-    if exclude is not None:
-        p["exclude"] = check_regex(exclude, "exclude")
+    _set_filters(p, include, exclude, location)
     name = name or board.get("name") or board["key"]
     row = conn.execute("SELECT * FROM boards WHERE key=%s", (board["key"],)).fetchone()
     if row:
@@ -96,16 +94,13 @@ def add_board(conn, url, name=None, include=None, exclude=None, adapter=None, pa
     conn.commit()
     return _board_row(r)
 
-def update_board(conn, board_id, name=None, enabled=None, include=None, exclude=None, params=None):
+def update_board(conn, board_id, name=None, enabled=None, include=None, exclude=None, params=None, location=None):
     b = get_board(conn, int(board_id))
     if not b:
         raise KeyError(board_id)
     p = dict(b["params"])
     p.update(params or {})
-    if include is not None:
-        p["include"] = check_regex(include, "include")
-    if exclude is not None:
-        p["exclude"] = check_regex(exclude, "exclude")
+    _set_filters(p, include, exclude, location)
     conn.execute("UPDATE boards SET name=%s, enabled=%s, params=%s WHERE id=%s",
                  (name or b["name"], int(b["enabled"] if enabled is None else bool(enabled)), json.dumps(p), b["id"]))
     conn.commit()
@@ -117,9 +112,17 @@ def delete_board(conn, board_id):
     conn.commit()
     return n
 
+def _set_filters(p, include, exclude, location):
+    """Write the card filters a caller gave (None = leave as is; '' = clear) into a params dict,
+    each validated: this is the one door every filter regex enters by."""
+    for key, value in (("include", include), ("exclude", exclude), ("location", location)):
+        if value is not None:
+            p[key] = check_regex(value, key)
+
 def check_regex(pattern, what="filter"):
-    """Title filters come from API callers and run against every card title: keep them short,
-    compilable, and free of nested quantifiers (catastrophic backtracking stalls the process)."""
+    """Card filters (title include/exclude, location) come from API callers and run against every
+    card: keep them short, compilable, and free of nested quantifiers (catastrophic backtracking
+    stalls the process)."""
     if pattern is None or pattern == "":
         return None
     if len(pattern) > 200:
@@ -133,6 +136,7 @@ def check_regex(pattern, what="filter"):
     return pattern
 
 def _title_filter(board):
+    """keep(title) for the board's include/exclude regexes."""
     inc, exc = board["params"].get("include"), board["params"].get("exclude")
     inc_re = re.compile(inc, re.I) if inc else None
     exc_re = re.compile(exc, re.I) if exc else None
@@ -145,3 +149,23 @@ def _title_filter(board):
             return False
         return True
     return keep
+
+# A card location that says nothing about where: nothing at all, or only a count. The posting
+# page decides later, so such a card passes the location rule.
+_UNKNOWN_LOCATION_RE = re.compile(r"^\s*(\d+\s+locations?|multiple(\s+locations?)?|various(\s+locations?)?)?\s*$", re.I)
+
+def _location_filter(board):
+    """keep(location) for the board's `location` regex (a nationwide board scanned for one
+    area, e.g. '\\b(Albuquerque|New Mexico|NM)\\b'); an unknown location is kept."""
+    loc = board["params"].get("location")
+    loc_re = re.compile(loc, re.I) if loc else None
+
+    def keep(location):
+        where = location or ""
+        return not loc_re or bool(_UNKNOWN_LOCATION_RE.match(where)) or bool(loc_re.search(where))
+    return keep
+
+def _card_filter(board):
+    """keep(card): the title rules and the location rule together (scan.py counts each)."""
+    title_ok, loc_ok = _title_filter(board), _location_filter(board)
+    return lambda card: title_ok(card.get("title")) and loc_ok(card.get("location"))

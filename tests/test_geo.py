@@ -93,6 +93,26 @@ def check_careers_links():
     assert m == ["https://c.example.com/x", "https://c.example.com/join-the-team"], m
 
 
+def check_card_filter():
+    """A board's include/exclude title rules and its location rule, as scan_board applies them;
+    a card whose location says nothing (missing, or only a count) passes the location rule."""
+    board = {"params": {"include": "analyst|budget", "exclude": "senior", "location": r"\b(Albuquerque|Rio Rancho|New Mexico|NM)\b"}}
+    keep = J._card_filter(board)
+    assert keep({"title": "Budget Analyst", "location": "Albuquerque, NM"})
+    assert keep({"title": "Financial Analyst", "location": "Rio Rancho, New Mexico"})
+    assert not keep({"title": "Senior Analyst", "location": "Albuquerque, NM"})           # exclude
+    assert not keep({"title": "Teller", "location": "Albuquerque, NM"})                    # include
+    assert not keep({"title": "Analyst", "location": "Minneapolis, MN"})                   # location
+    assert not keep({"title": "Analyst", "location": "Nome, Alaska"})                      # \bNM\b does not match "Nome"
+    for unknown in (None, "", "3 Locations", "12 locations", "Multiple Locations", "Multiple", "Various Locations"):
+        assert keep({"title": "Analyst", "location": unknown}), unknown
+    assert not keep({"title": "Analyst", "location": "Remote - US"})                       # a real place that is not ours
+    assert J._card_filter({"params": {}})({"title": None, "location": None})               # no rules: everything passes
+    assert J._card_filter({"params": {"location": "NM"}})({"title": "x", "location": "Santa Fe, NM"})
+    loc_ok = J._location_filter(board)
+    assert loc_ok("Albuquerque, NM") and loc_ok("3 Locations") and not loc_ok("Denver, CO")
+
+
 def check_registry_and_osm():
     from finders import osm
     assert set(J.DEFAULT_CATEGORIES) <= set(J.CATEGORIES)
@@ -367,6 +387,8 @@ def main():
     print("website picking: aggregators skipped, name resemblance: ok")
     check_careers_links()
     print("careers links: ok")
+    check_card_filter()
+    print("card filter: title include/exclude + location, unknown locations kept: ok")
     check_registry_and_osm()
     print("category registry + Overpass query/parse: ok")
     check_pipeline()

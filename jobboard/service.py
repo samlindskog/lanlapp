@@ -132,7 +132,7 @@ def sources(args):
 
 # ------------------------------------------------------------------ boards
 def add_boards(args):
-    """items: [url | {url, name?, include?, exclude?, adapter?}] -> per URL the board or the error.
+    """items: [url | {url, name?, include?, exclude?, location?, adapter?}] -> per URL the board or the error.
     One browser Session for the whole request; holds the browser slot."""
     items = args.get("urls")
     if not isinstance(items, list):
@@ -151,7 +151,7 @@ def add_boards(args):
             try:
                 adapter = it.get("adapter")
                 b = J.add_board(conn, url, name=it.get("name"), include=it.get("include"), exclude=it.get("exclude"),
-                                adapter=adapter, session=s,
+                                location=it.get("location"), adapter=adapter, session=s,
                                 fallback_adapter="firecrawl" if adapter == "firecrawl" else fallback)
                 out.append({"url": url, "board": b})
                 log_event("info", f"board added: [{b['id']}] {b['name']} ({b['adapter']}) {b['url']}")
@@ -165,7 +165,8 @@ def add_boards(args):
 def update_board(args):
     with db() as conn:
         return {"board": J.update_board(conn, int(args["id"]), name=args.get("name"), enabled=args.get("enabled"),
-                                        include=args.get("include"), exclude=args.get("exclude"))}
+                                        include=args.get("include"), exclude=args.get("exclude"),
+                                        location=args.get("location"))}
 
 
 def delete_board(args):
@@ -524,17 +525,18 @@ def list_resumes(args):
 # name -> (function, MCP description or None when HTTP-only, MCP input schema)
 _S = lambda **props: {"type": "object", "properties": props}  # noqa: E731
 _str, _intt, _boolt = {"type": "string"}, {"type": "integer"}, {"type": "boolean"}
-FILTER = r"include/exclude are title regexes applied at scan time (e.g. include 'analyst|account')"
+FILTER = (r"include/exclude are title regexes applied at scan time (e.g. include 'analyst|account'); location is a regex "
+          r"a card's location must match (e.g. '\\b(Albuquerque|New Mexico|NM)\\b'; cards with no or only a count of locations pass)")
 
 OPERATIONS = {
     "stats": (stats, "Counts of jobs, verdicts, embeddings; available adapters; active run.", _S()),
     "adapters": (adapters, "Adapters (hosting platforms) available: name, display_name, kind (family = many employers, site = one board).", _S()),
     "sources": (sources, "Adapters with boards registered and last scan (older name for adapters).", _S()),
     "boards": (boards, "Registered job boards: id, adapter, name, url, enabled, params (incl. include/exclude title regexes), jobs stored, last scan.", _S()),
-    "add_boards": (add_boards, "Register job boards by URL (many at once). The backend picks the adapter for each URL (Workday, Oracle HCM, iCIMS, UKG, NEOGOV, Greenhouse, Eightfold, Yello/USACE ...), verifies the endpoint answers, and stores the board. URLs no adapter recognises are registered as generic Firecrawl boards when Firecrawl is configured (adapter 'firecrawl' forces that). Each item is a URL or {url, name, include, exclude, adapter}; " + FILTER + ". Returns per URL the board or the error.",
-                   {"type": "object", "properties": {"urls": {"type": "array", "items": {"anyOf": [_str, {"type": "object", "properties": {"url": _str, "name": _str, "include": _str, "exclude": _str, "adapter": _str}, "required": ["url"]}]}}}, "required": ["urls"]}),
-    "update_board": (update_board, "Rename, enable/disable, or change the title filters of a board.",
-                     {"type": "object", "properties": {"id": _intt, "name": _str, "enabled": _boolt, "include": _str, "exclude": _str}, "required": ["id"]}),
+    "add_boards": (add_boards, "Register job boards by URL (many at once). The backend picks the adapter for each URL (Workday, Oracle HCM, iCIMS, UKG, NEOGOV, Greenhouse, Eightfold, Yello/USACE ...), verifies the endpoint answers, and stores the board. URLs no adapter recognises are registered as generic Firecrawl boards when Firecrawl is configured (adapter 'firecrawl' forces that). Each item is a URL or {url, name, include, exclude, location, adapter}; " + FILTER + ". Returns per URL the board or the error.",
+                   {"type": "object", "properties": {"urls": {"type": "array", "items": {"anyOf": [_str, {"type": "object", "properties": {"url": _str, "name": _str, "include": _str, "exclude": _str, "location": _str, "adapter": _str}, "required": ["url"]}]}}}, "required": ["urls"]}),
+    "update_board": (update_board, "Rename, enable/disable, or change the card filters of a board; " + FILTER + ".",
+                     {"type": "object", "properties": {"id": _intt, "name": _str, "enabled": _boolt, "include": _str, "exclude": _str, "location": _str}, "required": ["id"]}),
     "delete_board": (delete_board, "Remove a board; its jobs stay (detached from the board).", {"type": "object", "properties": {"id": _intt}, "required": ["id"]}),
     "list_jobs": (list_jobs, "List jobs with latest verdict and action. Filters are ANDed.",
                   _S(verdict={"type": "string", "description": "comma list of yes,maybe,no,none"},

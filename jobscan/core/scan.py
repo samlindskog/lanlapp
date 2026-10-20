@@ -1,7 +1,7 @@
 """Scans and refreshes: walk boards through one Session, store documents, carry verdicts, embed."""
 import browser
 from core.adapters import load_source
-from core.boards import _session, _title_filter, add_board, get_board, list_boards
+from core.boards import _card_filter, _location_filter, _session, _title_filter, add_board, get_board, list_boards
 from core.db import _store_documents, _update_fields, now
 from core.embed import embed_if_possible
 from core.text import html_to_text
@@ -32,8 +32,9 @@ def scan_board(conn, board, session, days=7, all_=False, limit=None, refetch=Fal
     """Fetch new postings from one board through the run's Session. Incremental: known
     (board, source_id) pairs are not re-fetched unless refetch=True. A new job whose announcement
     number was already judged under another id inherits that verdict. New/changed jobs are
-    embedded afterwards when an API key is available. Titles are filtered by the board's
-    include/exclude regexes. progress: a Progress (board-level fields are set by the caller);
+    embedded afterwards when an API key is available. Cards are filtered by the board's
+    include/exclude title regexes and its location regex (unknown locations pass). progress: a
+    Progress (board-level fields are set by the caller);
     session.check() is run between postings so a cancel lands between fetches. run_id: the
     persisted run this scan belongs to, recorded on every job it stores first (jobs.run_id)."""
     p = progress or Progress()
@@ -43,11 +44,14 @@ def scan_board(conn, board, session, days=7, all_=False, limit=None, refetch=Fal
                  (board["adapter"], src.DISPLAY_NAME, board["url"]))
     conn.commit()
     cards = src.list_jobs(session, board, since_days=None if all_ else days, max_pages=max_pages)
-    keep = _title_filter(board)
-    skipped = [c for c in cards if not keep(c.get("title"))]
-    cards = [c for c in cards if keep(c.get("title"))]
+    title_ok, loc_ok = _title_filter(board), _location_filter(board)
+    by_title = sum(1 for c in cards if not title_ok(c.get("title")))
+    by_location = sum(1 for c in cards if title_ok(c.get("title")) and not loc_ok(c.get("location")))
+    keep = _card_filter(board)
+    cards = [c for c in cards if keep(c)]
     log(f"{board['name']} ({board['adapter']}): {len(cards)} cards"
-        + (f", {len(skipped)} dropped by title filter" if skipped else ""))
+        + (f", {by_title} dropped by title filter" if by_title else "")
+        + (f", {by_location} dropped by location filter" if by_location else ""))
     p.update(phase="fetching", cards=len(cards), job_index=0, job_title=None)
     p.add(cards_total=len(cards))
     new = updated = carried = 0
