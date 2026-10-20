@@ -109,9 +109,17 @@ def check_escalation():
     assert B._proxy_parts(g0.url(1))[3].startswith("user-n-session-") and "country" not in g0.url(1)
 
 
+def _http_server(handler):
+    """Serve a BaseHTTPRequestHandler subclass on an ephemeral loopback port: (server, port)."""
+    from http.server import ThreadingHTTPServer
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, srv.server_address[1]
+
+
 def _origin_server():
     """A plain-HTTP origin on loopback that echoes the request path; (server, port, paths seen)."""
-    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from http.server import BaseHTTPRequestHandler
     seen = []
 
     class H(BaseHTTPRequestHandler):
@@ -125,9 +133,8 @@ def _origin_server():
 
         def log_message(self, *a):
             pass
-    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    return srv, srv.server_address[1], seen
+    srv, port = _http_server(H)
+    return srv, port, seen
 
 
 def _upstream_proxy():
@@ -273,7 +280,7 @@ def _firecrawl_server():
     """A fake Firecrawl v1 API on loopback: scrape (a 'blocked' target answers 403 once, then 200),
     crawl (two polls of 'scraping', then completed; a 'forever' target never completes), delete."""
     import json
-    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from http.server import BaseHTTPRequestHandler
     seen = {"scrape": [], "crawl": [], "polls": 0, "pages": 0, "deleted": []}
 
     class H(BaseHTTPRequestHandler):
@@ -321,9 +328,8 @@ def _firecrawl_server():
 
         def log_message(self, *a):
             pass
-    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    return srv, srv.server_address[1], seen
+    srv, port = _http_server(H)
+    return srv, port, seen
 
 
 def check_firecrawl():
