@@ -120,13 +120,12 @@ services:
     image: searxng/searxng:2026.10.19-81371861f
     container_name: crawl-searxng
     environment:
-      SEARXNG_SETTINGS_PATH: /srv/searxng/settings.yml   # our file, read-only; /etc/searxng stays the image's
       SEARXNG_SECRET: ${SEARXNG_SECRET:?SEARXNG_SECRET missing in the env file}
       SEARXNG_BASE_URL: http://searxng:8080/
       SEARXNG_BIND_ADDRESS: "0.0.0.0"
       SEARXNG_PORT: "8080"
     volumes:
-      - ./searxng/settings.yml:/srv/searxng/settings.yml:ro
+      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro   # the image's entrypoint only accepts this path
       - searxng-etc:/etc/searxng
       - searxng-cache:/var/cache/searxng
     cap_drop: [ALL]
