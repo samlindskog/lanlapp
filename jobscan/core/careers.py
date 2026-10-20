@@ -5,10 +5,20 @@ the run's Session."""
 import html as html_lib
 import re
 import urllib.parse
-from core.geo import host_of, norm_name, origin_of, web_url
+from core.geo import host_of, norm_name, origin_of, rx_escape, state_forms, web_url
 from core.text import html_to_text
 
 _STOP = {"the", "and", "of", "in", "at", "for", "a", "an", "on", "to", "de", "la", "le", "los", "las", "el"}
+# Words that name a kind of business rather than this one: a search hit sharing only these with
+# the name ("agency", "insurance", "bank") says nothing about whose site it is.
+GENERIC = {"bank", "banking", "agency", "agencies", "insurance", "insurer", "llc", "inc", "corp", "corporation",
+           "company", "companies", "group", "services", "service", "credit", "union", "office", "offices", "center",
+           "centre", "clinic", "hospital", "school", "church", "store", "shop", "restaurant", "cafe", "law", "legal",
+           "firm", "associates", "partners", "financial", "finance", "realty", "real", "estate", "state", "farm",
+           "national", "first", "community", "federal", "county", "city", "home", "health", "care", "medical",
+           "dental", "family", "auto", "ltd", "trust", "mutual", "american", "america", "usa", "new", "north",
+           "south", "east", "west", "central", "united", "general", "global", "international", "solutions",
+           "systems", "consulting", "management", "enterprises", "industries", "foundation", "association"}
 
 # ---------------------------------------------------------------- websites
 # Directory and social sites a web search returns instead of the business's own: registrable
@@ -33,24 +43,61 @@ def name_tokens(name):
     return [t for t in norm_name(name).split() if len(t) >= 3 and t not in _STOP]
 
 
-def resembles(name, url, title=""):
-    """Does the result look like the business's own page: over half of the name's tokens appear
-    in the host (run together: firstcommunitybank.com) or in the page title."""
+def key_tokens(name):
+    """The words that identify this business: its distinctive ones ("valdez", "aragon"), or,
+    for a name made of generic words only ("First Community Bank"), all of them."""
     toks = name_tokens(name)
-    if not toks:
+    return [t for t in toks if t not in GENERIC] or toks
+
+
+def registrable_domain(url):
+    """'riograndecu' for https://www.riograndecu.org/x: the label the business registered
+    (the one before the public suffix; co.uk-style suffixes are skipped), letters and digits only."""
+    labels = (host_of(url) or "").split(".")
+    if len(labels) < 2:
+        return ""
+    label = labels[-3] if len(labels) >= 3 and labels[-2] in ("co", "com", "org", "net", "gov", "edu", "ac") else labels[-2]
+    return re.sub(r"[^a-z0-9]", "", label)
+
+
+def domain_matches(name, url):
+    """Rule 1: the registered domain carries a distinctive word of the name (riograndecu.org
+    for Rio Grande Credit Union), or the whole name when it has no distinctive word
+    (firstcommunitybank.com); weloans.com for a State Farm agent carries nothing."""
+    dom = registrable_domain(url)
+    if not dom:
         return False
-    blob = re.sub(r"[^a-z0-9]", "", host_of(url) or "")
-    need = (len(toks) + 2) // 2 if len(toks) > 1 else 1          # more than half
-    in_host = sum(1 for t in toks if t in blob)
-    in_title = sum(1 for t in toks if t in set(norm_name(title).split()))
-    return in_host >= need or in_title >= need
+    distinct = [t for t in name_tokens(name) if t not in GENERIC]
+    if distinct:
+        return any(t in dom for t in distinct)
+    toks = name_tokens(name)
+    return bool(toks) and all(t in dom for t in toks)
 
 
-def pick_website(name, results):
-    """The first search result that is not a directory and resembles the name, or None."""
-    for r in results or []:
-        u = web_url(r.get("url"))
-        if u and not is_aggregator(u) and resembles(name, u, r.get("title") or ""):
+def mentions_place(text, city=None, state=None):
+    """Does a result's title or snippet name the place's city or state (either form)."""
+    t = text or ""
+    if city and re.search(r"\b" + rx_escape(city.strip()) + r"\b", t, re.I):
+        return True
+    abbr, sname = state_forms(state) if state else (None, None)
+    return bool((sname and re.search(r"\b" + rx_escape(sname) + r"\b", t, re.I))
+                or (abbr and re.search(r"\b" + abbr + r"\b", t)))
+
+
+def pick_website(name, results, city=None, state=None):
+    """The business's own site among search results, or None. Never a directory host. Rule 1
+    (preferred): the domain is built from the name (domain_matches). Rule 2: the title or
+    snippet names the place's city or state and carries a distinctive word of the name (a
+    local listing on a site named otherwise)."""
+    hits = [(web_url(r.get("url")), f"{r.get('title') or ''} {r.get('snippet') or ''}") for r in results or []]
+    hits = [(u, text) for u, text in hits if u and not is_aggregator(u)]
+    for u, _ in hits:
+        if domain_matches(name, u):
+            return u
+    keys = key_tokens(name)
+    for u, text in hits:
+        words = set(norm_name(text).split())
+        if mentions_place(text, city, state) and any(k in words for k in keys):
             return u
     return None
 

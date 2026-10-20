@@ -52,24 +52,52 @@ def check_names_and_dedup():
 def check_websites():
     assert careers.is_aggregator("https://www.yelp.com/biz/x") and careers.is_aggregator("https://m.facebook.com/x")
     assert careers.is_aggregator("https://yelp.ca/x") and careers.is_aggregator("https://www.bbb.org/x")
-    assert not careers.is_aggregator("https://firstcommunitybank.example.com/")
+    assert not careers.is_aggregator("https://firstcommunitybank.com/")
     assert not careers.is_aggregator("https://yelp.example.com/") and not careers.is_aggregator("https://notyelp.com/")
     assert not careers.is_aggregator("https://bbb.example.org/")       # a label is not a domain
     assert geo.web_url("https://Acme.example.com/jobs?x=1#top") == "https://Acme.example.com/jobs?x=1"
     assert geo.web_url(" http://a.example.com ") == "http://a.example.com"
     for bad in ("javascript:alert(1)", "mailto:hr@acme.example.com", "www.acme.example.com", "/careers", "ftp://x.example.com/", "", None, "https://"):
         assert geo.web_url(bad) is None, bad
-    assert careers.resembles("First Community Bank", "https://www.firstcommunitybank.example.com/", "")
-    assert careers.resembles("First Community Bank", "https://fcb.example.com/", "First Community Bank | Home")
-    assert not careers.resembles("First Community Bank", "https://fcb.example.com/", "Some other bank")
-    assert careers.resembles("Walmart", "https://walmart.com/store/123", "")
+    assert careers.registrable_domain("https://www.riograndecu.org/careers") == "riograndecu"
+    assert careers.registrable_domain("https://jobs.first-community.co.uk/") == "firstcommunity" and careers.registrable_domain("http://localhost/") == ""
+    assert careers.key_tokens("State Farm - Monica Valdez") == ["monica", "valdez"] and careers.key_tokens("The Aragon Agency") == ["aragon"]
+    assert careers.key_tokens("First Community Bank") == ["first", "community", "bank"]       # all generic: the whole name counts
+    # Rule 1: the domain is built from the name.
+    assert careers.domain_matches("Rio Grande Credit Union", "https://www.riograndecu.org/")
+    assert careers.domain_matches("First Community Bank", "https://www.firstcommunitybank.com/")
+    assert careers.domain_matches("Walmart", "https://walmart.com/store/123")
+    assert not careers.domain_matches("First Community Bank", "https://fcb.example.com/")
+    assert not careers.domain_matches("State Farm - Monica Valdez", "https://weloans.com/store/monica-valdez-state-farm-insurance-agent-2bdfbef9")
+    assert not careers.domain_matches("The Aragon Agency", "https://www.enqa.eu/membership-database/acpua-aragon-agency-for-quality-assurance")
+    assert not careers.domain_matches("Albuquerque Insurance Agency", "https://www.agency.example.com/")   # generic words only, not all present
+    # Rule 2: the place named, with a distinctive word.
+    assert careers.mentions_place("Monica Valdez - State Farm agent in Albuquerque, NM", "Albuquerque", "New Mexico")
+    assert careers.mentions_place("Serving all of New Mexico", "Santa Fe", "NM") and careers.mentions_place("Taos, NM office", None, "New Mexico")
+    assert not careers.mentions_place("Monica Valdez - State Farm Insurance Agent", "Albuquerque", "NM")
+    assert not careers.mentions_place("the nm value", None, "NM")                                        # the abbreviation is a word, upper-case
+    # The two false positives from the first real run return None; a right answer is found.
+    valdez = [{"url": "https://weloans.com/store/monica-valdez-state-farm-insurance-agent-2bdfbef9",
+               "title": "Monica Valdez - State Farm Insurance Agent | WeLoans", "snippet": "Compare loans and insurance agents."},
+              {"url": "https://www.statefarm.com/agent/us/nm/albuquerque/monica-valdez-x1", "title": "Monica Valdez - State Farm Insurance Agent in Albuquerque, NM"}]
+    assert careers.pick_website("State Farm - Monica Valdez", valdez[:1], "Albuquerque", "NM") is None
+    assert careers.pick_website("State Farm - Monica Valdez", valdez, "Albuquerque", "NM") == valdez[1]["url"]   # rule 2
+    aragon = [{"url": "https://www.enqa.eu/membership-database/acpua-aragon-agency-for-quality-assurance-and-accreditation-acpua/",
+               "title": "ACPUA - Aragon Agency for Quality Assurance and Accreditation | ENQA", "snippet": "Member since 2012."}]
+    assert careers.pick_website("The Aragon Agency", aragon, "Albuquerque", "NM") is None
+    rgcu = [{"url": "https://www.yelp.com/biz/rio-grande-credit-union-albuquerque", "title": "Rio Grande Credit Union - Albuquerque, NM - Yelp"},
+            {"url": "https://www.nerdwallet.example.com/best-credit-unions", "title": "Best credit unions in New Mexico", "snippet": "Rio Grande Credit Union and others"},
+            {"url": "https://www.riograndecu.org/", "title": "Home"}]
+    assert careers.pick_website("Rio Grande Credit Union", rgcu, "Albuquerque", "NM") == "https://www.riograndecu.org/"   # rule 1 beats an earlier rule-2 hit
+    assert careers.pick_website("Rio Grande Credit Union", rgcu[:2], "Albuquerque", "NM") == rgcu[1]["url"]             # rule 2 alone
     results = [{"url": "https://www.yelp.com/biz/first-community-bank", "title": "First Community Bank - Yelp"},
                {"url": "https://www.randomnews.example.com/story", "title": "A story"},
                {"url": "javascript:alert(1)", "title": "First Community Bank"},
-               {"url": "https://www.firstcommunitybank.example.com/#top", "title": "Home"},
+               {"url": "https://www.firstcommunitybank.com/#top", "title": "Home"},
                {"url": "https://other.example.com/", "title": "First Community Bank"}]
-    assert careers.pick_website("First Community Bank", results) == "https://www.firstcommunitybank.example.com/"
+    assert careers.pick_website("First Community Bank", results) == "https://www.firstcommunitybank.com/"
     assert careers.pick_website("First Community Bank", results[:3]) is None
+    assert careers.pick_website("First Community Bank", results[:3], "Albuquerque", "NM") is None       # no place named anywhere
 
 
 SAMPLE = """<html><head><title>Acme</title></head><body><nav>
@@ -255,7 +283,7 @@ PLACES = [
     {"name": "Acme Branch", "lat": 35.07, "lon": -106.0, "website": "https://acme-branch.example.com/", "category": "retail", "finder_id": "node/10"},  # shares Acme's careers page
 ]
 SEARCH = {'"First Community Bank" Albuquerque NM': [{"url": "https://www.yelp.com/biz/fcb", "title": "First Community Bank - Yelp"},
-                                                   {"url": "https://bank.example.com/", "title": "First Community Bank - Home"}],
+                                                   {"url": "https://bank.example.com/", "title": "First Community Bank - Albuquerque, NM"}],
           '"Nowhere Ltd" Albuquerque': [{"url": "https://www.yellowpages.com/x", "title": "Nowhere Ltd"}]}
 
 
@@ -337,7 +365,7 @@ def check_pipeline():
         assert any("shared by 2 places" in ln for ln in lines), lines[-12:]
         assert len(acme) == 2 and {r["categories"] for r in acme} == {'["finance"]', '["finance", "retail"]'}, acme
         assert acme[0]["finder_ids"] == '{"fake": "node/1"}', acme[0]["finder_ids"]      # the first sighting's id stays
-        assert rows["First Community Bank"]["website"] == "https://bank.example.com/"       # by title, not host
+        assert rows["First Community Bank"]["website"] == "https://bank.example.com/"       # rule 2: the title names the city
         assert rows["Nowhere Ltd"]["careers_kind"] == "no_site" and rows["Shop"]["careers_kind"] == "none"
         assert rows["Down Inc"]["careers_kind"] == "unresolved" and rows["Down Inc"]["careers_url"] is None
         assert rows["Bad Co"]["careers_kind"] == "unresolved" and rows["Bad Co"]["careers_url"] == "https://bad.example.com/careers"

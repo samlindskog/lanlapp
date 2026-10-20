@@ -84,7 +84,7 @@ def geo_scan(conn, params, session, log=print, progress=None, check=None, run_id
             check()
             q = " ".join(x for x in (f'"{row["name"]}"', row.get("city"), row.get("state")) if x)
             try:
-                site = pick_website(row["name"], websearch.search(q))
+                site = pick_website(row["name"], websearch.search(q), city=row.get("city"), state=row.get("state"))
             except Exception as e:  # noqa: BLE001
                 log(f"  ! web search failed for {row['name']}: {e}")
         if site:
