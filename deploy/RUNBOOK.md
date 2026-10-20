@@ -46,12 +46,16 @@ Check in the output:
 
 Rollback: nothing to roll back.
 
-## 2. Hermes teardown on the desktop and hub
+## 2. Hermes teardown on the desktop (the hub half comes later)
 
-Owned by the other project (sldesktop_nous). Finish it first: it removes the Hermes nftables table on the hub
-and whatever Hermes left on the desktop (ports 9119/19999/8183, its nginx bits). Re-run step 1 afterwards and
-confirm the 2222 DNAT still exists (if Hermes owned it, `hub-bootstrap.sh` will carry it instead: the plan
-prints "jobboard_hub will carry it").
+Owned by the other project (sldesktop_nous, `docs/TEARDOWN.md`). Run only its DESKTOP half now, over the
+LAN alias: it removes the Hermes stack, returns Docker to its defaults, deletes the storage image and the
+Hermes firewall table, and reverts `wg0.conf` (keeping `PersistentKeepalive = 25`). Reboot, confirm
+`ssh sldesktop true` through the 2222 forward, then re-run the desktop part of step 1.
+
+Do NOT run its hub half yet. The hub's Hermes table is what currently restricts 443 to Cloudflare and
+forwards laptop traffic; the jobboard hub bootstrap (step 5) installs its replacement first, and the Hermes
+hub teardown refuses to run until that replacement is live. It runs in step 7, after `retire-app`.
 
 ## 3. Desktop bootstrap (no public traffic yet)
 
@@ -220,6 +224,9 @@ Removes the stack (volume `jobboard_pgdata` kept: `docker volume rm jobboard_pgd
 the old `table inet jobboard` (the hub's previous input-drop policy; read the "input filtering now" lines it
 prints), the nginx site, `/opt/jobboard`, the `deploy` user and its sudoers rule. `/etc/sudoers.d/jobboard-bootstrap`
 stays (remove with the old bootstrap's `remove-sudo-rule` mode once the hub needs nothing more).
+
+Then the HUB half of the Hermes teardown (sldesktop_nous `docs/TEARDOWN.md`): it checks that `jobboard_hub` and
+its Cloudflare timer are live before removing the Hermes table, nginx files and scripts.
 
 Rollback: no automatic one; the backups under `/root/jobboard-hub-backup/<ts>/` hold the nftables config, and
 the pgdata volume holds the data as of 6h. Re-running the old bootstrap from `master` before this change
