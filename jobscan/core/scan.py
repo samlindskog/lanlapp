@@ -120,17 +120,20 @@ def scan_board(conn, board, session, days=7, all_=False, limit=None, refetch=Fal
             "known": updated, "carried": carried, "need_judgment": need_judgment, "embedded": embedded}
 
 def scan_boards(conn, boards, days=7, all_=False, limit=None, refetch=False, max_pages=100,
-                log=print, embed=True, progress=None, check=None, run_id=None):
+                log=print, embed=True, progress=None, check=None, run_id=None, session=None):
     """Scan several boards in one run: one browser.Session (one Chrome, one proxy escalation
     state, one log) for the whole run, torn down at the end. A board that fails is logged and
     skipped so the others still run. progress: a Progress to report into; check: raises
     browser.Cancelled to stop the run (checked before every fetch), which propagates; run_id:
-    the runs row this is, stamped on new jobs (None for the CLI and transient callers)."""
+    the runs row this is, stamped on new jobs (None for the CLI and transient callers).
+    session: a caller that already owns the run's Session (a geographic scan) hands it down;
+    two Sessions cannot be up at once (one relay port, one browser slot)."""
     p = progress or Progress()
     p.update(boards_total=len(boards), boards_done=0, boards_failed=0, cards_total=0,
              fetched=0, new=0, refetched=0, known=0, skipped=0, carried=0, embedded=0)
     results, failed = [], []
-    with browser.Session(log, check=check) as s:
+
+    def walk(s):
         for i, b in enumerate(boards):
             p.update(phase="listing", board=b["name"], platform=load_source(b["adapter"]).DISPLAY_NAME,
                      board_index=i + 1, cards=0, job_index=0, job_title=None)
@@ -144,6 +147,11 @@ def scan_boards(conn, boards, days=7, all_=False, limit=None, refetch=False, max
                 failed.append({"board": b["name"], "board_id": b["id"], "error": f"{e.__class__.__name__}: {e}"})
                 log(f"! {b['name']} failed: {e.__class__.__name__}: {e}")
                 p.add(boards_failed=1)
+    if session is not None:                  # the caller's Session (a geographic scan owns the run's)
+        walk(session)
+    else:
+        with browser.Session(log, check=check) as s:
+            walk(s)
     p.update(phase="done", board=None, job_title=None)
     need = [j for r in results for j in r["need_judgment"]]
     tot = {k: sum(r[k] for r in results) for k in ("cards", "new", "known", "carried", "embedded")}

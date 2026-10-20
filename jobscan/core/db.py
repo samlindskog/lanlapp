@@ -30,6 +30,9 @@ CREATE TABLE IF NOT EXISTS boards (
     enabled INTEGER NOT NULL DEFAULT 1,
     added_at TEXT
 );
+-- Where the board came from: 'manual' (registered by URL) or 'geo' (a careers page a
+-- geographic scan found; the place it belongs to is in places.board_id).
+ALTER TABLE boards ADD COLUMN IF NOT EXISTS origin TEXT NOT NULL DEFAULT 'manual';
 CREATE TABLE IF NOT EXISTS jobs (
     id SERIAL PRIMARY KEY,
     source TEXT NOT NULL,
@@ -116,6 +119,36 @@ CREATE INDEX IF NOT EXISTS resumes_job ON resumes(job_id);
 DELETE FROM resumes r USING resumes n WHERE r.job_id = n.job_id AND r.filename = n.filename AND r.id < n.id;
 ALTER TABLE resumes DROP CONSTRAINT IF EXISTS resumes_job_id_filename_sha256_key;
 CREATE UNIQUE INDEX IF NOT EXISTS resumes_job_file ON resumes(job_id, filename);
+-- Businesses a geographic scan discovered (core/geo.py): one row per place, deduplicated by
+-- normalised name within 150 m or by website host. careers_kind records how far resolution got:
+-- 'adapter:<name>' (a board exists), 'none' (site fetched, no careers page), 'no_site' (no
+-- website found), 'unresolved' (fetch or registration failed; retried next run).
+CREATE TABLE IF NOT EXISTS places (
+    id SERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    norm_name TEXT NOT NULL,
+    lat DOUBLE PRECISION,
+    lon DOUBLE PRECISION,
+    address TEXT,
+    city TEXT,
+    state TEXT,
+    phone TEXT,
+    website TEXT,
+    careers_url TEXT,
+    careers_kind TEXT,
+    status TEXT NOT NULL DEFAULT 'active',  -- active | ignored (skipped by later runs)
+    finder_ids TEXT,                        -- JSON {finder: id in that source}
+    categories TEXT,                        -- JSON [registry keys], the union over runs
+    careers_text TEXT,
+    last_checked TEXT,
+    board_id INTEGER REFERENCES boards(id) ON DELETE SET NULL,
+    first_run_id INTEGER,
+    last_run_id INTEGER,
+    first_seen TEXT,
+    last_seen TEXT
+);
+CREATE INDEX IF NOT EXISTS places_norm_name ON places(norm_name);
+CREATE INDEX IF NOT EXISTS places_board ON places(board_id);
 CREATE TABLE IF NOT EXISTS embeddings (
     job_id INTEGER PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
     model TEXT NOT NULL,

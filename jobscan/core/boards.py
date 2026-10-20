@@ -17,10 +17,12 @@ def _board_row(r):
     b["enabled"] = bool(b["enabled"])
     return b
 
-def list_boards(conn, adapter=None, enabled_only=False):
+def list_boards(conn, adapter=None, enabled_only=False, origin=None):
     where, params = ["TRUE"], []
     if adapter:
         where.append("adapter=%s"); params.append(adapter)
+    if origin:
+        where.append("origin=%s"); params.append(origin)
     if enabled_only:
         where.append("enabled=1")
     return [_board_row(r) for r in conn.execute(
@@ -47,13 +49,17 @@ def fallback_board(adapter, url):
     return {"key": f"{adapter}:{key}", "name": None, "url": url, "params": {}}
 
 def add_board(conn, url, name=None, include=None, exclude=None, adapter=None, params=None, session=None,
-              fallback_adapter=None):
+              fallback_adapter=None, origin="manual"):
     """Register a job board by URL. The adapter is detected (URL pattern, then a page probe);
     an already-registered board (same key) is returned unchanged except for the fields given.
     include/exclude: regexes on posting titles applied at scan time (None = no filter).
     session: the caller's browser.Session (one per add_boards request); opened here if absent.
     fallback_adapter: the adapter a URL nothing recognises goes to (the generic firecrawl one when
-    a Firecrawl is configured); forcing adapter= to it skips detection, which could never pick it."""
+    a Firecrawl is configured); forcing adapter= to it skips detection, which could never pick it.
+    origin: 'manual' (registered by URL) or 'geo' (a careers page a geographic scan found); a
+    board that already exists keeps its origin."""
+    if origin not in ("manual", "geo"):
+        raise ValueError(f"origin must be manual or geo, not {origin!r}")
     import sources as S
     s, owned = _session(session)
     try:
@@ -84,9 +90,9 @@ def add_board(conn, url, name=None, include=None, exclude=None, adapter=None, pa
                      (name if name != board["key"] else row["name"], json.dumps(p), row["id"]))
         conn.commit()
         return get_board(conn, row["id"])
-    r = conn.execute("""INSERT INTO boards (adapter, key, name, url, params, enabled, added_at)
-        VALUES (%s,%s,%s,%s,%s,1,%s) RETURNING *""",
-                     (adapter_name, board["key"], name, board.get("url") or url, json.dumps(p), now())).fetchone()
+    r = conn.execute("""INSERT INTO boards (adapter, key, name, url, params, enabled, added_at, origin)
+        VALUES (%s,%s,%s,%s,%s,1,%s,%s) RETURNING *""",
+                     (adapter_name, board["key"], name, board.get("url") or url, json.dumps(p), now(), origin)).fetchone()
     conn.commit()
     return _board_row(r)
 
