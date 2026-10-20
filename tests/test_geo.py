@@ -248,6 +248,10 @@ def check_pipeline():
         progress.update(phase="done", boards_total=len(boards))
         return {"cards": 10, "new": 4, "known": 6, "carried": 0, "embedded": 0, "boards": [], "failed": [], "need_judgment": []}
 
+    import inspect
+    from core import boards as B                      # the stub below mirrors the real signature; keep them in step
+    assert {"fallback_adapter", "origin", "session", "name"} <= set(inspect.signature(B.add_board).parameters)
+    assert "session" in inspect.signature(geo.scan_boards).parameters
     saved = (finders.names, finders.load, geo.add_board, geo.scan_boards, geo.websearch.configured, geo.websearch.search)
     finders.names = lambda: ["fake", "nope"]
     finders.load = lambda n: {"fake": FakeFinder, "nope": Unconfigured}[n]
