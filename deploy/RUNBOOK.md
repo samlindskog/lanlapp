@@ -268,10 +268,13 @@ stack by hand once: `ssh -t sldesktoplocal 'cd /opt/jobboard && sudo docker comp
 The crawl stack picks up its `dns:` lines when the full run brings it up (`compose up -d` recreates the three
 changed services).
 
-The egress mode backs up `wg0.conf`, edits it (PrivateKey never printed), installs the policy, restarts
-`wg-quick@wg0`, waits up to 20 s for the hub to answer over wg0 (else it restores the backup, restarts again
-and exits 1), prints `jobboard-egress verify`, the host's default route (still the LAN) and the exit address
-seen from the app container (must be 72.14.178.40).
+The egress mode backs up `wg0.conf`, edits it (PrivateKey never printed), installs the policy (the unit is
+ordered before `docker.service`, and a docker drop-in waits for it, so containers restored at boot never
+start before the prohibit rule exists), restarts `wg-quick@wg0`, waits up to 20 s for the hub to answer over
+wg0 (else it restores the backup, restarts again and exits 1), checks that `jobboard_default` and `crawl`
+really lie in 172.31.0.0/23 (if compose left the app on an old dynamic subnet it recreates the stack once
+and re-checks; still outside = abort, rules left in place), then prints `jobboard-egress verify`, the host's
+default route (still the LAN) and the exit address seen from the app container (must be 72.14.178.40).
 
 Verify from the laptop:
 

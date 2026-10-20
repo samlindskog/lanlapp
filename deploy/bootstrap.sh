@@ -58,6 +58,7 @@ EGRESS_SYSCTL=/etc/sysctl.d/90-jobboard-egress.conf
 WG_CONF=/etc/wireguard/$WG_IF.conf
 WG_ORIG=/root/jobboard-bootstrap-backup/$WG_IF.conf.pre-egress      # the config before egress was ever applied; egress-off restores it
 WG_DROPIN=/etc/systemd/system/wg-quick@$WG_IF.service.d/jobboard-egress.conf
+DOCKER_DROPIN=/etc/systemd/system/docker.service.d/jobboard-egress.conf   # docker waits for the rules: no LAN leak at boot
 # A staged `deploy-ref` file overrides the ref (one line, e.g. origin/next before cutover). Delete it once the
 # branch has merged, or a re-run of this script for an nginx/crawl change would reset the checkout to it.
 if [ -f "$HERE/deploy-ref" ]; then
@@ -91,6 +92,20 @@ exit_ip_check() {   # what the internet sees as the containers' address; through
   fi
   if [ "$seen" = "$HUB_PUBLIC_IP" ]; then echo "exit address from a container: $seen = the hub. Egress works."
   else echo "WARNING: exit address from a container: '${seen:-<no answer>}' (expected $HUB_PUBLIC_IP). Check: $EGRESS_BIN status; ip route show table 100; wg show"; return 1; fi
+}
+container_nets_ok() {   # print the subnets of our two networks; return 1 if any lies outside CONTAINER_NETS (or is missing)
+  local rc=0 net subs
+  for net in jobboard_default crawl; do
+    subs=$(docker network inspect -f '{{range .IPAM.Config}}{{.Subnet}} {{end}}' "$net" 2>/dev/null || true)
+    [ -n "$subs" ] || { echo "  $net: no such network"; rc=1; continue; }
+    # shellcheck disable=SC2086  # subs is a word list of CIDRs
+    if python3 -c 'import ipaddress,sys; o=ipaddress.ip_network(sys.argv[1]); sys.exit(0 if all(ipaddress.ip_network(s).subnet_of(o) for s in sys.argv[2:]) else 1)' "$CONTAINER_NETS" $subs; then
+      echo "  $net: $subs(inside $CONTAINER_NETS)"
+    else
+      echo "  $net: ${subs}OUTSIDE $CONTAINER_NETS: its containers would NOT match the egress rules"; rc=1
+    fi
+  done
+  return $rc
 }
 wait_app() {
   for _ in $(seq 1 40); do
@@ -215,8 +230,8 @@ if [ -f "$HERE/egress-off" ]; then
   log "egress-off: containers back on the host's LAN route"
   systemctl disable --now "$EGRESS_UNIT" 2>/dev/null || true          # ExecStop removes the ip rules
   [ -x "$EGRESS_BIN" ] && { "$EGRESS_BIN" remove || true; }
-  rm -f "/etc/systemd/system/$EGRESS_UNIT" "$WG_DROPIN" "$EGRESS_BIN" "$EGRESS_SYSCTL"
-  systemctl daemon-reload
+  rm -f "/etc/systemd/system/$EGRESS_UNIT" "$WG_DROPIN" "$DOCKER_DROPIN" "$EGRESS_BIN" "$EGRESS_SYSCTL"
+  systemctl daemon-reload                                               # docker no longer waits for the unit
   sysctl -q --system >/dev/null 2>&1 || true                           # rp_filter back to what the system's own files say
   if [ -f "$WG_ORIG" ]; then
     install -m 600 -o root -g root "$WG_ORIG" "$WG_CONF" && rm -f "$WG_ORIG"
@@ -303,10 +318,19 @@ net.ipv4.conf.all.rp_filter = 2
 net.ipv4.conf.default.rp_filter = 2
 -net.ipv4.conf.$WG_IF.rp_filter = 2
 EOF
-  install -d "$(dirname "$WG_DROPIN")"
+  install -d "$(dirname "$WG_DROPIN")" "$(dirname "$DOCKER_DROPIN")"
   cat > "$WG_DROPIN" <<EOF
 # jobboard egress (deploy/bootstrap.sh): the policy rules go with the tunnel
 [Unit]
+Wants=$EGRESS_UNIT
+EOF
+  # dockerd restores the restart:unless-stopped containers as soon as it starts; the prohibit rule must be
+  # there first, or a reboot leaks container traffic via the LAN until the unit runs. The unit itself is
+  # Before=docker.service; this drop-in makes docker pull it in even if the unit were enabled late.
+  cat > "$DOCKER_DROPIN" <<EOF
+# jobboard egress (deploy/bootstrap.sh): containers must not start before the egress rules exist
+[Unit]
+After=$EGRESS_UNIT
 Wants=$EGRESS_UNIT
 EOF
   systemctl daemon-reload
@@ -330,6 +354,14 @@ EOF
   "$EGRESS_BIN" verify
   wg show "$WG_IF" 2>/dev/null | grep -E 'allowed ips|persistent keepalive|latest handshake' | sed 's/^/  /' || true
   echo "host default route (must stay the LAN): $(ip -4 route show default | head -1)"
+  # The rules only match $CONTAINER_NETS: a network compose left on an old dynamic subnet would bypass them.
+  log "container networks must lie in $CONTAINER_NETS"
+  if ! container_nets_ok; then
+    echo "recreating the app stack so compose applies the fixed subnet (compose down, then the deploy helper; crawl is external and kept)"
+    C down --remove-orphans || true
+    /usr/local/sbin/jobboard-compose-up
+    container_nets_ok || { echo "ABORT: a network is still outside $CONTAINER_NETS; its containers are not covered. Rules left in place. Fix it (crawl: docker compose -p crawl down; docker network rm crawl; re-run the full bootstrap) and re-run egress."; exit 1; }
+  fi
   exit_ip_check || true
   echo "kill-switch test: sudo wg-quick down $WG_IF; docker exec jobboard python3 -c '...' fails at once; sudo wg-quick up $WG_IF restores it"
   echo "undo: touch $HERE/egress-off && sudo bash $HERE/bootstrap.sh"
@@ -565,14 +597,6 @@ systemctl daemon-reload
 systemctl enable --now jobboard-wg-watch.timer >/dev/null
 echo "every 2 min: ping $HUB_IP over $WG_IF; 3 failing runs -> systemctl restart wg-quick@$WG_IF (journalctl -u jobboard-wg-watch)"
 
-log "egress via the hub (reported only; the egress / egress-off modes change it)"
-if systemctl is-active -q "$EGRESS_UNIT" 2>/dev/null; then
-  echo "active: containers in $CONTAINER_NETS leave via $HUB_IP as $HUB_PUBLIC_IP, prohibited while the tunnel is down"
-  [ -x "$EGRESS_BIN" ] && { "$EGRESS_BIN" verify || true; }
-else
-  echo "not enabled: containers use the host's LAN route. touch $HERE/egress && sudo bash $HERE/bootstrap.sh to route them via the hub"
-fi
-
 log "deploy $DEPLOY_REF$([ -f "$HERE/deploy-ref" ] && echo " (from $HERE/deploy-ref; delete it once that branch has merged)")"
 ensure_crawl_network                                 # compose.prod.yaml joins it (external)
 su - deploy -c "/usr/local/bin/jobboard-deploy $DEPLOY_REF"
@@ -585,6 +609,16 @@ if [ "$CRAWL" = 1 ]; then
   # Ships through the bootstrap, not through a push: a deploy only rebuilds the app.
   (cd "$APP" && docker compose -f deploy/crawl/compose.yaml --env-file .env -p crawl up -d --remove-orphans)
   docker compose -p crawl ps --format 'table {{.Name}}\t{{.Status}}'
+fi
+
+log "egress via the hub (reported only; the egress / egress-off modes change it)"
+if systemctl is-active -q "$EGRESS_UNIT" 2>/dev/null; then
+  echo "active: containers in $CONTAINER_NETS leave via $HUB_IP as $HUB_PUBLIC_IP, prohibited while the tunnel is down"
+  [ -x "$EGRESS_BIN" ] && { "$EGRESS_BIN" verify || true; }
+  container_nets_ok || echo "WARNING: a network above lies outside $CONTAINER_NETS, so its containers bypass the egress rules; the egress mode recreates the stack to fix the app network"
+else
+  echo "not enabled: containers use the host's LAN route. touch $HERE/egress && sudo bash $HERE/bootstrap.sh to route them via the hub"
+  container_nets_ok || echo "NOTE: a network above lies outside $CONTAINER_NETS; the egress mode will recreate the stack"
 fi
 
 log "database restore (if a dump is staged and the jobs table is empty)"
