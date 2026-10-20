@@ -11,7 +11,7 @@
   th { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); white-space: nowrap; }
   td.when, td.dur { white-space: nowrap; color: var(--muted); }
   td.id { white-space: nowrap; font-weight: 600; }
-  .k-scan { background: var(--accent); } .k-refresh { background: #6b5ca5; } .k-other { background: var(--none); }
+  .k-scan { background: var(--accent); } .k-refresh { background: #6b5ca5; } .k-geo { background: var(--yes); } .k-other { background: var(--none); }
   .st { font-weight: 600; text-transform: uppercase; font-size: 12px; letter-spacing: .04em; }
   .st.running { color: var(--maybe); } .st.done { color: var(--yes); } .st.failed, .st.cancelled { color: var(--no); }
   td.params { max-width: 34em; }
@@ -32,7 +32,7 @@
   <h1>Scans <span class="count" id="count"></span> <a href="/" class="nav">← Job board</a></h1>
   <div class="controls">
     <div class="group"><span class="label">Kind</span>
-      <select id="kind"><option value="">all</option><option value="scan">scan</option><option value="refresh">refresh</option></select></div>
+      <select id="kind"><option value="">all</option><option value="scan">scan</option><option value="geo">geo</option><option value="refresh">refresh</option></select></div>
     <div class="group"><span class="label">Status</span>
       <select id="status"><option value="">all</option><option value="running">running</option><option value="done">done</option>
         <option value="failed">failed</option><option value="cancelled">cancelled</option></select></div>
@@ -52,6 +52,7 @@
   <button id="more" hidden>Load older runs</button>
 </main>
 <script src="/common.js"></script>
+<script src="/geo.js"></script>
 <script src="/scans.js"></script>
 </body>
 </html>

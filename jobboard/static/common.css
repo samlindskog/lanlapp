@@ -87,3 +87,14 @@ dialog select { width: 100%; margin-top: 4px; }
 .tabpanel[hidden] { display: none; }
 .boardlist { max-height: 40vh; overflow: auto; border: 1px solid var(--line); padding: 4px 8px; border-radius: 6px; }
 .boardlist label.board { display: block; margin: 2px 0; }
+.boardlist label.board[hidden] { display: none; }               /* geographic boards until asked for */
+/* The Geographic tab: text fields full width, number fields short, chips for categories and finders. */
+dialog input[type=text], dialog textarea { font: inherit; padding: 4px 8px; border: 1px solid var(--line);
+    border-radius: 6px; background: var(--bg); color: var(--fg); }
+.geo { display: flex; flex-direction: column; gap: 8px; }
+.geo > label { display: flex; flex-direction: column; gap: 2px; }
+.geo input[type=text], .geo textarea { width: 100%; }
+.geo-row { display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: center; }
+.geo-row input[type=number] { width: 5em; }
+.chips { display: flex; flex-wrap: wrap; gap: 4px 6px; margin-top: 4px; }
+.chips label.chk.off { opacity: .5; cursor: default; }

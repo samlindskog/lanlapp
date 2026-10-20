@@ -69,13 +69,22 @@ window.JB = (() => {
 
   // ---------------------------------------------------------------- runs: line + panel
   // How far along a run is, 0..1, or null when it cannot be known (listing a board, no totals yet).
+  const GEO_PHASES = ["discovering", "resolving", "careers"];      // before a geo run reaches its scan
+  function scanFraction(p) {
+    const finished = (p.boards_done || 0) + (p.boards_failed || 0);
+    const within = p.phase === "listing" ? 0 : p.cards ? Math.min(1, (p.job_index || 0) / p.cards) : p.phase === "embedding" ? 1 : 0;
+    return Math.min(1, (finished + (finished < p.boards_total ? within : 0)) / p.boards_total);
+  }
   function fraction(r) {
     const p = r.progress || {};
     if (r.status !== "running") return r.status === "done" ? 1 : null;
-    if (r.kind === "scan" && p.boards_total) {
-      const finished = (p.boards_done || 0) + (p.boards_failed || 0);
-      const within = p.phase === "listing" ? 0 : p.cards ? Math.min(1, (p.job_index || 0) / p.cards) : p.phase === "embedding" ? 1 : 0;
-      return Math.min(1, (finished + (finished < p.boards_total ? within : 0)) / p.boards_total);
+    if (r.kind === "scan" && p.boards_total) return scanFraction(p);
+    if (r.kind === "geo") {                        // discovery is one call; resolving and careers walk the places; then the scan
+      const places = p.discovered || 0, at = places ? Math.min(1, (p.place_index || 0) / places) : 0;
+      if (p.phase === "resolving") return 0.3 * at;
+      if (p.phase === "careers") return 0.3 + 0.3 * at;
+      if (p.phase !== "discovering" && p.boards_total) return 0.6 + 0.4 * scanFraction(p);
+      return null;
     }
     if (r.kind === "refresh" && p.total) return Math.min(1, (p.job_index || 0) / p.total);
     return null;
@@ -83,10 +92,15 @@ window.JB = (() => {
   // "scan · Northrop Grumman 3/7 · 12/40": what the one-liner puts in front of the latest log line.
   function headline(r) {
     const p = r.progress || {};
-    if (r.kind === "scan") {
+    const scanPart = () => {
       const where = p.board ? `${p.board}${p.boards_total ? ` ${p.board_index}/${p.boards_total}` : ""}` : "";
       const jobs = p.phase === "listing" ? "listing" : p.phase === "embedding" ? "embedding" : p.cards ? `${p.job_index || 0}/${p.cards}` : "";
-      return ["scan", where, jobs].filter(Boolean).join(" · ");
+      return [where, jobs].filter(Boolean).join(" · ");
+    };
+    if (r.kind === "scan") return ["scan", scanPart()].filter(Boolean).join(" · ");
+    if (r.kind === "geo") {
+      if (GEO_PHASES.includes(p.phase)) return ["geo", p.phase, p.place_name ? `${p.place_index}/${p.discovered || "?"} · ${p.place_name}` : ""].filter(Boolean).join(" · ");
+      return ["geo", p.phase === "scanning" || p.board ? "scanning" : "", scanPart()].filter(Boolean).join(" · ");
     }
     if (r.kind === "refresh") return `refresh ${p.job_index || 0}/${p.total || "?"}`;
     return r.kind;
@@ -95,6 +109,7 @@ window.JB = (() => {
   function describeArgs(r, a) {
     a = a || parseJSON(r.args, {}) || {};
     if (r.kind === "scan") return `${(a.names || a.boards || []).length} board(s): ${(a.names || []).join(", ")} · ${a.all ? "whole board" : `last ${a.days} days`}${a.refetch ? " · re-fetching stored postings" : ""}`;
+    if (r.kind === "geo" && JB.geo) return `around ${a.label || a.center} · ${JB.geo.describeArgs(a)}`;
     if (r.kind === "refresh") return `${(a.ids || []).length} posting(s)`;
     return Object.entries(a).map(([k, v]) => `${k}: ${Array.isArray(v) ? v.length + " item(s)" : typeof v === "object" && v ? JSON.stringify(v) : v}`).join(" · ");
   }
@@ -168,13 +183,21 @@ window.JB = (() => {
       $("#rpCancel").hidden = !running; $("#rpCancel").disabled = !!r.cancel_requested;
       $("#rpArgs").textContent = describeArgs(r);
       const cell = (label, v, cls = "") => v == null || v === "" ? "" : `<div class="${cls}">${label} <b>${esc(v)}</b></div>`;
-      let cells;
-      if (r.kind === "scan") {
+      let cells = "";
+      if (r.kind === "geo") {                      // the discovery counters first, then the scan's own below
+        const walking = running && ["resolving", "careers"].includes(p.phase);
+        cells = cell("Phase", running ? p.phase : null, "span")
+          + cell("Place", walking && p.place_name ? `${p.place_index}/${p.discovered || "?"} · ${p.place_name}` : null, "span")
+          + cell("Places found", p.discovered ?? sm.discovered) + cell("New places", p.new_places ?? sm.new_places)
+          + cell("Websites found", p.resolved ?? sm.resolved) + cell("No website", p.no_site ?? sm.no_site)
+          + cell("Careers pages", p.with_careers ?? sm.with_careers) + cell("New boards", p.boards_new ?? sm.boards_new);
+      }
+      if (r.kind === "scan" || (r.kind === "geo" && (p.boards_total != null || sm.boards))) {
         const total = p.boards_total ?? (sm.boards ? sm.boards.length + (sm.failed || []).length : null);
         const finished = (p.boards_done || 0) + (p.boards_failed || 0);
         const queuedCards = running && p.cards != null && p.phase !== "listing" ? Math.max(0, p.cards - (p.job_index || 0)) : null;
         const boardsLeft = running && total != null ? Math.max(0, total - finished - (p.board ? 1 : 0)) : null;
-        cells = cell("Board", p.board ? `${p.board_index}/${total} · ${p.board}${p.platform ? ` (${p.platform})` : ""}` : total != null ? `${finished || (sm.boards || []).length}/${total} done` : null, "span")
+        cells += cell("Board", p.board ? `${p.board_index}/${total} · ${p.board}${p.platform ? ` (${p.platform})` : ""}` : total != null ? `${finished || (sm.boards || []).length}/${total} done` : null, "span")
           + cell("Posting", p.job_title ? `${p.job_index}/${p.cards} · ${p.job_title}` : p.phase === "listing" ? "listing the board's cards…" : p.phase === "embedding" ? "embedding new text…" : null, "span")
           + cell("Cards listed", p.cards_total ?? sm.cards)
           + cell("Pages fetched", p.fetched)
@@ -187,7 +210,7 @@ window.JB = (() => {
           + cell("Queued", queuedCards != null ? `${queuedCards} card(s)${boardsLeft ? ` + ${boardsLeft} board(s)` : ""}` : null)
           + cell("Boards failed", p.boards_failed ?? (sm.failed ? sm.failed.length : null))
           + cell("Need judgment", sm.need_judgment ? sm.need_judgment.length : null);
-      } else {
+      } else if (r.kind === "refresh") {
         cells = cell("Posting", p.job_title ? `${p.job_index}/${p.total} · ${p.job_title}` : p.phase === "embedding" ? "embedding changed text…" : null, "span")
           + cell("Refreshed", p.refreshed ?? sm.refreshed) + cell("Failed", p.failed ?? sm.failed) + cell("Embedded", p.embedded ?? sm.embedded);
       }
@@ -296,19 +319,39 @@ window.JB = (() => {
     const addTab = (name, tab) => { tabs[name] = tab; };
 
     let boards = [];
+    // Boards a geographic scan registered (origin geo) can run into the hundreds; the list hides
+    // them until asked, and all/none act on what is shown.
+    const renderBoards = (panel) => {
+      const showGeo = $("#boardsGeo").checked, geo = boards.filter((b) => b.origin === "geo").length;
+      $("#boardList").innerHTML = boards.length ? boards.map((b) => {
+        const ls = b.last_scan;
+        const when = ls ? `${fmtAgo(ls.started_at)}${ls.status === "failed" ? " · failed" : ls.new != null ? ` · ${ls.new} new` : ""}` : "never scanned";
+        return `<label class="chk board" ${b.origin === "geo" && !showGeo ? "hidden" : ""}><input type="checkbox" name="board" value="${b.id}">
+          <b>${esc(b.name)}</b> <small class="muted">${esc(b.adapter)}${b.origin === "geo" ? " · geographic" : ""} · ${b.jobs} jobs · ${esc(when)}</small>
+          <a href="${esc(b.url)}" target="_blank" rel="noopener" title="${esc(b.url)}">↗</a></label>`;
+      }).join("") : `<div class="muted">No boards yet. Add one by URL below.</div>`;
+      $("#boardsGeoNote").textContent = geo ? `(${geo})` : "";
+      $("#boardsGeoWrap").hidden = !geo;
+    };
     addTab("boards", {
       label: "Boards",
       html: `<div id="boardList" class="boardlist"></div>
-        <div class="muted" style="margin:4px 0 8px"><a href="#" id="boardsAll">all</a> · <a href="#" id="boardsNone">none</a></div>
+        <div class="muted" style="margin:4px 0 8px"><a href="#" id="boardsAll">all</a> · <a href="#" id="boardsNone">none</a>
+          <label class="chk" id="boardsGeoWrap" style="margin-left:10px" hidden><input type="checkbox" id="boardsGeo"> show geographic boards <span id="boardsGeoNote"></span></label></div>
         <details id="addBoards"><summary>Add boards by URL</summary>
           <textarea id="boardUrls" rows="3" placeholder="one board URL per line (Workday, Oracle HCM, iCIMS, UKG, NEOGOV, Greenhouse, Eightfold, Yello ...)" style="width:100%"></textarea>
           <div class="muted">Optional title filters for the new boards: include <input type="text" id="boardInclude" placeholder="analyst|account|actuar" style="width:11em"> exclude <input type="text" id="boardExclude" placeholder="senior|director|manager" style="width:11em"></div>
           <button type="button" id="boardAdd">Add</button> <span id="boardAddStatus" class="muted"></span>
         </details>`,
       mount(panel) {
-        const all = (on) => panel.querySelectorAll('input[name="board"]').forEach((i) => { i.checked = on; });
+        const all = (on) => panel.querySelectorAll('label.board:not([hidden]) input[name="board"]').forEach((i) => { i.checked = on; });
         $("#boardsAll").addEventListener("click", (e) => { e.preventDefault(); all(true); });
         $("#boardsNone").addEventListener("click", (e) => { e.preventDefault(); all(false); });
+        $("#boardsGeo").addEventListener("change", () => {
+          const checked = new Set([...panel.querySelectorAll('input[name="board"]:checked')].map((i) => i.value));
+          renderBoards(panel);
+          panel.querySelectorAll('input[name="board"]').forEach((i) => { i.checked = checked.has(i.value); });
+        });
         $("#boardAdd").addEventListener("click", async () => {
           const urls = $("#boardUrls").value.split("\n").map((x) => x.trim()).filter(Boolean);
           if (!urls.length) return;
@@ -325,17 +368,12 @@ window.JB = (() => {
       },
       async load(panel) {
         boards = (await get("/api/boards")).boards;
-        $("#boardList").innerHTML = boards.length ? boards.map((b) => {
-          const ls = b.last_scan;
-          const when = ls ? `${fmtAgo(ls.started_at)}${ls.status === "failed" ? " · failed" : ls.new != null ? ` · ${ls.new} new` : ""}` : "never scanned";
-          return `<label class="chk board"><input type="checkbox" name="board" value="${b.id}">
-            <b>${esc(b.name)}</b> <small class="muted">${esc(b.adapter)} · ${b.jobs} jobs · ${esc(when)}</small>
-            <a href="${esc(b.url)}" target="_blank" rel="noopener" title="${esc(b.url)}">↗</a></label>`;
-        }).join("") : `<div class="muted">No boards yet. Add one by URL below.</div>`;
+        renderBoards(panel);
         if (opts.onBoards) opts.onBoards(boards);          // the board page refreshes its Board filter
       },
       prefill(panel, a) {
         const want = new Set((a.boards || []).map(Number));
+        if (boards.some((b) => b.origin === "geo" && want.has(b.id)) && !$("#boardsGeo").checked) { $("#boardsGeo").checked = true; renderBoards(panel); }
         panel.querySelectorAll('input[name="board"]').forEach((i) => { i.checked = want.has(Number(i.value)); });
       },
       submit(panel) {

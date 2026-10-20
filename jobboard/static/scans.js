@@ -29,14 +29,19 @@
     render();
   }
 
-  const kindBadge = (k) => `<span class="badge k-${k === "scan" || k === "refresh" ? k : "other"}">${esc(k)}</span>`;
-  // Parameters: what the run was asked to do. Scans name their boards; anything else lists its args.
+  const kindBadge = (k) => `<span class="badge k-${["scan", "refresh", "geo"].includes(k) ? k : "other"}">${esc(k)}</span>`;
+  // Parameters: what the run was asked to do. Scans name their boards; a geo run its centre
+  // (a Maps link) and search; anything else lists its args.
   function params(r) {
     const a = r.args || {};
     if (r.kind === "scan") {
       const names = a.names || (a.boards || []).map((b) => `board ${b}`);
       return `${esc(names.join(", ") || (a.source ? `every ${a.source} board` : "every enabled board"))}
         <small>${a.all ? "whole board" : `last ${a.days ?? 7} days`}${a.refetch ? " · re-fetching stored postings" : ""}${a.source ? ` · source ${esc(a.source)}` : ""}</small>`;
+    }
+    if (r.kind === "geo") {
+      const where = a.lat != null ? `<a href="${esc(JB.geo.mapsLink(a.lat, a.lon))}" target="_blank" rel="noopener" title="${esc(a.center || "")}">${esc(a.label || JB.geo.fmtCoord(a.lat, a.lon))}</a>` : esc(a.center || "?");
+      return `${where} <small>${esc(JB.geo.describeArgs(a))}</small>`;
     }
     if (r.kind === "refresh") return `${(a.ids || []).length} posting(s)`;
     return Object.entries(a).map(([k, v]) => `<small>${esc(k)}: ${esc(Array.isArray(v) ? `${v.length} item(s)` : typeof v === "object" && v ? JSON.stringify(v) : v)}</small>`).join("") || "—";
@@ -50,6 +55,11 @@
       return `${sm.cards ?? 0} cards · <b>${sm.new ?? 0} new</b> · ${sm.known ?? 0} known${failed ? ` · <span style="color:var(--no)">${failed} failed</span>` : ""}
         ${sm.need_judgment && sm.need_judgment.length ? `<small>${sm.need_judgment.length} need judgment</small>` : ""}`;
     }
+    if (r.kind === "geo" && sm.discovered != null) {
+      const failed = (sm.failed || []).length;
+      return `${esc(JB.geo.describeSummary(sm))} · <b>${sm.new ?? 0} new jobs</b>${failed ? ` · <span style="color:var(--no)">${failed} failed</span>` : ""}
+        ${sm.need_judgment && sm.need_judgment.length ? `<small>${sm.need_judgment.length} need judgment</small>` : ""}`;
+    }
     if (r.kind === "refresh" && sm.refreshed != null) return `${sm.refreshed} refreshed${sm.failed ? ` · <span style="color:var(--no)">${sm.failed} failed</span>` : ""}`;
     const scalars = Object.entries(sm).filter(([, v]) => v == null || typeof v !== "object");
     return scalars.length ? scalars.map(([k, v]) => `<small>${esc(k)}: ${esc(v)}</small>`).join("") : "—";
@@ -59,8 +69,8 @@
     return [
       running ? `<button class="x" data-act="cancel" data-id="${esc(r.id)}" ${r.cancel_requested ? "disabled" : ""}>Cancel</button>` : "",
       !running && persisted(r) && req.op ? `<button data-act="repeat" data-id="${r.id}" title="Run again with the same request">Repeat</button>` : "",
-      req.op === "scan" ? `<button data-act="edit" data-id="${esc(r.id)}" title="Open the scan dialog pre-filled from this run">Edit and run</button>` : "",
-      r.kind === "scan" && persisted(r) ? `<a class="btn" href="/?run=${r.id}" title="The jobs this scan stored first">Jobs</a>` : "",
+      ["scan", "geo_scan"].includes(req.op) ? `<button data-act="edit" data-id="${esc(r.id)}" title="Open the scan dialog pre-filled from this run">Edit and run</button>` : "",
+      ["scan", "geo"].includes(r.kind) && persisted(r) ? `<a class="btn" href="/?run=${r.id}" title="The jobs this scan stored first">Jobs</a>` : "",
       `<button data-act="log" data-id="${esc(r.id)}" class="${state.logs.has(String(r.id)) ? "on" : ""}">Log</button>`,
     ].join("");
   }
@@ -122,7 +132,12 @@
     }
     // A scan asked for by source or "every enabled board" stored no ids: the boards it resolved to
     // (args.boards) are the selection to edit; an explicit request keeps its own.
-    if (act === "edit") { scanDlg.open({ boards: (r.args || {}).boards, ...((r.request || {}).args || {}) }); return; }
+    if (act === "edit") {
+      const req = r.request || {};
+      if (req.op === "geo_scan") scanDlg.open(req.args || {}, "geo");
+      else scanDlg.open({ boards: (r.args || {}).boards, ...(req.args || {}) });
+      return;
+    }
     b.disabled = true;
     try {
       if (act === "cancel") { await post(`/api/runs/${encodeURIComponent(id)}/cancel`); }
