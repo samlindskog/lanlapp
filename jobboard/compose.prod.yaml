@@ -47,6 +47,7 @@ services:
       JOBSCAN_RELAY_PORT: "8899"            # proxy relay for the crawl stack (PROXY_SERVER=http://jobboard:8899); not published
       JOBSCAN_RELAY_PEERS: 172.31.0.0/24    # the relay accepts loopback + these CIDRs: the `crawl` network's fixed subnet
     networks: [default, crawl]
+    dns: [1.1.1.1, 9.9.9.9]                  # resolved from inside the container (so via the hub once egress is on), never the host's LAN resolver
     ports:
       - "127.0.0.1:8080:8080"              # web + API: only via nginx (10.88.0.2:443, fed by the hub's DNAT)
       - "127.0.0.1:8091:8090"              # MCP: only via nginx (10.88.0.2:8090 over WireGuard)
@@ -60,6 +61,9 @@ services:
     security_opt: [no-new-privileges:true]
 
 networks:
+  default:                                   # fixed subnet: with crawl's 172.31.0.0/24 every container of ours is in 172.31.0.0/23,
+    ipam:                                    # the range the desktop's egress policy routes via the hub (deploy/bootstrap.sh egress mode)
+      config: [{subnet: 172.31.1.0/24}]
   crawl:
     external: true                           # docker network create --subnet 172.31.0.0/24 crawl (bootstrap and compose-up.sh do it)
 

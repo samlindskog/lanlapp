@@ -130,6 +130,12 @@ gunzip -c jobscan-backup.sql.gz | docker compose -f jobboard/compose.yaml exec -
   Firecrawl, its Playwright service, queue and database, and SearXNG; no published ports) runs. Firecrawl's
   outbound traffic goes through the app's proxy relay (`JOBSCAN_RELAY_PORT` 8899, peers `JOBSCAN_RELAY_PEERS`),
   so one access policy covers Chrome and Firecrawl alike.
+- Egress: with the bootstrap's `egress` mode on, every container (app, db, crawl: 172.31.0.0/23, both networks
+  have fixed subnets) reaches the internet only through the WireGuard hub, exit address 72.14.178.40, never via the
+  desktop's home connection: policy rules (`jobboard-egress.service`, `deploy/systemd/jobboard-egress.sh`) send
+  container traffic to a table that holds only `default dev wg0` and `prohibit` it when the tunnel is down (kill
+  switch); containers resolve DNS at 1.1.1.1 / 9.9.9.9 from inside; the hub masquerades 10.88.0.2 out of eth0. The
+  host itself keeps its LAN default route (`wg0.conf`: `Table = off`). `deploy/RUNBOOK.md` "Egress via the hub".
 - nginx: `deploy/nginx/jobboard.conf` (site; placeholders for the addresses filled by the bootstrap) installed to
   sites-available, plus the snippets `deploy/nginx/jobboard-*.conf` installed to `/etc/nginx/jobboard/` and the
   certificates to `/etc/nginx/jobboard/certs/`. All installed by the bootstrap, so an nginx change needs a

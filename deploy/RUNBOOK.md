@@ -232,6 +232,74 @@ Rollback: no automatic one; the backups under `/root/jobboard-hub-backup/<ts>/` 
 the pgdata volume holds the data as of 6h. Re-running the old bootstrap from `master` before this change
 would rebuild the installation.
 
+## 8. Egress via the hub
+
+Goal: every container on the desktop (app, db, crawl stack) reaches the internet only through the hub, exit
+address 72.14.178.40, never via the home connection, and is refused (not leaked) while the tunnel is down.
+The host itself keeps its LAN default route, so `ssh sldesktoplocal` and the bootstraps keep working; run
+this step over the LAN alias, because the tunnel restarts once.
+
+How it works: both compose networks have fixed subnets (`crawl` 172.31.0.0/24; the app stack's default
+network 172.31.1.0/24, `compose.prod.yaml`), so all our containers are in 172.31.0.0/23. On the desktop,
+`jobboard-egress.service` installs four `ip rule`s for that range (bridge-to-bridge and the tunnel subnet via
+the main table; everything else via table 100, which holds only `default dev wg0` from wg-quick's `PostUp`;
+then `prohibit`, the kill switch), `wg0.conf` gets `Table = off`, the two Post lines and `AllowedIPs =
+0.0.0.0/0`, and containers resolve DNS at 1.1.1.1 / 9.9.9.9 from inside. Docker masquerades the containers
+to 10.88.0.2; the hub forwards `10.88.0.2 -> eth0` and masquerades it (table `jobboard_hub`).
+
+Order: hub first (its two rules are harmless while the desktop routes nothing through it), then the desktop.
+
+```
+# 8a. hub: re-apply the table (idempotent; adds the "desktop egress" forward accept and masquerade)
+scp deploy/hub-bootstrap.sh uscentral1:/home/sam/jobboard-bootstrap/hub-bootstrap.sh
+ssh -t uscentral1 'sudo bash /home/sam/jobboard-bootstrap/hub-bootstrap.sh --check'    # the diff shows exactly the two new lines
+ssh -t uscentral1 'sudo bash /home/sam/jobboard-bootstrap/hub-bootstrap.sh'
+ssh uscentral1 'sudo nft list table inet jobboard_hub | grep -n "desktop egress"; sysctl net.ipv4.ip_forward'
+
+# 8b. desktop: the new compose files first (fixed subnet + dns), then the egress mode
+scp deploy/bootstrap.sh sldesktoplocal:/home/sam/jobboard-bootstrap/bootstrap.sh
+ssh -t sldesktoplocal 'sudo bash /home/sam/jobboard-bootstrap/bootstrap.sh'            # full run: deploys master; compose recreates the app
+                                                                                         # network for the new ipam config, so the stack restarts once
+ssh -t sldesktoplocal 'touch /home/sam/jobboard-bootstrap/egress && sudo bash /home/sam/jobboard-bootstrap/bootstrap.sh'
+```
+
+If compose refuses to recreate the network ("needs to be recreated" without doing it), stop and start the
+stack by hand once: `ssh -t sldesktoplocal 'cd /opt/jobboard && sudo docker compose -f jobboard/compose.prod.yaml --env-file .env down && sudo /usr/local/sbin/jobboard-compose-up'`.
+The crawl stack picks up its `dns:` lines when the full run brings it up (`compose up -d` recreates the three
+changed services).
+
+The egress mode backs up `wg0.conf`, edits it (PrivateKey never printed), installs the policy (the unit is
+ordered before `docker.service`, and a docker drop-in waits for it, so containers restored at boot never
+start before the prohibit rule exists), restarts `wg-quick@wg0`, waits up to 20 s for the hub to answer over
+wg0 (else it restores the backup, restarts again and exits 1), checks that `jobboard_default` and `crawl`
+really lie in 172.31.0.0/23 (if compose left the app on an old dynamic subnet it recreates the stack once
+and re-checks; still outside = abort, rules left in place), then prints `jobboard-egress verify`, the host's
+default route (still the LAN) and the exit address seen from the app container (must be 72.14.178.40).
+
+Verify from the laptop:
+
+```
+ssh sldesktoplocal true                                                                 # LAN ssh unaffected
+ssh sldesktoplocal 'ip -4 rule show | grep -E "^(98|99|100|101):"; ip -4 route show table 100; ip -4 route show default'
+ssh sldesktoplocal 'docker exec jobboard python3 -c "import urllib.request;print(urllib.request.urlopen(\"https://api.ipify.org\",timeout=20).read().decode())"'   # 72.14.178.40
+ssh sldesktoplocal 'curl -4 -s https://api.ipify.org'                                   # the host: still the home address
+ssh sldesktoplocal 'docker run --rm --network crawl curlimages/curl -s --max-time 20 https://api.ipify.org'   # a crawl-network container: 72.14.178.40
+# kill switch: tunnel down -> containers refused at once, not leaked; up -> back
+ssh -t sldesktoplocal 'sudo wg-quick down wg0; docker exec jobboard python3 -c "import urllib.request;urllib.request.urlopen(\"https://api.ipify.org\",timeout=10)" ; sudo wg-quick up wg0'
+ssh sldesktoplocal 'sleep 3; docker exec jobboard python3 -c "import urllib.request;print(urllib.request.urlopen(\"https://api.ipify.org\",timeout=20).read().decode())"'
+```
+
+The fetch during "down" must fail immediately with a network error (`Network is unreachable`: the
+`prohibit` rule), not hang and not print the home address. The watchdog (`jobboard-wg-watch`) still restarts
+the tunnel when the hub stops answering; `wg-quick@wg0` now also wants `jobboard-egress.service`, so the
+rules are present whenever the tunnel is.
+
+Rollback: `ssh -t sldesktoplocal 'touch /home/sam/jobboard-bootstrap/egress-off && sudo bash /home/sam/jobboard-bootstrap/bootstrap.sh'`
+removes the rules, unit and sysctl, restores the pre-egress `wg0.conf` (kept at
+`/root/jobboard-bootstrap-backup/wg0.conf.pre-egress`) and restarts the tunnel; containers are back on the
+LAN route. The hub's two rules can stay (they match nothing then); the `dns:` lines and fixed subnets are
+harmless either way.
+
 ## Afterwards: routine operations on the desktop
 
 ```

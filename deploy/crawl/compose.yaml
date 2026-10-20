@@ -22,6 +22,7 @@ services:
     image: ghcr.io/firecrawl/firecrawl:2.11.560
     container_name: crawl-firecrawl-api
     command: node dist/src/harness.js --start-docker
+    dns: [1.1.1.1, 9.9.9.9]               # resolved inside the container: via the hub once egress is on, never the host's LAN resolver
     environment:
       HOST: "0.0.0.0"
       PORT: "3002"
@@ -63,6 +64,7 @@ services:
   playwright-service:
     image: ghcr.io/firecrawl/playwright-service:sha-a7a63b4bfabf
     container_name: crawl-playwright
+    dns: [1.1.1.1, 9.9.9.9]
     environment:
       PORT: "3000"
       BLOCK_MEDIA: "true"                   # no images/fonts/media: half the bandwidth, lower memory
@@ -119,6 +121,7 @@ services:
   searxng:
     image: searxng/searxng:2026.10.19-81371861f
     container_name: crawl-searxng
+    dns: [1.1.1.1, 9.9.9.9]
     environment:
       SEARXNG_SECRET: ${SEARXNG_SECRET:?SEARXNG_SECRET missing in the env file}
       SEARXNG_BASE_URL: http://searxng:8080/
