@@ -189,7 +189,8 @@ and copy the coordinates; `@lat,lng`, `?q=lat,lng` and `!3dlat!4dlng` links all 
 `core/geo.py`, plus any raw OSM tag lines and a name keyword filter), deduplicated by normalised name
 within 150 m or by website host, and kept in the `places` table across runs. A place without a website
 is looked up through the web search when `SEARXNG_URL` is set (directory hosts such as Yelp or Facebook
-are skipped; the result must resemble the name), else marked `no_site`. Each website is fetched through
+are skipped; the result's domain must be built from the name, or its title must name the place's
+city or state together with a distinctive word of the name), else marked `no_site`. Each website is fetched through
 the run's browser Session and searched for a careers page: a careers/jobs/employment link on the
 homepage, then the common paths (`/careers`, `/jobs`, ...), then a Firecrawl site map when
 `FIRECRAWL_URL` is set. Each careers page becomes an ordinary board with origin `geo` through the
