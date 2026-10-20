@@ -377,7 +377,9 @@ def geo_scan(args):
     """Start a geographic scan (a persisted run of kind 'geo'): businesses around the centre ->
     their careers pages become boards (origin geo) -> those boards are scanned. The stored
     request (what repeat_run replays) carries the centre as resolved coordinates, so a repeat
-    is deterministic and needs no geocoder; what was typed is kept as center_text for display."""
+    is deterministic and needs no geocoder; what was typed is kept as center_text for display.
+    Postings on the boards found are kept only when their location matches `location` (a regex;
+    by default built from the places' and the centre's city/state)."""
     lat, lon, label = _resolve_center(args.get("center"))
     center, center_text = f"{lat:.5f}, {lon:.5f}", (args.get("center_text") or args.get("center") or "").strip()
     radius = 10.0 if args.get("radius_km") in (None, "") else float(args["radius_km"])
@@ -401,14 +403,21 @@ def geo_scan(args):
                 "tags": _strs(args.get("tags")) or [], "finders": finders,
                 "include": J.check_regex(args.get("include"), "include"),
                 "exclude": J.check_regex(args.get("exclude"), "exclude"),
+                "location": J.check_regex(args.get("location"), "location"),
                 "max_places": max_places, "recheck_days": max(0, _int(args.get("recheck_days"), 30)),
                 "rediscover": _bool(args.get("rediscover")), "days": _int(args.get("days"), 7)}
+    # The centre's city and state feed the automatic location filter. Looked up once, after every
+    # argument is known good; the stored request carries the answer, so a repeat never asks again.
+    place = args.get("center_place") if isinstance(args.get("center_place"), dict) else None
+    if place is None:
+        place = J.geocode.reverse(lat, lon) if J.geocode.configured() else {}
+    resolved["center_place"] = place
     capacity.check()
 
     def work(conn, run):
         with J.browser.Session(run.log, check=run.check) as s:
             return J.geo_scan(conn, resolved, s, log=run.log, progress=run.progress, check=run.check, run_id=run.id)
-    rid = runs.start("geo", resolved, work, request={"op": "geo_scan", "args": {**args, "center": center, "center_text": center_text}})
+    rid = runs.start("geo", resolved, work, request={"op": "geo_scan", "args": {**args, "center": center, "center_text": center_text, "center_place": place}})
     return {"run_id": rid, "status": "running", "center": {"lat": lat, "lon": lon, "label": label}}
 
 
@@ -558,14 +567,16 @@ OPERATIONS = {
     "scan": (scan, "Start a background scan: boards = list of board ids, or source = every board of one adapter, or neither = every enabled board. New/changed postings are embedded automatically. Returns a run id to poll with run_status.",
              _S(boards={"type": "array", "items": _intt}, source=_str, days={"type": "integer", "default": 7},
                 all={"type": "boolean", "default": False}, refetch={"type": "boolean", "default": False})),
-    "geo_scan": (geo_scan, "Start a geographic scan (background run of kind 'geo'): businesses around a point are discovered from OpenStreetMap, their websites and careers pages found, each careers page registered as a board (origin geo) and scanned. center: 'lat, lng', a Google Maps link, or an address (geocoded). Returns a run id to poll with run_status; places lists what was found.",
+    "geo_scan": (geo_scan, "Start a geographic scan (background run of kind 'geo'): businesses around a point are discovered from OpenStreetMap, their websites and careers pages found, each careers page registered as a board (origin geo) and scanned for postings in the area (location filter). center: 'lat, lng', a Google Maps link, or an address (geocoded). Returns a run id to poll with run_status; places lists what was found.",
                  _S(center={"type": "string", "description": "'35.0844, -106.6504', a Google Maps URL (@lat,lng / ?q=lat,lng / !3dlat!4dlng), or an address (geocoded once; the stored request keeps the coordinates)"},
                     radius_km={"type": "number", "default": 10},
                     categories={"type": "array", "items": _str, "description": "registry keys (geo_categories); default " + ", ".join(J.DEFAULT_CATEGORIES)},
                     keywords={"type": "string", "description": "match place names (comma-separated alternatives)"},
                     tags={"type": "array", "items": _str, "description": "raw OSM tag lines, e.g. shop=bakery or [\"office\"=\"it\"]"},
                     finders={"type": "array", "items": _str, "description": "finder names; default every configured one"},
-                    include=_str, exclude=_str, max_places={"type": "integer", "default": 300},
+                    include=_str, exclude=_str,
+                    location={"type": "string", "description": "regex a posting's location must match; default: built from the places' and the centre's city/state, e.g. \\b(Albuquerque|New Mexico|NM)\\b (postings with no location, or only a count of locations, pass)"},
+                    max_places={"type": "integer", "default": 300},
                     recheck_days={"type": "integer", "default": 30, "description": "re-check a place's careers page after this many days"},
                     rediscover={"type": "boolean", "default": False, "description": "re-check every place now"},
                     days={"type": "integer", "default": 7, "description": "postings within the last N days on the boards scanned"}) | {"required": ["center"]}),

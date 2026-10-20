@@ -147,6 +147,57 @@ def _merge(a, b):
     a["finder_ids"] = {**(b.get("finder_ids") or {}), **(a.get("finder_ids") or {})}     # a's own id stays
 
 
+# ---------------------------------------------------------------- where a posting is
+US_STATES = {
+    "AL": "Alabama", "AK": "Alaska", "AZ": "Arizona", "AR": "Arkansas", "CA": "California", "CO": "Colorado",
+    "CT": "Connecticut", "DE": "Delaware", "FL": "Florida", "GA": "Georgia", "HI": "Hawaii", "ID": "Idaho",
+    "IL": "Illinois", "IN": "Indiana", "IA": "Iowa", "KS": "Kansas", "KY": "Kentucky", "LA": "Louisiana",
+    "ME": "Maine", "MD": "Maryland", "MA": "Massachusetts", "MI": "Michigan", "MN": "Minnesota", "MS": "Mississippi",
+    "MO": "Missouri", "MT": "Montana", "NE": "Nebraska", "NV": "Nevada", "NH": "New Hampshire", "NJ": "New Jersey",
+    "NM": "New Mexico", "NY": "New York", "NC": "North Carolina", "ND": "North Dakota", "OH": "Ohio", "OK": "Oklahoma",
+    "OR": "Oregon", "PA": "Pennsylvania", "RI": "Rhode Island", "SC": "South Carolina", "SD": "South Dakota",
+    "TN": "Tennessee", "TX": "Texas", "UT": "Utah", "VT": "Vermont", "VA": "Virginia", "WA": "Washington",
+    "WV": "West Virginia", "WI": "Wisconsin", "WY": "Wyoming", "DC": "District of Columbia", "PR": "Puerto Rico",
+}
+_STATE_BY_NAME = {v.lower(): k for k, v in US_STATES.items()}
+MAX_LOCATION_TERMS = 30                      # a run's places rarely span more cities; keeps the regex short
+
+
+def state_forms(text):
+    """(abbreviation, name) for a state given either way ('NM' or 'new mexico'); an unknown
+    value comes back as (None, the text) so a non-US region still matches literally."""
+    t = (text or "").strip()
+    if t.upper() in US_STATES:
+        return t.upper(), US_STATES[t.upper()]
+    if t.lower() in _STATE_BY_NAME:
+        return _STATE_BY_NAME[t.lower()], US_STATES[_STATE_BY_NAME[t.lower()]]
+    return None, t or None
+
+
+def rx_escape(s):
+    """Escape regex metacharacters only (re.escape also escapes spaces, which reads badly in logs)."""
+    return re.sub(r"([.^$*+?()\[\]{}\\|])", r"\\\1", s)
+
+
+def location_regex(cities, states):
+    """A card-location regex for an area, e.g. \\b(Albuquerque|Rio Rancho|New Mexico|NM)\\b, from
+    the cities and states of a run's places and its centre (states in both forms, duplicates
+    dropped, first MAX_LOCATION_TERMS kept). None when nothing is known."""
+    terms, seen = [], set()
+
+    def add(t):
+        if t and t.lower() not in seen and len(terms) < MAX_LOCATION_TERMS:
+            seen.add(t.lower())
+            terms.append(t)
+    for c in cities or []:
+        add((c or "").strip())
+    for s in states or []:
+        abbr, name = state_forms(s)
+        add(name)
+        add(abbr)
+    return r"\b(" + "|".join(rx_escape(t) for t in terms) + r")\b" if terms else None
+
+
 def dedup(places):
     """One entry per business: the same normalised name within DEDUP_M metres, or the same
     website host, is one place; duplicates fill the first one's blanks, categories are the union."""

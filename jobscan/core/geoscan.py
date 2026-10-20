@@ -11,7 +11,7 @@ from core import websearch
 from core.boards import get_board
 from core.careers import discover_careers, pick_website
 from core.db import now
-from core.geo import DEFAULT_CATEGORIES, dedup
+from core.geo import DEFAULT_CATEGORIES, dedup, location_regex
 from core.places import register_place_board, set_fields, upsert_place
 from core.scan import Progress, scan_boards
 
@@ -20,8 +20,9 @@ def geo_scan(conn, params, session, log=print, progress=None, check=None, run_id
     """One geographic scan: discover (finders) -> places table -> websites (web search) ->
     careers pages (session.fetch, Firecrawl map) -> boards (add_board, origin geo) -> scan_boards
     on the boards this run registered or re-checked. params: lat, lon, radius_km, categories,
-    keywords, tags, finders (None = all configured), include, exclude, max_places, recheck_days,
-    rediscover, days. progress fields: phase (discovering | resolving | careers | scanning |
+    keywords, tags, finders (None = all configured), include, exclude, location (a card-location
+    regex; None = built from the places' and the centre's city/state, center_place), max_places,
+    recheck_days, rediscover, days. progress fields: phase (discovering | resolving | careers | scanning |
     done), place_index/place_name, the counters discovered, new_places, resolved, no_site,
     with_careers, boards_new, then scan_boards' own. check() runs before every network call."""
     p, check = progress or Progress(), check or (lambda: None)
@@ -132,10 +133,16 @@ def geo_scan(conn, params, session, log=print, progress=None, check=None, run_id
         boards[b["id"]] = b
         log(f"{row['name']}: board [{b['id']}] {b['name']} ({b['adapter']})")
 
-    # 5. scan what this run touched
+    # 5. scan what this run touched, keeping only postings in the area: a business's careers page
+    # is often a nationwide board, so each card's location must match the run's location regex
+    # (given, or built from the places' and the centre's city/state).
+    cp = params.get("center_place") or {}
+    location = params.get("location") or location_regex([cp.get("city")] + [r.get("city") for r in rows],
+                                                        [cp.get("state")] + [r.get("state") for r in rows])
+    log(f"location filter: {location}" if location else "location filter: none (no city or state known for the centre or the places)")
     sel = list(boards.values())
     for b in sel:
-        b["params"] = {**b["params"], **({"include": include} if include else {}), **({"exclude": exclude} if exclude else {})}
+        b["params"] = {**b["params"], **{k: v for k, v in (("include", include), ("exclude", exclude), ("location", location)) if v}}
     p.update(phase="scanning", place_name=None)
     if sel:
         log(f"scanning {len(sel)} board(s)")
@@ -145,4 +152,4 @@ def geo_scan(conn, params, session, log=print, progress=None, check=None, run_id
         sm = {"cards": 0, "new": 0, "known": 0, "carried": 0, "embedded": 0, "boards": [], "failed": [], "need_judgment": []}
     p.update(phase="done", place_name=None, board=None, job_title=None)
     return {k: p.state.get(k, 0) for k in ("discovered", "new_places", "resolved", "no_site", "with_careers", "boards_new")} \
-        | {"boards_scanned": len(sel)} | sm
+        | {"boards_scanned": len(sel), "location": location} | sm

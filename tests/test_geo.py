@@ -113,6 +113,26 @@ def check_card_filter():
     assert loc_ok("Albuquerque, NM") and loc_ok("3 Locations") and not loc_ok("Denver, CO")
 
 
+def check_location_regex():
+    from core import geocode
+    assert J.state_forms("NM") == ("NM", "New Mexico") and J.state_forms("new mexico") == ("NM", "New Mexico")
+    assert J.state_forms("Baja California") == (None, "Baja California") and J.state_forms("") == (None, None)
+    rx = J.location_regex(["Albuquerque", "Rio Rancho", "albuquerque", None, ""], ["NM", "New Mexico", "Colorado"])
+    assert rx == r"\b(Albuquerque|Rio Rancho|New Mexico|NM|Colorado|CO)\b", rx
+    import re
+    assert re.search(rx, "Rio Rancho, NM", re.I) and re.search(rx, "Denver, Colorado", re.I) and not re.search(rx, "Nome, AK", re.I)
+    assert J.location_regex([], []) is None and J.location_regex([None], [None]) is None
+    assert J.location_regex(["St. Louis (Downtown)"], []) == r"\b(St\. Louis \(Downtown\))\b"
+    assert len(J.location_regex([f"City{i}" for i in range(80)], []).split("|")) == 30      # bounded
+    assert J.check_regex(J.location_regex(["Albuquerque", "Rio Rancho"], ["NM"]), "location")  # passes the API's own guard
+    canned = {"place_id": 1, "address": {"road": "Central Ave", "city": "Albuquerque", "county": "Bernalillo County",
+                                         "state": "New Mexico", "ISO3166-2-lvl4": "US-NM", "postcode": "87102", "country": "United States"}}
+    assert geocode.parse_reverse(canned) == {"city": "Albuquerque", "state": "New Mexico"}
+    assert geocode.parse_reverse({"address": {"town": "Los Lunas", "state": "New Mexico"}}) == {"city": "Los Lunas", "state": "New Mexico"}
+    assert geocode.parse_reverse({"address": {"county": "Valencia County"}}) == {"city": "Valencia County"}
+    assert geocode.parse_reverse({"error": "Unable to geocode"}) == {} and geocode.parse_reverse([]) == {} and geocode.parse_reverse(None) == {}
+
+
 def check_registry_and_osm():
     from finders import osm
     assert set(J.DEFAULT_CATEGORIES) <= set(J.CATEGORIES)
@@ -300,7 +320,8 @@ def check_pipeline():
         p = J.Progress(lambda st: phases.append(st.get("phase")) if phases[-1:] != [st.get("phase")] else None)
         s = FakeSession(fetch, firecrawl=firecrawl)
         params = {"lat": 35.0, "lon": -106.0, "radius_km": 5, "categories": ["finance", "retail"], "keywords": "acme",
-                  "finders": None, "include": "analyst", "max_places": 300, "recheck_days": 30, "days": 14}
+                  "finders": None, "include": "analyst", "max_places": 300, "recheck_days": 30, "days": 14,
+                  "center_place": {"city": "Rio Rancho", "state": "NM"}}
         sm = J.geo_scan(conn, params, s, log=lines.append, progress=p, check=lambda: None, run_id=42)
         assert FakeFinder.calls == [((35.0, -106.0), 5000.0, ["finance", "retail"], "acme", [])], FakeFinder.calls
         assert phases == ["discovering", "resolving", "careers", "scanning", "done"], phases
@@ -333,7 +354,11 @@ def check_pipeline():
         assert rows["First Community Bank"]["careers_kind"] == "adapter:firecrawl"   # found at the common path /jobs
         assert len(scanned) == 1 and scanned[0]["session"] is s and scanned[0]["days"] == 14 and scanned[0]["run_id"] == 42
         sb = scanned[0]["boards"]
-        assert [b["adapter"] for b in sb] == ["workday", "firecrawl", "firecrawl"] and all(b["params"] == {"include": "analyst"} for b in sb), sb
+        # The automatic location filter: the centre's city/state plus the places' (First Community
+        # Bank and Nowhere Ltd are in Albuquerque, NM), state in both forms, on every board scanned.
+        auto = r"\b(Rio Rancho|Albuquerque|New Mexico|NM)\b"
+        assert [b["adapter"] for b in sb] == ["workday", "firecrawl", "firecrawl"] and all(b["params"] == {"include": "analyst", "location": auto} for b in sb), sb
+        assert sm["location"] == auto and any(ln == f"location filter: {auto}" for ln in lines), lines[-8:]
         assert "https://shop.example.com/careers" in fetched and "https://bank.example.com/jobs" in fetched
         assert any("not configured" in ln for ln in lines) and any("discovered 9 place(s) (10 before dedup)" in ln for ln in lines), lines
         # A repeat: nothing new, resolved places are left alone, the two unresolved ones are retried.
@@ -346,12 +371,15 @@ def check_pipeline():
         assert all(r["last_run_id"] == 43 and r["first_run_id"] == 42 for r in conn.places.values())
         # rediscover: every site is fetched again and every board re-registered (then scanned).
         fetched.clear(); added.clear()
-        sm3 = J.geo_scan(conn, {**params, "rediscover": True}, s, log=lines.append, progress=p, check=lambda: None, run_id=44)
+        sm3 = J.geo_scan(conn, {**params, "rediscover": True, "location": r"\bSanta Fe\b"}, s, log=lines.append, progress=p, check=lambda: None, run_id=44)
         assert sm3["boards_new"] == 0 and sm3["boards_scanned"] == 3 and len(added) == 5 and "https://acme.example.com/" in fetched, (sm3, added)
+        assert sm3["location"] == r"\bSanta Fe\b" and all(b["params"]["location"] == r"\bSanta Fe\b" for b in scanned[-1]["boards"])   # explicit wins
+        sm4 = J.geo_scan(conn, {**params, "center_place": {}, "rediscover": True}, s, log=lines.append, progress=p, check=lambda: None, run_id=45)
+        assert sm4["location"] == r"\b(Albuquerque|New Mexico|NM)\b", sm4["location"]                 # no centre place: the places' alone
         assert conn.boards[1]["name"] == "acme.example.com"                   # a rename happens once, not every run
         # Cancel lands at the first check.
         try:
-            J.geo_scan(conn, params, s, log=lines.append, progress=p, check=lambda: (_ for _ in ()).throw(J.browser.Cancelled("stop")), run_id=45)
+            J.geo_scan(conn, params, s, log=lines.append, progress=p, check=lambda: (_ for _ in ()).throw(J.browser.Cancelled("stop")), run_id=46)
             raise AssertionError("cancel did not propagate")
         except J.browser.Cancelled:
             pass
@@ -389,6 +417,8 @@ def main():
     print("careers links: ok")
     check_card_filter()
     print("card filter: title include/exclude + location, unknown locations kept: ok")
+    check_location_regex()
+    print("location_regex + state forms + Nominatim reverse parsing: ok")
     check_registry_and_osm()
     print("category registry + Overpass query/parse: ok")
     check_pipeline()
