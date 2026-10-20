@@ -195,8 +195,14 @@ homepage, then the common paths (`/careers`, `/jobs`, ...), then a Firecrawl sit
 `FIRECRAWL_URL` is set. Each careers page becomes an ordinary board with origin `geo` through the
 normal adapter detection (an unrecognised page goes to the `firecrawl` adapter when Firecrawl is
 configured), so its jobs have one parent: job -> board -> place. The run then scans the boards it
-registered or re-checked, with the run's include/exclude title regexes applied, and is persisted
-like a scan (kind `geo`, repeatable and editable from the Scans page). A place's careers page is
+registered or re-checked with the run's include/exclude title regexes and a *location filter*: a
+business's careers page is often a nationwide board (a bank's Workday tenant lists a thousand
+postings), so only cards whose location matches a regex are fetched, by default
+`\b(<the places' cities>|<the centre's city>|<state name>|<abbreviation>)\b` from the places' addresses and
+one Nominatim reverse lookup of the centre (kept in the stored request, so a repeat is offline);
+`location` overrides it. Cards with no location, or only a count ("3 Locations"), pass: the posting
+page decides later. Any board can carry such a `location` filter (`add_boards`, `update_board`).
+The run is persisted like a scan (kind `geo`, repeatable and editable from the Scans page). A place's careers page is
 re-checked after `recheck_days` (30) or on `rediscover`; `max_places` (300) caps a run. `GET /api/places`
 lists what was found (with `careers_kind`: `adapter:<name>`, `none`, `no_site`, `unresolved`), and
 `POST /api/places/<id>` ignores a place or sets its website or careers page by hand.
