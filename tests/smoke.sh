@@ -68,6 +68,14 @@ printf '%s' "$STREAM" | head -1 | grep -q '^: connected' || { echo "FAIL: event 
 echo "ok event stream"
 expect 404 -X POST "$WEB/api/runs/999999/cancel" "${AUTH[@]}" "${JSON[@]}" -d '{}'
 
+echo "== scan history: the runs list, repeat of an unknown run, the Scans page behind the gate"
+expect 200 "$WEB/api/runs?kind=scan&limit=5" "${AUTH[@]}"
+curl -sf "$WEB/api/runs?kind=scan&limit=5" "${AUTH[@]}" | jq 'all(r["kind"]=="scan" and not isinstance(r.get("args"), str) for r in d["runs"])' | grep -qx True || { echo "FAIL: /api/runs kind filter or parsed args"; exit 1; }
+expect 404 -X POST "$WEB/api/runs/999999/repeat" "${AUTH[@]}" "${JSON[@]}" -d '{}'
+expect 302 "$WEB/scans.html"
+expect 200 -b "$CJ" "$WEB/scans.html"
+expect 200 -b "$CJ" "$WEB/common.js"
+
 echo "== job + resume round trip"
 JID=$(curl -sf "$WEB/api/jobs?q=Smoke+test+job" "${AUTH[@]}" | jq '(d["jobs"] or [{}])[0].get("id","")')
 if [ -z "$JID" ]; then

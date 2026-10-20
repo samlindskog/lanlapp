@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scans · Job Board</title>
+<link rel="stylesheet" href="/common.css">
+<style>
+  table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); white-space: nowrap; }
+  td.when, td.dur { white-space: nowrap; color: var(--muted); }
+  td.id { white-space: nowrap; font-weight: 600; }
+  .k-scan { background: var(--accent); } .k-refresh { background: #6b5ca5; } .k-other { background: var(--none); }
+  .st { font-weight: 600; text-transform: uppercase; font-size: 12px; letter-spacing: .04em; }
+  .st.running { color: var(--maybe); } .st.done { color: var(--yes); } .st.failed, .st.cancelled { color: var(--no); }
+  td.params { max-width: 34em; }
+  td.params small, td.results small { display: block; color: var(--muted); }
+  td.actions { white-space: nowrap; }
+  td.actions button, td.actions a.btn { font: inherit; font-size: 12px; padding: 2px 8px; margin: 0 2px 2px 0; display: inline-block; text-decoration: none;
+                                        border: 1px solid var(--line); border-radius: 6px; background: var(--card); color: var(--fg); }
+  td.actions button:disabled { opacity: .5; cursor: default; }
+  td.actions button.x { line-height: 16px; }
+  tr.logrow td { background: var(--card); padding: 8px 14px; }
+  tr.logrow pre { margin: 0; max-height: 50vh; }
+  #more { margin: 14px 0; }
+  @media (max-width: 800px) { th.hide-sm, td.hide-sm { display: none; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Scans <span class="count" id="count"></span> <a href="/" class="nav">← Job board</a></h1>
+  <div class="controls">
+    <div class="group"><span class="label">Kind</span>
+      <select id="kind"><option value="">all</option><option value="scan">scan</option><option value="refresh">refresh</option></select></div>
+    <div class="group"><span class="label">Status</span>
+      <select id="status"><option value="">all</option><option value="running">running</option><option value="done">done</option>
+        <option value="failed">failed</option><option value="cancelled">cancelled</option></select></div>
+    <div class="group"><span class="label">Actions</span>
+      <button id="scan" title="Pick boards and start a scan">New scan…</button></div>
+    <span class="runline" id="runline"></span>
+  </div>
+</header>
+<main>
+  <table>
+    <thead><tr>
+      <th>Run</th><th>Status</th><th>Started</th><th class="hide-sm">Duration</th>
+      <th>Parameters</th><th>Results</th><th>Actions</th>
+    </tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <button id="more" hidden>Load older runs</button>
+</main>
+<script src="/common.js"></script>
+<script src="/scans.js"></script>
+</body>
+</html>
