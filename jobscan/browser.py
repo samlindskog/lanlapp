@@ -103,11 +103,19 @@ def check_url(url):
     u = urllib.parse.urlsplit(url or "")
     if u.scheme not in ("http", "https") or not u.hostname:
         raise UnsafeURL(f"only public http(s) URLs can be fetched: {url[:120]}")
-    host = u.hostname.lower()
+    check_host(u.hostname)
+    return url
+
+
+def check_host(host):
+    """The destination half of check_url: the host must resolve to public addresses only. Also
+    applied by the ProxyRelay to every tunnel it opens, so traffic the Session never sees as a URL
+    (Firecrawl's redirects, a page's subresources) meets the same guard."""
+    host = host.lower()
     if host in ("localhost",) or host.endswith(".localhost") or host.endswith(".internal") or "." not in host:
         raise UnsafeURL(f"refusing internal host {host}")
     if host in _host_ok:                       # one lookup per host per process, not per request
-        return url
+        return host
     try:
         infos = socket.getaddrinfo(host, None)
     except socket.gaierror as e:
@@ -117,7 +125,7 @@ def check_url(url):
         if not ip.is_global or ip.is_multicast:
             raise UnsafeURL(f"refusing non-public address {ip} for {host}")
     _host_ok.add(host)
-    return url
+    return host
 
 
 _host_ok = set()
