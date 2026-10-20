@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """jobboard: shared job-research service over the jobscan Postgres database.
 
-Human API  : GET /            single-page app (static/index.html)
+Human API  : GET /            the board (static/index.html; ?run=<id> lists one scan's new jobs)
+             GET /scans.html  scan history: runs, their parameters and results; repeat, edit and run, log
 Agent API  : JSON over HTTP, documented at GET /api  (also in .claude/skills/job-search)
 
   GET  /api                       this API description
@@ -18,9 +19,10 @@ Agent API  : JSON over HTTP, documented at GET /api  (also in .claude/skills/job
   POST /api/boards/<id>/delete    remove a board (its jobs stay, detached)
   GET  /api/adapters              adapters available: name, display_name, kind (family | site)
   GET  /api/sources               adapters with their last scan (older name for /api/adapters)
-  GET  /api/jobs?verdict=yes,maybe&action=none&closing=open|closed|week&source=&board=&days=&q=&pending=1
+  GET  /api/jobs?verdict=yes,maybe&action=none&closing=open|closed|week&source=&board=&days=&q=&pending=1&run=<id>
                                   (each job carries board_id, board_name, board_platform e.g. "Workday",
-                                   board_adapter, board_source_url: the board it was scanned from)
+                                   board_adapter, board_source_url: the board it was scanned from, and
+                                   run_id: the scan run that stored it first; run= filters on that)
   GET  /api/jobs/<id>?text=0      job + documents + verdict/action history
   GET  /api/jobs/<id>/sections    primary document split into named sections (board adapter decides)
   GET  /api/jobs/<id>/section?name=<heading>[&kind=<kind>]   one section (default: the board's key section)
@@ -34,9 +36,12 @@ Agent API  : JSON over HTTP, documented at GET /api  (also in .claude/skills/job
   POST /api/scan                  {boards?:[id..], source?, days?:7, all?:false, refetch?:false} -> {run_id}
                                   (boards = ids; source = every board of one adapter; neither = all enabled)
   POST /api/refresh               {ids?:[..]} or {filter:"open-qualifying"}       -> {run_id}
-  GET  /api/runs  /api/runs/<id>  background run status, log, progress (board/posting in flight, counters) and
-                                  summary (scans persist; refresh runs are transient, ids like t3)
+  GET  /api/runs?kind=scan&status=done&limit=20&before=<id>   runs newest first (args, request, summary as
+                                  objects, no log; before = id cursor); scans persist, refresh runs are transient (ids like t3)
+  GET  /api/runs/<id>             one run: status, log, progress (board/posting in flight, counters), summary, request
   POST /api/runs/<id>/cancel      stop a running run at its next fetch -> status 'cancelled'
+  POST /api/runs/<id>/repeat      start a new run from the stored request (scan: same boards/days/all/refetch;
+                                  deleted boards dropped and reported) -> {run_id, repeated_from, dropped}
   GET  /api/logs?lines=200&level=all|warn|error&q=<substring>   server log ring buffer (requests, errors,
                                   tracebacks, run outcomes, embedding results); newest last
   GET  /api/events?since=<seq>    events after seq: {kind:"log", level, msg} server log lines and {kind:"run",
@@ -155,6 +160,7 @@ ROUTES = [
     ("GET", r"/api/runs", "runs", lambda m, qs, b: _q(qs, b), 200),
     ("GET", r"/api/runs/([^/]+)", "run_status", lambda m, qs, b: {"run_id": m[0]}, 200),
     ("POST", r"/api/runs/([^/]+)/cancel", "cancel_run", lambda m, qs, b: {"run_id": m[0]}, 200),
+    ("POST", r"/api/runs/(\d+)/repeat", "repeat_run", lambda m, qs, b: {"run_id": m[0]}, 202),
     ("GET", r"/api/events", "events", lambda m, qs, b: _q(qs, b), 200),
     ("POST", r"/api/scan", "scan", lambda m, qs, b: b, 202),
     ("POST", r"/api/boards", "add_boards", lambda m, qs, b: b, 201),

@@ -28,13 +28,14 @@ class Progress:
 
 
 def scan_board(conn, board, session, days=7, all_=False, limit=None, refetch=False,
-               max_pages=100, log=print, embed=True, progress=None):
+               max_pages=100, log=print, embed=True, progress=None, run_id=None):
     """Fetch new postings from one board through the run's Session. Incremental: known
     (board, source_id) pairs are not re-fetched unless refetch=True. A new job whose announcement
     number was already judged under another id inherits that verdict. New/changed jobs are
     embedded afterwards when an API key is available. Titles are filtered by the board's
     include/exclude regexes. progress: a Progress (board-level fields are set by the caller);
-    session.check() is run between postings so a cancel lands between fetches."""
+    session.check() is run between postings so a cancel lands between fetches. run_id: the
+    persisted run this scan belongs to, recorded on every job it stores first (jobs.run_id)."""
     p = progress or Progress()
     fetch = session.fetch
     src = load_source(board["adapter"])
@@ -82,7 +83,7 @@ def scan_board(conn, board, session, days=7, all_=False, limit=None, refetch=Fal
             job_id = conn.execute("""INSERT INTO jobs (source, source_id, board_id, title, location,
                 announcement_no, external_url, board_url, series, pay_plan, grade_low,
                 grade_high, salary, open_date, close_date, posted_age_days, first_seen,
-                last_seen) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                last_seen, run_id) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
                                   (board["adapter"], card["source_id"], board["id"], fields.get("title"),
                                    fields.get("location"), fields.get("announcement_no"),
                                    fields.get("external_url"), fields.get("board_url"),
@@ -90,7 +91,7 @@ def scan_board(conn, board, session, days=7, all_=False, limit=None, refetch=Fal
                                    fields.get("grade_low"), fields.get("grade_high"),
                                    fields.get("salary"), fields.get("open_date"),
                                    fields.get("close_date"), card.get("age_days"),
-                                   now(), now())).fetchone()["id"]
+                                   now(), now(), run_id)).fetchone()["id"]
             new += 1
             prior = None
             if fields.get("announcement_no"):
@@ -120,11 +121,12 @@ def scan_board(conn, board, session, days=7, all_=False, limit=None, refetch=Fal
             "known": updated, "carried": carried, "need_judgment": need_judgment, "embedded": embedded}
 
 def scan_boards(conn, boards, days=7, all_=False, limit=None, refetch=False, max_pages=100,
-                log=print, embed=True, progress=None, check=None):
+                log=print, embed=True, progress=None, check=None, run_id=None):
     """Scan several boards in one run: one browser.Session (one Chrome, one proxy escalation
     state, one log) for the whole run, torn down at the end. A board that fails is logged and
     skipped so the others still run. progress: a Progress to report into; check: raises
-    browser.Cancelled to stop the run (checked before every fetch), which propagates."""
+    browser.Cancelled to stop the run (checked before every fetch), which propagates; run_id:
+    the runs row this is, stamped on new jobs (None for the CLI and transient callers)."""
     p = progress or Progress()
     p.update(boards_total=len(boards), boards_done=0, boards_failed=0, cards_total=0,
              fetched=0, new=0, refetched=0, known=0, skipped=0, carried=0, embedded=0)
@@ -134,7 +136,7 @@ def scan_boards(conn, boards, days=7, all_=False, limit=None, refetch=False, max
             p.update(phase="listing", board=b["name"], platform=load_source(b["adapter"]).DISPLAY_NAME,
                      board_index=i + 1, cards=0, job_index=0, job_title=None)
             try:
-                results.append(scan_board(conn, b, s, days, all_, limit, refetch, max_pages, log, embed, p))
+                results.append(scan_board(conn, b, s, days, all_, limit, refetch, max_pages, log, embed, p, run_id))
                 p.add(boards_done=1)
             except browser.Cancelled:
                 raise

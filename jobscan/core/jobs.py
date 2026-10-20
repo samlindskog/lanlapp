@@ -135,12 +135,15 @@ LEFT JOIN embeddings e ON e.job_id = j.id
 """
 
 def list_jobs(conn, verdict=None, action=None, open_only=False, source=None, days=None,
-              pending_only=False, q=None, board=None, closing=None):
+              pending_only=False, q=None, board=None, closing=None, run=None):
     """Filters are ANDed. verdict/action: comma lists ('none' = unset). closing: 'open' (no close
-    date or not yet closed), 'closed', or 'week' (closes within 7 days); open_only is 'open'."""
+    date or not yet closed), 'closed', or 'week' (closes within 7 days); open_only is 'open'.
+    run: jobs first stored by that scan run (jobs.run_id)."""
     where, params = ["TRUE"], []
     if source:
         where.append("j.source=%s"); params.append(source)
+    if run:
+        where.append("j.run_id=%s"); params.append(int(run))
     if board:
         b = get_board(conn, board)
         where.append("j.board_id=%s"); params.append(b["id"] if b else -1)
