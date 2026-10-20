@@ -12,8 +12,9 @@ jobscan/             job posting tracker (PostgreSQL + pgvector, runs in the com
                        scan (scans + refreshes), jobs (verdicts, actions, listing, search, resumes), embed, cli
   browser.py           fetch layer: Chrome via Selenium + undetected-chromedriver, optional proxy; urllib fallback
   sources/             one adapter per hosting platform: families (workday, oracle_hcm, icims, icims_jibe,
-                       ukg, neogov, greenhouse, eightfold) and single sites (usace_yellogov); __init__.py
-                       detects the adapter for a board URL; _util.py shared helpers
+                       ukg, neogov, greenhouse, eightfold), single sites (usace_yellogov) and firecrawl (any
+                       other site, through a self-hosted Firecrawl); __init__.py detects the adapter for a
+                       board URL; _util.py shared helpers
 jobboard/            shared research service over the database
   service.py           every operation once (plain dict in, plain dict out) + the table that defines
                        the MCP tools; both front doors below are one line per operation
@@ -129,7 +130,10 @@ A *board* is one job site registered by URL (`POST /api/boards`, MCP `add_boards
 The backend picks the *adapter* for the URL: first by URL pattern, then by fetching the page and
 probing (Jibe `/api/jobs`, Eightfold's domain) or following the links it finds (a careers page that
 links to its Workday board). Family adapters cover a hosting platform for any employer; a site
-adapter (USACE on Yello) covers one board. Each board can carry `include` / `exclude` regexes on
+adapter (USACE on Yello) covers one board. A URL no adapter recognises is registered as a generic
+`firecrawl` board when `FIRECRAWL_URL` points at a self-hosted Firecrawl (an item's `adapter:
+"firecrawl"` forces it): the page's openings are extracted with a JSON schema, so dates are
+best-effort and the days window is advisory there. Each board can carry `include` / `exclude` regexes on
 posting titles so a 4,000-job Workday tenant only yields the analyst roles. A scan walks any set of
 boards in one run; the web page's Scan dialog lists them with checkboxes and an add-by-URL box.
 

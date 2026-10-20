@@ -4,6 +4,11 @@ Two kinds coexist. A *family* adapter (workday.py, oracle_hcm.py, ...) serves ev
 that platform; a *site* adapter (usace_yellogov.py) is built for one board. Either way a board
 is registered by URL and detect() picks the adapter.
 
+One family adapter, firecrawl, is the explicit fallback: its match() never wins, so detect()
+itself never returns it. core.boards.add_board takes a fallback_adapter and hands it any URL
+detect() gave up on (service.add_boards passes "firecrawl" when FIRECRAWL_URL is set, or when
+the caller forces that adapter), building the board with fallback_board() and going on to verify.
+
 Adapter contract (jobscan.py and jobboard/server.py rely on it; tests/test_adapters.py checks it):
 
     DISPLAY_NAME     platform name for the scan dialog ("Workday", "USACE Talent Acquisition (Yello)")
@@ -35,8 +40,9 @@ Adapter contract (jobscan.py and jobboard/server.py rely on it; tests/test_adapt
 session is the operation's browser.Session, passed down by the caller (scan run, add_boards
 request, refresh batch) for the duration of the call. Adapters only ever use
 session.fetch(url, accept=None, data=None, headers=None, method=None) -> (status, body); data
-makes it a POST (dicts become JSON). Adapters never import urllib themselves and never keep
-the session beyond the call.
+makes it a POST (dicts become JSON); the firecrawl adapter alone uses session.firecrawl(url, op,
+**options) -> (status, data). Adapters never import urllib themselves and never keep the
+session beyond the call.
 """
 import importlib
 import os
