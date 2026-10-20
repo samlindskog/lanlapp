@@ -2,7 +2,7 @@ name: test and deploy
 
 on:
   push:
-    branches: [master, next]      # next: tests only; master: tests, then deploy
+    branches: [master]      # next: tests only; master: tests, then deploy
   workflow_dispatch:
 
 jobs:
