@@ -79,6 +79,12 @@ def scan_board(conn, board, session, days=7, all_=False, limit=None, refetch=Fal
         for k in ("announcement_no", "salary", "location", "title"):   # adapters may hand back numbers
             if fields.get(k) is not None and not isinstance(fields[k], str):
                 fields[k] = str(fields[k])
+        # A card listed as "Multiple Locations" passed the location rule unknown; the posting page
+        # names the real places, so the rule is applied again here before anything is stored.
+        if not row and not loc_ok(fields.get("location") or card.get("location")):
+            log(f"  dropped by location filter after fetch: {fields.get('location')}")
+            p.add(dropped_after_fetch=1)
+            continue
         if row:
             job_id = row["id"]
             _update_fields(conn, job_id, fields, card.get("age_days"))
@@ -134,7 +140,7 @@ def scan_boards(conn, boards, days=7, all_=False, limit=None, refetch=False, max
     two Sessions cannot be up at once (one relay port, one browser slot)."""
     p = progress or Progress()
     p.update(boards_total=len(boards), boards_done=0, boards_failed=0, cards_total=0,
-             fetched=0, new=0, refetched=0, known=0, skipped=0, carried=0, embedded=0)
+             fetched=0, new=0, refetched=0, known=0, skipped=0, dropped_after_fetch=0, carried=0, embedded=0)
     results, failed = [], []
 
     def walk(s):
