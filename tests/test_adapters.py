@@ -341,6 +341,11 @@ def main():
     from sources._util import posted_text_days, iso_date
     assert [posted_text_days(x) for x in ("Posted Today", "Posted Yesterday", "Posted 9 Days Ago", "Posted 30+ Days Ago", "Posted 3 weeks ago", "", "2 months ago", "1 year ago")] == [0, 1, 9, 31, 21, None, 60, 365]
     assert iso_date("2026-10-14T13:16:00+0000") == "2026-10-14" and iso_date("10/5/2026") == "2026-10-05" and iso_date("October 20, 2026") == "2026-10-20"
+    # impossible or day-first dates: a real date or None, never an exception out of a board walk
+    from sources._util import days_since
+    assert iso_date("14/03/2026") == "2026-03-14" and iso_date("2026-13-40") is None and iso_date("13/13/2026") is None
+    assert iso_date("02/30/2026") is None and iso_date("Soon") is None and iso_date(None) is None
+    assert days_since("14/03/2026") is not None and days_since("2026-02-30") is None and days_since("x/y") is None
     print("all adapter checks passed")
 
 
