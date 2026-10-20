@@ -395,7 +395,8 @@ def check_pipeline():
         sm2 = J.geo_scan(conn, params, s, log=lines.append, progress=p, check=lambda: None, run_id=43)
         assert {k: sm2[k] for k in ("discovered", "new_places", "resolved", "no_site", "with_careers", "boards_new", "boards_scanned")} \
             == {"discovered": 9, "new_places": 0, "resolved": 0, "no_site": 0, "with_careers": 0, "boards_new": 0, "boards_scanned": 3}, sm2
-        assert [a["url"] for a in added] == ["https://bad.example.com/careers"] and not scanned and not maps, (added, scanned)
+        assert [a["url"] for a in added] == ["https://bad.example.com/careers"] and not maps, (added, maps)
+        assert len(scanned) == 1 and sorted(b["id"] for b in scanned[0]["boards"]) == [1, 2, 3], scanned
         assert fetched == ["https://down.example.com/"], fetched
         assert all(r["last_run_id"] == 43 and r["first_run_id"] == 42 for r in conn.places.values())
         # rediscover: every site is fetched again and every board re-registered (then scanned).
