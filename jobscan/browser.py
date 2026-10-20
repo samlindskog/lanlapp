@@ -1004,41 +1004,54 @@ class Session:
     def fetch(self, url, retries=2, delay=0.4, accept=None, data=None, headers=None, method=None, transport=None):
         method = method or ("POST" if data is not None else "GET")
         transport = transport or self.transport
+
+        def once():
+            proxy = self.access.proxy_for(url)
+            status, body = transport(url, method, data, headers, accept, proxy)
+            if status in (404, 410):
+                return "done", (status, "")
+            if status == 0 and body.startswith("net::ERR_") and proxy:
+                return "blocked", f"proxy refused ({body[5:]})"
+            if looks_blocked(status, body):
+                return "blocked", f"blocked (HTTP {status})"
+            if status and status < 500:
+                time.sleep(delay)
+                return "done", (status, body)
+            return "retry", f"HTTP {status}"
+        return self._attempts(url, once, "", retries, "fetch")
+
+    def _attempts(self, url, once, empty, retries, what):
+        """The loop fetch and firecrawl share: cancel check, the URL guard, the blocked short-cut,
+        then once() per attempt (retries + 1, plus one per proxy level) until it answers
+        ("done", result), or ("blocked", why) exhausts the host's escalation (-> (403, empty)).
+        ("retry", why) and any exception but Cancelled back off and try again; (0, empty) at the end."""
         self.check()
         try:
             check_url(url)
         except UnsafeURL as e:
             self.log(f"  ! {e}")
-            return 0, ""
+            return 0, empty
         if self.access.host(url) in self.access.blocked:
-            return 403, ""
+            return 403, empty
         last = None
         for attempt in range(retries + 1 + self.pool.tries):
             self.check()
-            proxy = self.access.proxy_for(url)
             try:
-                status, body = transport(url, method, data, headers, accept, proxy)
-                if status in (404, 410):
-                    return status, ""
-                if status == 0 and body.startswith("net::ERR_") and proxy:
-                    if self.access.escalate(url, f"proxy refused ({body[5:]})"):
-                        continue
-                    return 403, ""
-                if looks_blocked(status, body):
-                    if self.access.escalate(url, f"blocked (HTTP {status})"):
-                        continue
-                    return 403, ""
-                if status and status < 500:
-                    time.sleep(delay)
-                    return status, body
-                last = f"HTTP {status}"
+                verdict, value = once()
             except Cancelled:
                 raise
             except Exception as e:  # noqa: BLE001
-                last = e
+                verdict, value = "retry", e
+            if verdict == "done":
+                return value
+            if verdict == "blocked":
+                if self.access.escalate(url, value):
+                    continue
+                return 403, empty
+            last = value
             time.sleep(1.5 * (attempt + 1))
-        self.log(f"  ! fetch failed {url}: {last}")
-        return 0, ""
+        self.log(f"  ! {what} failed {url}: {last}")
+        return 0, empty
 
     # ------------------------------------------------------------- firecrawl
     def firecrawl(self, url, op="scrape", retries=2, delay=0.4, wait=600, poll=1.0, **options):
@@ -1058,44 +1071,28 @@ class Session:
         if not self.cfg.firecrawl:
             raise RuntimeError("FIRECRAWL_URL is not set: the firecrawl adapter needs a self-hosted Firecrawl "
                                "(e.g. http://firecrawl-api:3002) that routes through this service's relay")
-        self.check()
-        try:
-            check_url(url)
-        except UnsafeURL as e:
-            self.log(f"  ! {e}")
-            return 0, {}
-        if self.access.host(url) in self.access.blocked:
-            return 403, {}
-        last = None
-        for attempt in range(retries + 1 + self.pool.tries):
-            self.check()
-            try:
-                code, reply = self._api("POST", f"/v1/{op}", {"url": url, **options}, timeout=wait)
-                if code >= 500:
-                    last = f"firecrawl HTTP {code}: {str(reply.get('error') or reply)[:160]}"
-                elif code >= 400 or not reply.get("success", True):
-                    self.log(f"  ! firecrawl {op} refused {url}: HTTP {code} {str(reply.get('error') or '')[:160]}")
-                    return 0, {}
-                elif op == "crawl":
-                    return self._crawl_wait(reply.get("id"), wait, poll)
-                else:
-                    data = reply.get("data") if op == "scrape" else reply
-                    status, content = self._target_status(data) if op == "scrape" else (200, "")
-                    if status in (404, 410):
-                        return status, {}
-                    if looks_blocked(status, content):
-                        if self.access.escalate(url, f"blocked (HTTP {status})"):
-                            continue
-                        return 403, {}
-                    time.sleep(delay)
-                    return status, data or {}
-            except Cancelled:
-                raise
-            except Exception as e:  # noqa: BLE001
-                last = e
-            time.sleep(1.5 * (attempt + 1))
-        self.log(f"  ! firecrawl {op} failed {url}: {last}")
-        return 0, {}
+
+        def once():
+            code, reply = self._api("POST", f"/v1/{op}", {"url": url, **options}, timeout=wait)
+            if code >= 500:
+                return "retry", f"firecrawl HTTP {code}: {str(reply.get('error') or reply)[:160]}"
+            if code >= 400 or not reply.get("success", True):
+                self.log(f"  ! firecrawl {op} refused {url}: HTTP {code} {str(reply.get('error') or '')[:160]}")
+                return "done", (0, {})
+            if op != "scrape":                 # map: the links; crawl: the new job's id
+                return "done", (200, reply)
+            data = reply.get("data") or {}
+            status, content = self._target_status(data)
+            if status in (404, 410):
+                return "done", (status, {})
+            if looks_blocked(status, content):
+                return "blocked", f"blocked (HTTP {status})"
+            time.sleep(delay)
+            return "done", (status, data)
+        status, data = self._attempts(url, once, {}, retries, f"firecrawl {op}")
+        if op == "crawl" and status == 200:    # the job exists: from here on nothing re-creates it
+            return self._crawl_wait(data.get("id"), wait, poll)
+        return status, data
 
     @staticmethod
     def _target_status(data):
