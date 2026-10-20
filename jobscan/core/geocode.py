@@ -5,7 +5,7 @@ import urllib.parse
 from core.client import Pacer, request
 
 NOMINATIM_URL = (os.environ.get("NOMINATIM_URL") or "https://nominatim.openstreetmap.org").rstrip("/")
-USER_AGENT = "jobscan/2.0 (jobs.slindskog.net)"
+from core.client import USER_AGENT
 _pace = Pacer(1.0)
 
 

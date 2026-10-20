@@ -10,6 +10,8 @@ import time
 import urllib.parse
 from core.embed import SSL_CTX
 
+USER_AGENT = "jobscan/2.0 (jobs.slindskog.net)"   # the public instances want to know who is asking
+
 
 class Pacer:
     """At most one call per `interval` seconds across threads (public services ask for this)."""
@@ -31,7 +33,8 @@ def request(url, data=None, headers=None, timeout=30):
     u = urllib.parse.urlsplit(url)
     cls = http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection
     conn = cls(u.hostname, u.port, timeout=timeout, **({"context": SSL_CTX} if u.scheme == "https" else {}))
-    hdrs = {"Accept": "application/json", **(headers or {})}
+    # Every side service gets the same identification: Overpass answers 406 to an anonymous agent.
+    hdrs = {"Accept": "application/json", "User-Agent": USER_AGENT, **(headers or {})}
     body = None
     if isinstance(data, dict):
         body = urllib.parse.urlencode(data).encode()
