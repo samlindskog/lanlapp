@@ -4,20 +4,36 @@ browser lifecycle. Adapters only ever see session.fetch(url, ...) -> (status, bo
 
 Layers (each testable on its own):
   Config        everything read from the environment, in one place
-  check_url     refuses loopback/private/link-local targets before any request
+  check_url     refuses loopback/private/link-local targets before any request (check_host: the
+                same guard on a bare hostname, returning the checked addresses; check_dest: that
+                plus web ports only, applied by the relay to every tunnel)
   ProxyPool     escalation level -> proxy URL (Decodo sticky ports, or the gateway with {session}
                 and {country} placeholders: a fresh session per level, countries cycled)
   Access        per-host state for one operation: direct -> proxy levels -> blocked
+  ProxyRelay    the Session's routing proxy (one per Session, up for the with-block): decides per
+                destination host from Access: refuse (blocked, or not a public address), direct,
+                or tunnel through the host's current upstream proxy with credentials added. Chrome
+                always runs through it, so a route change needs no restart; Firecrawl can too.
   Chrome        headless Chromium via undetected-chromedriver: pages rendered, JSON/POST as
-                in-page fetch; a loopback ProxyRelay adds proxy credentials; cleanup is scoped to
-                this session's own process tree
+                in-page fetch; cleanup is scoped to this session's own process tree
   HttpPool      plain HTTP with keep-alive: curl_cffi impersonating Chrome's TLS fingerprint when
-                installed, else http.client tunnels
-  Session       fetch(): the escalation loop over the transports; close(): tear everything down.
-                Nothing outlives the session: the next operation starts direct with new sessions.
+                installed, else http.client tunnels (uses the per-level proxy itself, no relay)
+  Session       fetch(): the escalation loop over the transports; firecrawl(): the same loop for
+                a self-hosted Firecrawl (scrape, map, crawl with polling), whose own traffic comes
+                back in through the relay; close(): tear everything down. Nothing outlives the
+                session: the next operation starts direct with new sessions, a fresh relay and no
+                crawl jobs left running.
 
 Env (Config):
   JOBSCAN_BROWSER=0        plain HTTP only (CI, offline tests)
+  FIRECRAWL_URL            a self-hosted Firecrawl API, e.g. http://firecrawl-api:3002 (unset: the
+                           firecrawl adapter fails at scan time); point its PROXY_SERVER at the relay
+  JOBSCAN_RELAY_PORT       the relay's port (default 8899; 0 = ephemeral); one Session at a time
+                           (the capacity slot), so a port in use is an error, not a retry
+  JOBSCAN_RELAY_BIND       the relay's address (default 0.0.0.0 so a Firecrawl container on the same
+                           Docker network can reach it; the container publishes no ports)
+  JOBSCAN_RELAY_PEERS      networks the relay serves besides loopback, comma-separated CIDRs (e.g.
+                           172.31.0.0/24, the crawl network); default empty: loopback only
   JOBSCAN_PROXY            proxies, one per escalation level: comma/space/newline-separated
                            http://user:pass@host:port or host:port:user:pass entries, or one URL with
                            {session} (and optionally {country}) in the username, e.g.
@@ -86,6 +102,11 @@ class Config:
         self.chromedriver = env.get("JOBSCAN_CHROMEDRIVER") or None
         self.own_chrome = env.get("JOBSCAN_OWN_CHROME") == "1"
         self.browser_dir = env.get("JOBSCAN_BROWSER_DIR") or None
+        self.relay_bind = env.get("JOBSCAN_RELAY_BIND") or "0.0.0.0"
+        self.relay_port = int(env.get("JOBSCAN_RELAY_PORT", "8899") or 0)
+        self.relay_peers = [ipaddress.ip_network(p.strip(), strict=False)
+                            for p in env.get("JOBSCAN_RELAY_PEERS", "").split(",") if p.strip()]
+        self.firecrawl = (env.get("FIRECRAWL_URL") or "").rstrip("/") or None
 
 
 class Cancelled(Exception):
@@ -103,24 +124,43 @@ def check_url(url):
     u = urllib.parse.urlsplit(url or "")
     if u.scheme not in ("http", "https") or not u.hostname:
         raise UnsafeURL(f"only public http(s) URLs can be fetched: {url[:120]}")
-    host = u.hostname.lower()
-    if host in ("localhost",) or host.endswith(".localhost") or host.endswith(".internal") or "." not in host:
-        raise UnsafeURL(f"refusing internal host {host}")
-    if host in _host_ok:                       # one lookup per host per process, not per request
-        return url
-    try:
-        infos = socket.getaddrinfo(host, None)
-    except socket.gaierror as e:
-        raise UnsafeURL(f"cannot resolve {host}: {e}") from None
-    for info in infos:
-        ip = ipaddress.ip_address(info[4][0])
-        if not ip.is_global or ip.is_multicast:
-            raise UnsafeURL(f"refusing non-public address {ip} for {host}")
-    _host_ok.add(host)
+    check_host(u.hostname)
     return url
 
 
-_host_ok = set()
+def check_host(host):
+    """The destination half of check_url: the host must resolve to public addresses only; returns
+    those addresses. Resolved afresh on every call (no cache): the relay dials one of the addresses
+    it was handed, so what was checked is what is connected to and a record that changes between
+    check and connect (DNS rebinding) cannot point a tunnel at a private address."""
+    host = host.lower()
+    if host in ("localhost",) or host.endswith(".localhost") or host.endswith(".internal") or "." not in host:
+        raise UnsafeURL(f"refusing internal host {host}")
+    addrs = resolve(host)
+    for addr in addrs:
+        ip = ipaddress.ip_address(addr)
+        if not ip.is_global or ip.is_multicast:
+            raise UnsafeURL(f"refusing non-public address {ip} for {host}")
+    return addrs
+
+
+def resolve(host):
+    """The host's addresses, in resolver order (a module attribute so offline tests can stub DNS)."""
+    try:
+        return [info[4][0] for info in socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)]
+    except socket.gaierror as e:
+        raise UnsafeURL(f"cannot resolve {host}: {e}") from None
+
+
+RELAY_PORTS = (80, 443)
+
+
+def check_dest(host, port):
+    """The relay's guard for one tunnel: web ports only (the relay is not a general CONNECT proxy
+    for whoever can reach it), then check_host; returns the addresses a direct connect may dial."""
+    if port not in RELAY_PORTS:
+        raise UnsafeURL(f"refusing port {port} for {host}: only {' and '.join(map(str, RELAY_PORTS))}")
+    return check_host(host)
 
 
 def _ssl_context():
@@ -145,13 +185,11 @@ class _Pool:
 
     def _connect(self, scheme, host, port, proxy):
         if proxy:
-            pscheme, phost, pport, puser, ppass = _proxy_parts(proxy)
+            pscheme, phost, pport, _, _ = _proxy_parts(proxy)
             c = http.client.HTTPSConnection(phost, pport, timeout=40, context=SSL_CTX) if pscheme == "https" \
                 else http.client.HTTPConnection(phost, pport, timeout=40)
-            hdrs = {}
-            if puser or ppass:
-                import base64
-                hdrs["Proxy-Authorization"] = "Basic " + base64.b64encode(f"{puser or ''}:{ppass or ''}".encode()).decode()
+            auth = _basic_auth(proxy)
+            hdrs = {"Proxy-Authorization": auth} if auth else {}
             if scheme == "https":
                 c.set_tunnel(host, port, headers=hdrs)
             return c
@@ -373,34 +411,89 @@ def _proxy_parts(url):
 
 
 class ProxyRelay:
-    """A loopback HTTP proxy that forwards to an authenticated upstream proxy, adding the
-    Proxy-Authorization header. Chrome is pointed at it with a plain --proxy-server, so no
-    extension is needed (Google Chrome 137+ ignores --load-extension; Chromium still honours it,
-    but one mechanism everywhere is simpler). Each Chrome socket maps to one upstream connection
-    that stays open as long as Chrome keeps its own, so tunnels are reused the way Chrome reuses them."""
+    """The Session's routing proxy. Chrome always runs through it (--proxy-server is fixed at
+    launch, so the per-destination routing happens here instead of restarting Chrome) and a
+    Firecrawl container on the same Docker network can too. For each CONNECT host:port and each
+    absolute-form plain-HTTP request the destination host goes through the operation's access
+    policy: blocked -> 403; not a public address (check_host, the SSRF guard for traffic the
+    Session never sees as a URL: Firecrawl's redirects, a page's subresources) -> 403; else the
+    host's escalation level picks the route: direct, or a tunnel through that level's upstream
+    proxy with Proxy-Authorization added (Chrome needs no extension and never sees credentials).
+    Each client socket maps to one connection that lives as long as the client keeps its own, so
+    tunnels are reused the way Chrome reuses them.
 
-    def __init__(self, upstream):
-        import base64
-        self.scheme, self.host, self.port, user, pw = _proxy_parts(upstream)
-        self.auth = ("Basic " + base64.b64encode(f"{user or ''}:{pw or ''}".encode()).decode()) if (user or pw) else None
-        self.sock = socket.socket()
-        self.sock.bind(("127.0.0.1", 0))
-        self.sock.listen(64)
-        self.addr = f"127.0.0.1:{self.sock.getsockname()[1]}"
+    An upstream that cannot be reached is answered with 502: Chrome reports
+    net::ERR_TUNNEL_CONNECTION_FAILED and Session.fetch escalates ("proxy refused"). A direct
+    connect that fails gets the same 502; at level 0 fetch treats the error as transient (retry,
+    then (0, "")) rather than as a reason to escalate, like plain HTTP does for an unreachable host.
+
+    Who may use it: loopback (Chrome) and the networks listed in JOBSCAN_RELAY_PEERS (the Docker
+    network Firecrawl shares with the app; the container publishes no ports). Where it may go:
+    ports 80 and 443 of hosts that resolve to public addresses, and for a direct connect only the
+    addresses that were just checked. That is the whole surface: it is not a general CONNECT
+    proxy for whoever can reach the container."""
+
+    def __init__(self, access, cfg, log=_stderr, dest_check=check_dest):
+        self.access = access
+        self.log = log
+        self.peers = cfg.relay_peers
+        self.dest_check = dest_check       # (host, port) -> addresses; tests allow loopback through here
+        bind, port = cfg.relay_bind, cfg.relay_port
+        self.sock = socket.socket(socket.AF_INET6 if ":" in bind else socket.AF_INET)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            self.sock.bind((bind, port))
+        except OSError as e:
+            # One Session at a time is the capacity slot's guarantee; a port in use means it broke.
+            raise RuntimeError(f"relay: cannot bind {bind}:{port} ({e}); is another operation's relay still up?") from None
+        self.sock.listen(128)
+        self.port = self.sock.getsockname()[1]
+        self.addr = f"127.0.0.1:{self.port}"
         self._stop = False
-        threading.Thread(target=self._serve, name="proxy-relay", daemon=True).start()
+        self._thread = threading.Thread(target=self._serve, name="proxy-relay", daemon=True)
+        self._thread.start()
 
     def _serve(self):
         while not self._stop:
             try:
-                client, _ = self.sock.accept()
+                client, peer = self.sock.accept()
             except OSError:
-                break
-            threading.Thread(target=self._handle, args=(client,), daemon=True).start()
+                if self._stop or self.sock.fileno() == -1:   # closed: done; anything else (EMFILE...) is per-connection
+                    break
+                time.sleep(0.05)
+                continue
+            try:
+                threading.Thread(target=self._handle, args=(client, peer[0]), daemon=True).start()
+            except Exception as e:  # noqa: BLE001  (thread limit): drop this connection, keep serving
+                self.log(f"  ! relay: cannot serve {peer[0]}: {e}")
+                client.close()
 
-    def _handle(self, client):
+    def alive(self):
+        """Still accepting: the listening socket is open and the accept thread runs."""
+        return not self._stop and self.sock.fileno() != -1 and self._thread.is_alive()
+
+    def _peer_ok(self, peer):
+        ip = ipaddress.ip_address(peer)
+        ip = getattr(ip, "ipv4_mapped", None) or ip
+        return ip.is_loopback or any(ip in net for net in self.peers)
+
+    def route(self, host, port):
+        """The operation's policy for one destination: ("refuse", why, None), or ("ok", upstream
+        proxy URL or None for direct, the checked addresses a direct connect may dial)."""
+        if host in self.access.blocked:
+            return "refuse", "blocked for this operation", None
+        try:
+            addrs = self.dest_check(host, port)
+        except UnsafeURL as e:
+            return "refuse", str(e), None
+        return "ok", self.access.pool.url(self.access.level(f"http://{host}/")), addrs
+
+    def _handle(self, client, peer):
         up = None
         try:
+            if not self._peer_ok(peer):
+                self.log(f"  ! relay: refused connection from {peer}")
+                return
             client.settimeout(PAGE_TIMEOUT)
             head = b""
             while b"\r\n\r\n" not in head:
@@ -409,14 +502,29 @@ class ProxyRelay:
                     return
                 head += chunk
             hdr, rest = head.split(b"\r\n\r\n", 1)
-            lines = hdr.split(b"\r\n")
-            if self.auth:
-                lines = [ln for ln in lines if not ln.lower().startswith(b"proxy-authorization:")]
-                lines.insert(1, f"Proxy-Authorization: {self.auth}".encode())
-            up = socket.create_connection((self.host, self.port), timeout=PAGE_TIMEOUT)
-            if self.scheme == "https":
-                up = SSL_CTX.wrap_socket(up, server_hostname=self.host)
-            up.sendall(b"\r\n".join(lines) + b"\r\n\r\n" + rest)
+            req = _ProxyRequest(hdr)
+            if not req.host:
+                client.sendall(_reply(400, "bad request"))
+                return
+            verdict, upstream, addrs = self.route(req.host, req.port)
+            if verdict == "refuse":
+                self.log(f"  ! relay: refused {req.host}:{req.port}: {upstream}")
+                client.sendall(_reply(403, f"refused {req.host}:{req.port}: {upstream}"))
+                return
+            try:
+                up = self._connect(req, upstream, addrs)
+            except OSError as e:
+                self.log(f"  ! relay: cannot reach {ProxyPool.label(upstream) if upstream else req.host}: {e}")
+                client.sendall(_reply(502, f"cannot reach {req.host}"))
+                return
+            if upstream:
+                up.sendall(req.head(auth=_basic_auth(upstream)) + rest)
+            elif req.connect:
+                client.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                if rest:
+                    up.sendall(rest)
+            else:
+                up.sendall(req.head(origin_form=True) + rest)
             self._pipe(client, up)
         except Exception:  # noqa: BLE001
             pass
@@ -426,6 +534,25 @@ class ProxyRelay:
                     s_.close()
                 except Exception:  # noqa: BLE001
                     pass
+
+    @staticmethod
+    def _connect(req, upstream, addrs):
+        if not upstream:
+            # Direct: dial the addresses the check returned, never the name again (DNS rebinding).
+            # Through a proxy the name goes to the upstream, which resolves it on its own network,
+            # where our private ranges do not exist.
+            last = None
+            for addr in addrs:
+                try:
+                    return socket.create_connection((addr, req.port), timeout=PAGE_TIMEOUT)
+                except OSError as e:
+                    last = e
+            raise last or OSError(f"no address for {req.host}")
+        scheme, host, port, _, _ = _proxy_parts(upstream)
+        up = socket.create_connection((host, port), timeout=PAGE_TIMEOUT)
+        if scheme == "https":
+            up = SSL_CTX.wrap_socket(up, server_hostname=host)
+        return up
 
     @staticmethod
     def _pipe(a, b):
@@ -449,6 +576,66 @@ class ProxyRelay:
             self.sock.close()
         except OSError:
             pass
+
+
+class _ProxyRequest:
+    """One proxy request head: CONNECT host:port, or an absolute-form plain-HTTP request."""
+
+    def __init__(self, hdr):
+        self.lines = hdr.split(b"\r\n")
+        self.host = self.port = self.path = None
+        self.connect = False
+        try:
+            self.method, target, self.version = self.lines[0].decode("latin-1").split()
+        except ValueError:
+            return
+        self.connect = self.method.upper() == "CONNECT"
+        if self.connect:
+            host, _, port = target.rpartition(":")
+            self.host, self.port = host.strip("[]").lower(), int(port or 443)
+        else:
+            u = urllib.parse.urlsplit(target)
+            if u.scheme == "http" and u.hostname:            # origin-form has no host to route on
+                self.host, self.port = u.hostname.lower(), u.port or 80
+                self.path = (u.path or "/") + (f"?{u.query}" if u.query else "")
+
+    def head(self, auth=None, origin_form=False):
+        """The head to forward: proxy-only headers dropped, Proxy-Authorization for an upstream
+        added, the request line rewritten to origin-form for a direct plain-HTTP connection. A
+        plain-HTTP connection is also closed after one exchange: a client may reuse its socket to
+        the relay for another host, which a piped connection cannot route."""
+        drop = (b"proxy-authorization:", b"proxy-connection:") + (() if self.connect else (b"connection:",))
+        lines = [ln for ln in self.lines[1:] if not ln.lower().startswith(drop)]
+        first = f"{self.method} {self.path} {self.version}".encode() if origin_form else self.lines[0]
+        if auth:
+            lines.insert(0, f"Proxy-Authorization: {auth}".encode())
+        if not self.connect:
+            lines.append(b"Connection: close")
+        return b"\r\n".join([first] + lines) + b"\r\n\r\n"
+
+
+def _reply(status, text):
+    reason = {400: "Bad Request", 403: "Forbidden", 502: "Bad Gateway"}[status]
+    body = f"jobscan relay: {text}".encode()
+    return (f"HTTP/1.1 {status} {reason}\r\nContent-Type: text/plain\r\nContent-Length: {len(body)}\r\n"
+            f"Connection: close\r\n\r\n").encode() + body
+
+
+def tunnel_error(exc):
+    """The net::ERR_PROXY_*/ERR_TUNNEL_* code in a Chrome exception, or None: these mean the relay
+    answered the tunnel with a refusal (or is not there), not that Chrome itself is broken."""
+    m = re.search(r"net::(ERR_[A-Z_]+)", str(exc))
+    code = m.group(1) if m else ""
+    return code if code.startswith("ERR_PROXY") or code.startswith("ERR_TUNNEL") else None
+
+
+def _basic_auth(proxy):
+    """Proxy-Authorization value for a proxy URL's credentials, or None."""
+    import base64
+    _, _, _, user, pw = _proxy_parts(proxy)
+    if not (user or pw):
+        return None
+    return "Basic " + base64.b64encode(f"{user or ''}:{pw or ''}".encode()).decode()
 
 
 def _proc_cmdline(pid):
@@ -547,17 +734,17 @@ def chrome_major(binary):
 
 
 class Chrome:
-    """Headless Chromium for one Session. Started on first use, restarted when the proxy changes,
-    disabled after MAX_FAILURES start/crash failures; close() kills its own process tree."""
+    """Headless Chromium for one Session, every request through the Session's ProxyRelay (so the
+    route can change per host without a restart). Started on first use, disabled after
+    MAX_FAILURES start/crash failures; close() kills its own process tree."""
 
     def __init__(self, cfg, log=_stderr):
         self.cfg = cfg
         self.log = log
+        self.relay = None             # the Session's ProxyRelay, set once it is up; every request goes through it
         self._lock = threading.RLock()
         self._drv = None
         self._dir = None
-        self._proxy = None            # proxy URL the running Chrome was started with
-        self._relay = None
         self._disabled_reason = None
         self._failures = 0
 
@@ -574,9 +761,10 @@ class Chrome:
             return False
         return True
 
-    def _start(self, proxy=None):
+    def _start(self):
         import undetected_chromedriver as uc
-        self._proxy = proxy
+        if self.relay is None:
+            raise RuntimeError("no relay to route through: the Session must be entered (with-block) first")
         self._dir = tempfile.mkdtemp(prefix="jobscan-chrome-", dir=self.cfg.browser_dir)
         # The library patches the driver binary in place and keeps its profile under $HOME:
         # in the read-only container both must live on the tmpfs scratch dir.
@@ -599,14 +787,10 @@ class Chrome:
         # Pages are read for their text: no images or web fonts (most of a proxied page's bytes).
         opts.add_argument("--blink-settings=imagesEnabled=false")
         opts.add_argument("--disable-remote-fonts")
-        if proxy:
-            scheme, host, port, user, pw = _proxy_parts(proxy)
-            if user or pw:
-                self._relay = ProxyRelay(proxy)        # credentials added here; Chrome sees a plain proxy
-                opts.add_argument(f"--proxy-server=http://{self._relay.addr}")
-            else:
-                opts.add_argument(f"--proxy-server={scheme}://{host}:{port}")
-            opts.add_argument("--proxy-bypass-list=<-loopback>")
+        # Everything, loopback included, goes to the relay: it routes per host and refuses what
+        # the service must not reach, so Chrome itself has no way around the policy.
+        opts.add_argument(f"--proxy-server=http://{self.relay.addr}")
+        opts.add_argument("--proxy-bypass-list=<-loopback>")
         driver_path = None
         if self.cfg.chromedriver:
             # copy so the patcher can write to it (the system binary is read-only in the image)
@@ -625,14 +809,12 @@ class Chrome:
             self._drv.switch_to.window(self._drv.window_handles[0])
         except Exception:  # noqa: BLE001
             pass
-        self.log(f"  browser: chrome {major or '?'} started ({ProxyPool.label(proxy)})")
+        self.log(f"  browser: chrome {major or '?'} started (via relay {self.relay.addr})")
 
-    def _driver(self, proxy=None):
-        if self._drv is not None and proxy != self._proxy:
-            self.close()                 # the proxy is fixed at launch
+    def _driver(self):
         if self._drv is None:
             try:
-                self._start(proxy)
+                self._start()
             except Exception as e:  # noqa: BLE001
                 self._failed(f"start failed: {e.__class__.__name__}: {str(e)[:120]}")
                 raise
@@ -649,8 +831,8 @@ class Chrome:
             self.log(f"  ! browser: {self._disabled_reason}")
 
     def close(self):
-        """Quit Chrome and kill whatever of its own process tree is left; drop the relay and the
-        scratch dir. Other sessions' browsers are not touched."""
+        """Quit Chrome and kill whatever of its own process tree is left; drop the scratch dir.
+        Other sessions' browsers are not touched."""
         with self._lock:
             if self._drv is not None:
                 try:
@@ -661,9 +843,6 @@ class Chrome:
             if self._dir:
                 n = kill_chrome_tree(self._dir)
                 self.log(f"  browser: closed ({n} process(es) killed)")
-            if self._relay is not None:
-                self._relay.close()
-                self._relay = None
             if self._dir:
                 shutil.rmtree(self._dir, ignore_errors=True)
                 self._dir = None
@@ -735,22 +914,25 @@ class Chrome:
         status, text = drv.execute_async_script(_FETCH_JS, url, method, body, h)
         return int(status), text or ""
 
-    def request(self, url, method="GET", data=None, headers=None, accept=None, proxy=None):
+    def request(self, url, method="GET", data=None, headers=None, accept=None):
         """(status, body). GET of a page without special headers renders it; anything else runs
-        as an in-page fetch from the URL's origin. proxy: URL to run Chrome through (None = direct)."""
+        as an in-page fetch from the URL's origin. The route (direct or which proxy) is the
+        relay's decision for the URL's host; a tunnel it refuses comes back as (0, "net::ERR_...")."""
         xhr = method != "GET" or data is not None or bool(headers) or bool(accept)
         with self._lock:
             for attempt in range(2):
                 try:
-                    drv = self._driver(proxy)
+                    drv = self._driver()
                     if xhr:
                         return self._xhr(drv, url, method, data, headers, accept)
                     return self._page(drv, url)
                 except Exception as e:  # noqa: BLE001
-                    m = re.search(r"net::(ERR_[A-Z_]+)", str(e))
-                    if m and (m.group(1).startswith("ERR_PROXY") or m.group(1).startswith("ERR_TUNNEL")):
-                        return 0, f"net::{m.group(1)}"     # the proxy refused: Chrome itself is fine
-                    self._failed(f"{e.__class__.__name__}: {str(e)[:160]}")
+                    code = tunnel_error(e)
+                    if code and self.relay is not None and self.relay.alive():
+                        return 0, f"net::{code}"           # the relay refused this tunnel: Chrome itself is fine
+                    # A tunnel error with no relay to answer it is a browser failure, not a route
+                    # decision: counting it lets MAX_FAILURES hand the session to plain HTTP.
+                    self._failed(f"relay down (net::{code})" if code else f"{e.__class__.__name__}: {str(e)[:160]}")
                     if attempt or not self.available():
                         raise
 
@@ -765,19 +947,29 @@ class Session:
     (status, body). data (dict/list -> JSON, or str/bytes) makes it a POST; 404/410 come back as
     (code, ""); a host blocked at every level returns (403, "") at once; network failures retry
     and finally return (0, ""). Every request to a career site goes through here, so the
-    escalation policy is the same for scans, board registration and refreshes."""
+    escalation policy is the same for scans, board registration and refreshes.
 
-    def __init__(self, log=None, cfg=None, check=None):
+    firecrawl(url, op="scrape", **options): (status, data), the same loop for a self-hosted
+    Firecrawl (FIRECRAWL_URL) whose own traffic runs through this Session's relay."""
+
+    def __init__(self, log=None, cfg=None, check=None, dest_check=check_dest):
         self.cfg = cfg or Config()
         self.log = log or _stderr
+        self._crawls = set()                     # live Firecrawl crawl ids, deleted on close/cancel
         self.check = check or (lambda: None)     # raises Cancelled to stop the operation; run before every fetch
+        self.dest_check = dest_check             # the relay's destination guard; tests swap it to allow loopback
         self.pool = ProxyPool(self.cfg.proxy, self.cfg.proxy_tries, self.cfg.countries)
         self.access = Access(self.pool, self.log)
         self.chrome = Chrome(self.cfg, self.log)
         self.http = HttpPool()
+        self.relay = None
         self._token = None
 
     def __enter__(self):
+        # The relay is the way out for Chrome and for Firecrawl; plain HTTP uses the proxies itself.
+        if self.cfg.enabled or self.cfg.firecrawl:
+            self.relay = ProxyRelay(self.access, self.cfg, self.log, self.dest_check)
+            self.chrome.relay = self.relay
         self._token = _current_log.set(self.log)
         return self
 
@@ -786,8 +978,14 @@ class Session:
         return False
 
     def close(self):
-        """Tear everything down: Chrome and its process tree, pooled connections, escalation state."""
+        """Tear everything down: Chrome and its process tree, live crawls, the relay, pooled
+        connections, escalation state."""
         self.chrome.close()
+        for cid in list(self._crawls):
+            self._crawl_delete(cid)
+        if self.relay is not None:
+            self.relay.close()
+            self.relay = None
         self.http.close()
         self.access = Access(self.pool, self.log)
         if self._token is not None:
@@ -796,7 +994,7 @@ class Session:
 
     def transport(self, url, method, data, headers, accept, proxy):
         if self.chrome.available():
-            status, body = self.chrome.request(url, method, data, headers, accept, proxy)
+            status, body = self.chrome.request(url, method, data, headers, accept)
             if status == 0 and body.startswith("origin unreachable"):
                 self.log(f"  ! browser: {body}; plain HTTP for {url[:80]}")
                 status, body = self.http.request(url, method, data, headers, accept, proxy)
@@ -806,38 +1004,192 @@ class Session:
     def fetch(self, url, retries=2, delay=0.4, accept=None, data=None, headers=None, method=None, transport=None):
         method = method or ("POST" if data is not None else "GET")
         transport = transport or self.transport
+
+        def once():
+            proxy = self.access.proxy_for(url)
+            status, body = transport(url, method, data, headers, accept, proxy)
+            if status in (404, 410):
+                return "done", (status, "")
+            if status == 0 and body.startswith("net::ERR_") and proxy:
+                return "blocked", f"proxy refused ({body[5:]})"
+            if looks_blocked(status, body):
+                return "blocked", f"blocked (HTTP {status})"
+            if status and status < 500:
+                time.sleep(delay)
+                return "done", (status, body)
+            return "retry", f"HTTP {status}"
+        return self._attempts(url, once, "", retries, "fetch")
+
+    def _attempts(self, url, once, empty, retries, what):
+        """The loop fetch and firecrawl share: cancel check, the URL guard, the blocked short-cut,
+        then once() per attempt (retries + 1, plus one per proxy level) until it answers
+        ("done", result), or ("blocked", why) exhausts the host's escalation (-> (403, empty)).
+        ("retry", why) and any exception but Cancelled back off and try again; (0, empty) at the end."""
         self.check()
         try:
             check_url(url)
         except UnsafeURL as e:
             self.log(f"  ! {e}")
-            return 0, ""
+            return 0, empty
         if self.access.host(url) in self.access.blocked:
-            return 403, ""
+            return 403, empty
         last = None
         for attempt in range(retries + 1 + self.pool.tries):
             self.check()
-            proxy = self.access.proxy_for(url)
             try:
-                status, body = transport(url, method, data, headers, accept, proxy)
-                if status in (404, 410):
-                    return status, ""
-                if status == 0 and body.startswith("net::ERR_") and proxy:
-                    if self.access.escalate(url, f"proxy refused ({body[5:]})"):
-                        continue
-                    return 403, ""
-                if looks_blocked(status, body):
-                    if self.access.escalate(url, f"blocked (HTTP {status})"):
-                        continue
-                    return 403, ""
-                if status and status < 500:
-                    time.sleep(delay)
-                    return status, body
-                last = f"HTTP {status}"
+                verdict, value = once()
+            except Cancelled:
+                raise
+            except Exception as e:  # noqa: BLE001
+                verdict, value = "retry", e
+            if verdict == "done":
+                return value
+            if verdict == "blocked":
+                if self.access.escalate(url, value):
+                    continue
+                return 403, empty
+            last = value
+            time.sleep(1.5 * (attempt + 1))
+        self.log(f"  ! {what} failed {url}: {last}")
+        return 0, empty
+
+    # ------------------------------------------------------------- firecrawl
+    def firecrawl(self, url, op="scrape", retries=2, delay=0.4, wait=600, poll=1.0, **options):
+        """(status, data) from the self-hosted Firecrawl at FIRECRAWL_URL: POST /v1/{op} with
+        {"url": url, **options}. data is Firecrawl's parsed JSON for the operation ({} on failure):
+        the "data" object of a scrape, the whole {"links": [...]} reply of a map, and for a crawl
+        the finished job ({"status": "completed", "data": [pages]}), polled with check() between
+        polls (poll seconds apart, wait seconds in all), deleted on cancel or close, and once it
+        exists never created again: polls and page fetches retry in place. A scrape's status is
+        the target's (metadata.statusCode); a blocked one escalates the host and retries, which
+        takes effect because Firecrawl's traffic runs through this Session's relay (set
+        PROXY_SERVER on the Firecrawl side to the relay). A map carries no target status, so a
+        blocked site shows as an empty or short link list, not as an escalation. Firecrawl's own
+        base URL is an internal service and is not subject to check_url; only the target is.
+        Firecrawl 5xx, timeouts and connection errors retry with backoff like fetch; a 4xx from
+        Firecrawl is final."""
+        if not self.cfg.firecrawl:
+            raise RuntimeError("FIRECRAWL_URL is not set: the firecrawl adapter needs a self-hosted Firecrawl "
+                               "(e.g. http://firecrawl-api:3002) that routes through this service's relay")
+
+        def once():
+            code, reply = self._api("POST", f"/v1/{op}", {"url": url, **options}, timeout=wait)
+            if code >= 500:
+                return "retry", f"firecrawl HTTP {code}: {str(reply.get('error') or reply)[:160]}"
+            if code >= 400 or not reply.get("success", True):
+                self.log(f"  ! firecrawl {op} refused {url}: HTTP {code} {str(reply.get('error') or '')[:160]}")
+                return "done", (0, {})
+            if op != "scrape":                 # map: the links; crawl: the new job's id
+                return "done", (200, reply)
+            data = reply.get("data") or {}
+            status, content = self._target_status(data)
+            if status in (404, 410):
+                return "done", (status, {})
+            if looks_blocked(status, content):
+                return "blocked", f"blocked (HTTP {status})"
+            time.sleep(delay)
+            return "done", (status, data)
+        status, data = self._attempts(url, once, {}, retries, f"firecrawl {op}")
+        if op == "crawl" and status == 200:    # the job exists: from here on nothing re-creates it
+            return self._crawl_wait(data.get("id"), wait, poll)
+        return status, data
+
+    @staticmethod
+    def _target_status(data):
+        """A scrape's outcome as the target saw it: (HTTP status, the content the challenge
+        check reads). Firecrawl reports the target's status in metadata.statusCode."""
+        data = data if isinstance(data, dict) else {}
+        meta = data.get("metadata")
+        try:                                   # an odd reply is the target's success, not a retry
+            status = int((meta if isinstance(meta, dict) else {}).get("statusCode") or 200)
+        except (TypeError, ValueError):
+            status = 200
+        return status, data.get("markdown") or data.get("html") or ""
+
+    def _api(self, method, path, body=None, timeout=120):
+        """One request to Firecrawl: (HTTP status, parsed JSON or {})."""
+        u = urllib.parse.urlsplit(self.cfg.firecrawl)
+        conn = (http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection)(
+            u.hostname, u.port, timeout=timeout)
+        try:
+            conn.request(method, (u.path or "") + path, body=json.dumps(body) if body is not None else None,
+                         headers={"Content-Type": "application/json", "Accept": "application/json"})
+            r = conn.getresponse()
+            raw = r.read().decode("utf-8", errors="replace")
+        finally:
+            conn.close()
+        try:
+            data = json.loads(raw) if raw else {}
+        except ValueError:
+            data = {"error": raw[:200]}
+        return r.status, data if isinstance(data, dict) else {"data": data}
+
+    def _api_retry(self, method, path, tries=3):
+        """_api with Firecrawl 5xx, timeouts and connection errors retried in place: (status,
+        JSON), or (0, {"error": ...}) when the tries are spent. Used once a crawl job exists, so a
+        hiccup never bubbles up to firecrawl()'s attempt loop, which would create a second job."""
+        last = None
+        for i in range(tries):
+            try:
+                code, data = self._api(method, path)
+                if code < 500:
+                    return code, data
+                last = f"HTTP {code}: {str(data.get('error') or '')[:120]}"
             except Cancelled:
                 raise
             except Exception as e:  # noqa: BLE001
                 last = e
-            time.sleep(1.5 * (attempt + 1))
-        self.log(f"  ! fetch failed {url}: {last}")
-        return 0, ""
+            time.sleep(1.5 * (i + 1))
+        return 0, {"error": str(last)}
+
+    def _crawl_wait(self, cid, wait, poll):
+        """Poll a crawl job to completion and read its pages; the finished job is then deleted
+        (Firecrawl keeps results otherwise). Cancel (check raising), the time cap or a job that
+        failed deletes it too. Nothing here raises except Cancelled, so the job is never re-created."""
+        if not cid:
+            return 0, {}
+        self._crawls.add(cid)
+        end = time.time() + wait
+        try:
+            while True:
+                self.check()
+                code, job = self._api_retry("GET", f"/v1/crawl/{cid}")
+                state = job.get("status")
+                if code == 200 and state == "completed":
+                    pages = self._crawl_pages(job)
+                    self._crawl_delete(cid)
+                    return 200, dict(job, data=pages, next=None)
+                if code in (0, 404) or state in ("failed", "cancelled"):
+                    self.log(f"  ! firecrawl crawl {cid}: {state or job.get('error') or f'HTTP {code}'}")
+                    return 0, {}
+                if time.time() > end:
+                    self.log(f"  ! firecrawl crawl {cid}: still {state} after {wait}s; cancelled")
+                    return 0, {}
+                time.sleep(poll)
+        finally:
+            if cid in self._crawls:            # cancelled, timed out or failed: stop Firecrawl's work
+                self._crawl_delete(cid)
+
+    def _crawl_pages(self, job):
+        """Every page of a finished crawl: Firecrawl pages large results ("next"). A page that
+        still fails after its retries ends the walk with what was collected."""
+        pages = list(job.get("data") or [])
+        nxt = job.get("next")
+        while nxt:
+            self.check()
+            u = urllib.parse.urlsplit(nxt)   # Firecrawl's idea of its own address; ours is FIRECRAWL_URL
+            code, more = self._api_retry("GET", u.path + (f"?{u.query}" if u.query else ""))
+            if code != 200:
+                self.log(f"  ! firecrawl crawl: page {u.query or u.path} failed ({more.get('error') or f'HTTP {code}'}); "
+                         f"keeping {len(pages)} page(s)")
+                break
+            pages += list(more.get("data") or [])
+            nxt = more.get("next")
+        return pages
+
+    def _crawl_delete(self, cid):
+        self._crawls.discard(cid)
+        try:
+            self._api("DELETE", f"/v1/crawl/{cid}", timeout=10)
+        except Exception as e:  # noqa: BLE001
+            self.log(f"  ! firecrawl crawl {cid}: delete failed: {e}")
