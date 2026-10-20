@@ -281,13 +281,19 @@ def check_firecrawl(mod):
     bare = {"source_id": a["source_id"], "title": a["title"], "location": a["location"], "board_url": s.POST, "card_html": "", "age_days": None}
     assert mod.fetch_job(s, board, bare)[0]["text"] == s.POST_MD
     assert mod.fetch_job(s, board, {**bare, "board_url": s.BOARD}) == []
-    # a front-door page without openings crawls its listing sub-page with the same extraction
+    # a front-door page without openings crawls its listing sub-page with the same extraction; a
+    # link-less opening is identified by the page it was found on, so the same title on two crawled
+    # pages is two cards while a repeat on one page is one
     s.calls.clear()
     front = {"markdown": "# Hi", "links": ["https://www.example.org/about", "https://www.example.org/jobs/"], "json": {"openings": []}}
-    s.firecrawl = lambda url, op="scrape", **o: (s.calls.append((op, url, o)) or (200, front if op == "scrape" else
-                  {"status": "completed", "data": [{"json": {"openings": [{"title": "Clerk"}]}}, {"json": {"openings": [{"title": "Clerk"}]}}]}))
+    clerk = {"title": "Clerk", "snippet": "Files."}
+    crawled = {"status": "completed", "data": [
+        {"json": {"openings": [clerk, dict(clerk)]}, "metadata": {"sourceURL": "https://www.example.org/jobs/"}},
+        {"json": {"openings": [clerk]}, "metadata": {"sourceURL": "https://www.example.org/jobs/page2"}}]}
+    s.firecrawl = lambda url, op="scrape", **o: (s.calls.append((op, url, o)) or (200, front if op == "scrape" else crawled))
     cards = mod.list_jobs(s, board, since_days=None, max_pages=3)
-    assert [c["title"] for c in cards] == ["Clerk"], cards
+    assert [c["title"] for c in cards] == ["Clerk", "Clerk"] and cards[0]["source_id"] != cards[1]["source_id"], cards
+    assert mod.list_jobs(s, board, since_days=None, max_pages=3)[0]["source_id"] == cards[0]["source_id"]   # stable across scans
     op, url, o = s.calls[-1]
     assert (op, url, o["limit"], o["maxDepth"], o["scrapeOptions"]["formats"]) == ("crawl", "https://www.example.org/jobs/", 3, 2, ["markdown", "links", "json"]), s.calls
 

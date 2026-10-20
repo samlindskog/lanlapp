@@ -17,7 +17,7 @@ import hashlib
 import re
 import urllib.parse
 
-from sources._util import base_fields, days_since, iso_date, split_url, within, log
+from sources._util import base_fields, days_since, dedupe, doc, iso_date, split_url, within, log
 
 DISPLAY_NAME = "Firecrawl (generic site)"
 KIND = "family"
@@ -55,14 +55,21 @@ def _openings(page):
     return [o for o in (ops or []) if isinstance(o, dict) and (o.get("title") or "").strip()]
 
 
-def _card(board, o):
+def _page_url(page, default):
+    meta = page.get("metadata") if isinstance(page.get("metadata"), dict) else {}
+    return meta.get("sourceURL") or meta.get("url") or default
+
+
+def _card(board, o, page_url):
     url = urllib.parse.urljoin(board["url"], (o.get("url") or "").strip()) if (o.get("url") or "").strip() else None
-    title, loc = o["title"].strip(), (o.get("location") or "").strip()
-    ident = url or f"{title}|{loc}"   # no link: the title and place are all that identify it
+    title, loc, snippet = o["title"].strip(), (o.get("location") or "").strip(), (o.get("snippet") or "").strip()
+    # no link: the page it was found on and its text are all that identify it, so two like-named
+    # openings on different pages stay apart while the same page content keeps its id across scans
+    ident = url or "|".join((page_url, title, loc, snippet))
     return {"source_id": hashlib.sha1(ident.encode()).hexdigest(), "title": title, "location": loc,
             "age_days": days_since(o.get("posted")), "open_date": iso_date(o.get("posted")),
             "close_date": iso_date(o.get("closes")), "board_url": url or board["url"], "card_html": "",
-            "url": url, "snippet": (o.get("snippet") or "").strip()}
+            "url": url, "snippet": snippet}
 
 
 def _listing_link(board, page):
@@ -76,25 +83,26 @@ def _listing_link(board, page):
     return None
 
 
+def _crawl(session, board, link, max_pages):
+    """The pages of a bounded crawl under a listing sub-page, extracted like the board page:
+    [(page, its URL)]."""
+    log(f"  {board['name']}: no openings on the page; crawling {link}")
+    status, job = session.firecrawl(link, "crawl", limit=max_pages, maxDepth=2,
+                                    scrapeOptions={"formats": LIST_FORMATS, "jsonOptions": JSON_OPTIONS})
+    return [(p, _page_url(p, link)) for p in (job.get("data") or [])] if status == 200 else []
+
+
 def list_jobs(session, board, since_days=None, max_pages=100):
     status, page = session.firecrawl(board["url"], "scrape", formats=LIST_FORMATS, jsonOptions=JSON_OPTIONS)
     if status != 200:
         log(f"  ! firecrawl: no page for {board['name']} (HTTP {status})")
         return []
-    pages = [page]
+    pages = [(page, board["url"])]
     if not _openings(page):
         link = _listing_link(board, page)
         if link:                      # the page is a front door; the list is one level in
-            log(f"  {board['name']}: no openings on the page; crawling {link}")
-            st, job = session.firecrawl(link, "crawl", limit=max_pages, maxDepth=2,
-                                        scrapeOptions={"formats": LIST_FORMATS, "jsonOptions": JSON_OPTIONS})
-            pages = list(job.get("data") or []) if st == 200 else []
-    cards, seen = [], set()
-    for p in pages:
-        for c in (_card(board, o) for o in _openings(p)):
-            if c["source_id"] not in seen:
-                seen.add(c["source_id"])
-                cards.append(c)
+            pages = _crawl(session, board, link, max_pages)
+    cards = dedupe([_card(board, o, u) for p, u in pages for o in _openings(p)])
     log(f"  {board['name']}: {len(cards)} cards")
     return within(cards, since_days)
 
@@ -112,12 +120,12 @@ def fetch_job(session, board, card):
     url = _posting_url(board, card)
     if not url:                       # link-less opening: the listing's snippet is all there is
         text = card.get("snippet") or ""
-        return [{"kind": "posting", "url": card["board_url"], "raw_html": None, "text": text}] if text else []
+        return [doc("posting", card["board_url"], None, text)] if text else []
     status, d = session.firecrawl(url, "scrape", formats=["markdown", "html"])
     text = (d.get("markdown") or "").strip()
     if status != 200 or not text:
         return []
-    return [{"kind": "posting", "url": url, "raw_html": d.get("html"), "text": text}]
+    return [doc("posting", url, d.get("html"), text)]
 
 
 def parse_fields(board, card, docs):

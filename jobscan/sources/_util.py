@@ -182,6 +182,12 @@ def base_fields(card):
             "open_date": card.get("open_date"), "close_date": card.get("close_date")}
 
 
+def dedupe(cards):
+    """The cards with every repeat of an earlier source_id dropped (order kept)."""
+    seen = set()
+    return [c for c in cards if c["source_id"] not in seen and not seen.add(c["source_id"])]
+
+
 def within(cards, since_days):
     """Keep cards no older than since_days; unknown ages are kept (dropping a new posting
     is worse than one extra fetch)."""
