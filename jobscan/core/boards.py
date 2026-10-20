@@ -36,14 +36,14 @@ def get_board(conn, ref):
 
 def fallback_board(adapter, url):
     """The board a fallback adapter (one whose match() never wins by URL) gets for a URL nothing
-    recognised. The key carries the normalised URL (scheme and host lowercased, no trailing slash,
-    no fragment) so the same page registers once however it was typed; the URL itself is kept as
+    recognised. The key carries the normalised URL (https, host lowercased, no trailing slash, no
+    fragment) so the same page registers once however it was typed; the URL itself is kept as
     given and verify() fills the name from the page."""
     url = url.strip()
     if not re.match(r"https?://", url, re.I):
         url = "https://" + url
     u = urllib.parse.urlsplit(url)
-    key = urllib.parse.urlunsplit((u.scheme.lower(), u.netloc.lower(), u.path.rstrip("/"), u.query, ""))
+    key = urllib.parse.urlunsplit(("https", u.netloc.lower(), u.path.rstrip("/"), u.query, ""))
     return {"key": f"{adapter}:{key}", "name": None, "url": url, "params": {}}
 
 def add_board(conn, url, name=None, include=None, exclude=None, adapter=None, params=None, session=None,
@@ -59,7 +59,9 @@ def add_board(conn, url, name=None, include=None, exclude=None, adapter=None, pa
     try:
         hit = None if adapter and adapter == fallback_adapter else S.detect(url, s, adapter=adapter)
         if not hit and fallback_adapter:
-            hit = fallback_adapter, fallback_board(fallback_adapter, url)
+            board = fallback_board(fallback_adapter, url)
+            browser.check_url(board["url"])   # detect() guards the URL before it probes; a forced fallback skipped detect()
+            hit = fallback_adapter, board
         if not hit:
             raise ValueError(f"no adapter recognises {url} (adapters: {', '.join(list_sources())})")
         adapter_name, board = hit

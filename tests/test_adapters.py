@@ -240,6 +240,16 @@ def check_fallback():
                  "url": "HTTPS://WWW.Example.org/careers/#jobs", "params": {}}, b
     assert fallback_board("firecrawl", " example.org/Jobs?x=1 ")["key"] == "firecrawl:https://example.org/Jobs?x=1"
     assert fallback_board("firecrawl", "https://example.org")["key"] == "firecrawl:https://example.org"
+    assert fallback_board("firecrawl", "http://example.org/careers")["key"] == "firecrawl:https://example.org/careers"
+    # a forced fallback skips detect() and with it its URL guard; add_board guards the URL itself
+    from core.boards import add_board
+    import browser
+    for url in ("http://127.0.0.1:8080/jobs", "https://db/", "ftp://example.org/jobs"):
+        try:
+            add_board(None, url, adapter="firecrawl", session=FirecrawlSession(), fallback_adapter="firecrawl")
+            raise AssertionError(f"add_board fetched {url}")
+        except browser.UnsafeURL:
+            pass
 
 
 def check_firecrawl(mod):
