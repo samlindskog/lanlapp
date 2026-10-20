@@ -13,6 +13,14 @@ sys.path.insert(0, os.path.join(HERE, "..", "jobscan"))
 import jobscan as J  # noqa: E402
 
 
+def _fake_dns():
+    """Resolve *.example.com to a public address without DNS; everything else stays real."""
+    import browser as B
+    real = getattr(B, "_real_resolve", B.resolve)
+    B._real_resolve = real
+    B.resolve = lambda host: ["93.184.216.34"] if host.endswith(".example.com") else real(host)
+
+
 def check_guards():
     from browser import check_url, UnsafeURL
     for bad in ("http://127.0.0.1:8090/mcp", "http://localhost/", "http://db:5432/", "http://169.254.169.254/latest",
@@ -37,7 +45,7 @@ def check_escalation():
     immediate 403s; a host that works direct never sees the proxy; a tunnel refusal moves to the
     next proxy; a new Session starts clean."""
     import browser as B
-    B._host_ok.update({"fine.example.com", "blocked.example.com", "flaky.example.com", "gov.example.com"})  # skip DNS
+    _fake_dns()
     cfg = B.Config({"JOBSCAN_BROWSER": "0", "JOBSCAN_PROXY": "http://u-session-{session}:p@gw.example.net:7000",
                     "JOBSCAN_PROXY_TRIES": "3"})
     calls = []
@@ -205,7 +213,7 @@ def check_relay():
     env = {"JOBSCAN_BROWSER": "1", "JOBSCAN_RELAY_PORT": "0", "JOBSCAN_RELAY_BIND": "127.0.0.1",
            "JOBSCAN_PROXY": f"http://u:pw@127.0.0.1:{uport}, http://u:pw@127.0.0.1:{_dead_port()}", "JOBSCAN_PROXY_TRIES": "3"}
     cfg = B.Config(env)
-    allow = lambda host: host                                   # the real guard refuses loopback  # noqa: E731
+    allow = lambda host, port: [host]                           # the real guard refuses loopback and odd ports  # noqa: E731
     with B.Session(lambda m: None, cfg, dest_check=allow) as s:
         assert s.relay is not None and s.chrome.proxy == f"http://127.0.0.1:{s.relay.port}"
         port = s.relay.port
@@ -240,6 +248,20 @@ def check_relay():
         assert _tunnel_get(s.relay.port, oport)[0] == 403
         assert _relay_request(s.relay.port, b"CONNECT localhost:80 HTTP/1.1\r\n\r\n")[0] == 403
         assert _relay_request(s.relay.port, b"CONNECT 10.0.0.5:443 HTTP/1.1\r\n\r\n")[0] == 403
+        assert _relay_request(s.relay.port, b"CONNECT fine.example.com:8080 HTTP/1.1\r\n\r\n")[0] == 403   # web ports only
+        assert _relay_request(s.relay.port, b"GET http://fine.example.com:8000/ HTTP/1.1\r\n\r\n")[0] == 403
+        assert s.relay._peer_ok("127.0.0.1") and not s.relay._peer_ok("172.31.0.5")      # loopback only by default
+    with B.Session(lambda m: None, B.Config(dict(env, JOBSCAN_RELAY_PEERS="172.31.0.0/24, 10.9.0.0/16"))) as s:
+        ok = s.relay._peer_ok
+        assert ok("172.31.0.5") and ok("::ffff:172.31.0.9") and ok("10.9.3.4") and ok("::1")
+        assert not ok("172.31.1.5") and not ok("192.168.1.1") and not ok("8.8.8.8")
+    assert B.check_host("fine.example.com") == ["93.184.216.34"] and B.check_dest("fine.example.com", 443)
+    for host, port in (("fine.example.com", 8080), ("localhost", 443), ("10.0.0.5", 80)):
+        try:
+            B.check_dest(host, port)
+        except B.UnsafeURL:
+            continue
+        raise AssertionError(f"check_dest accepted {bad}")
     with B.Session(lambda m: None, B.Config({"JOBSCAN_BROWSER": "0"})) as s:              # plain HTTP: no relay
         assert s.relay is None
     origin.shutdown()
@@ -303,7 +325,7 @@ def check_firecrawl():
     completion, a cancel mid-poll deletes the job, a private target never reaches Firecrawl, and
     without FIRECRAWL_URL the call fails loudly."""
     import browser as B
-    B._host_ok.update({"fine.example.com", "blocked.example.com", "flaky.example.com", "forever.example.com", "gone.example.com"})
+    _fake_dns()
     srv, port, seen = _firecrawl_server()
     cfg = B.Config({"JOBSCAN_BROWSER": "0", "FIRECRAWL_URL": f"http://127.0.0.1:{port}/", "JOBSCAN_RELAY_PORT": "0",
                     "JOBSCAN_RELAY_BIND": "127.0.0.1", "JOBSCAN_PROXY": "http://u:p@gw.example.net:7000", "JOBSCAN_PROXY_TRIES": "2"})

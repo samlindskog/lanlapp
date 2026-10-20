@@ -5,7 +5,8 @@ browser lifecycle. Adapters only ever see session.fetch(url, ...) -> (status, bo
 Layers (each testable on its own):
   Config        everything read from the environment, in one place
   check_url     refuses loopback/private/link-local targets before any request (check_host: the
-                same guard on a bare hostname, applied by the relay to every tunnel)
+                same guard on a bare hostname, returning the checked addresses; check_dest: that
+                plus web ports only, applied by the relay to every tunnel)
   ProxyPool     escalation level -> proxy URL (Decodo sticky ports, or the gateway with {session}
                 and {country} placeholders: a fresh session per level, countries cycled)
   Access        per-host state for one operation: direct -> proxy levels -> blocked
@@ -29,9 +30,10 @@ Env (Config):
                            firecrawl adapter fails at scan time); point its PROXY_SERVER at the relay
   JOBSCAN_RELAY_PORT       the relay's port (default 8899; 0 = ephemeral); one Session at a time
                            (the capacity slot), so a port in use is an error, not a retry
-  JOBSCAN_RELAY_BIND       the relay's address (default 0.0.0.0: a Firecrawl container on the same
-                           Docker network can use it; the container publishes no ports, and the relay
-                           accepts only loopback and private peers)
+  JOBSCAN_RELAY_BIND       the relay's address (default 0.0.0.0 so a Firecrawl container on the same
+                           Docker network can reach it; the container publishes no ports)
+  JOBSCAN_RELAY_PEERS      networks the relay serves besides loopback, comma-separated CIDRs (e.g.
+                           172.31.0.0/24, the crawl network); default empty: loopback only
   JOBSCAN_PROXY            proxies, one per escalation level: comma/space/newline-separated
                            http://user:pass@host:port or host:port:user:pass entries, or one URL with
                            {session} (and optionally {country}) in the username, e.g.
@@ -102,6 +104,8 @@ class Config:
         self.browser_dir = env.get("JOBSCAN_BROWSER_DIR") or None
         self.relay_bind = env.get("JOBSCAN_RELAY_BIND") or "0.0.0.0"
         self.relay_port = int(env.get("JOBSCAN_RELAY_PORT", "8899") or 0)
+        self.relay_peers = [ipaddress.ip_network(p.strip(), strict=False)
+                            for p in env.get("JOBSCAN_RELAY_PEERS", "").split(",") if p.strip()]
         self.firecrawl = (env.get("FIRECRAWL_URL") or "").rstrip("/") or None
 
 
@@ -125,27 +129,38 @@ def check_url(url):
 
 
 def check_host(host):
-    """The destination half of check_url: the host must resolve to public addresses only. Also
-    applied by the ProxyRelay to every tunnel it opens, so traffic the Session never sees as a URL
-    (Firecrawl's redirects, a page's subresources) meets the same guard."""
+    """The destination half of check_url: the host must resolve to public addresses only; returns
+    those addresses. Resolved afresh on every call (no cache): the relay dials one of the addresses
+    it was handed, so what was checked is what is connected to and a record that changes between
+    check and connect (DNS rebinding) cannot point a tunnel at a private address."""
     host = host.lower()
     if host in ("localhost",) or host.endswith(".localhost") or host.endswith(".internal") or "." not in host:
         raise UnsafeURL(f"refusing internal host {host}")
-    if host in _host_ok:                       # one lookup per host per process, not per request
-        return host
-    try:
-        infos = socket.getaddrinfo(host, None)
-    except socket.gaierror as e:
-        raise UnsafeURL(f"cannot resolve {host}: {e}") from None
-    for info in infos:
-        ip = ipaddress.ip_address(info[4][0])
+    addrs = resolve(host)
+    for addr in addrs:
+        ip = ipaddress.ip_address(addr)
         if not ip.is_global or ip.is_multicast:
             raise UnsafeURL(f"refusing non-public address {ip} for {host}")
-    _host_ok.add(host)
-    return host
+    return addrs
 
 
-_host_ok = set()
+def resolve(host):
+    """The host's addresses, in resolver order (a module attribute so offline tests can stub DNS)."""
+    try:
+        return [info[4][0] for info in socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)]
+    except socket.gaierror as e:
+        raise UnsafeURL(f"cannot resolve {host}: {e}") from None
+
+
+RELAY_PORTS = (80, 443)
+
+
+def check_dest(host, port):
+    """The relay's guard for one tunnel: web ports only (the relay is not a general CONNECT proxy
+    for whoever can reach it), then check_host; returns the addresses a direct connect may dial."""
+    if port not in RELAY_PORTS:
+        raise UnsafeURL(f"refusing port {port} for {host}: only {' and '.join(map(str, RELAY_PORTS))}")
+    return check_host(host)
 
 
 def _ssl_context():
@@ -412,14 +427,18 @@ class ProxyRelay:
     connect that fails gets the same 502; at level 0 fetch treats the error as transient (retry,
     then (0, "")) rather than as a reason to escalate, like plain HTTP does for an unreachable host.
 
-    It binds 0.0.0.0 so Docker-network peers (Firecrawl) can reach it; the container publishes no
-    ports, and peers must be loopback or private addresses (RFC1918, link-local) regardless, so
-    the relay can never serve as an open proxy."""
+    Who may use it: loopback (Chrome) and the networks listed in JOBSCAN_RELAY_PEERS (the Docker
+    network Firecrawl shares with the app; the container publishes no ports). Where it may go:
+    ports 80 and 443 of hosts that resolve to public addresses, and for a direct connect only the
+    addresses that were just checked. That is the whole surface: it is not a general CONNECT
+    proxy for whoever can reach the container."""
 
-    def __init__(self, access, bind="127.0.0.1", port=0, log=_stderr, dest_check=check_host):
+    def __init__(self, access, cfg, log=_stderr, dest_check=check_dest):
         self.access = access
         self.log = log
-        self.dest_check = dest_check       # tests allow loopback destinations through here
+        self.peers = cfg.relay_peers
+        self.dest_check = dest_check       # (host, port) -> addresses; tests allow loopback through here
+        bind, port = cfg.relay_bind, cfg.relay_port
         self.sock = socket.socket(socket.AF_INET6 if ":" in bind else socket.AF_INET)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
@@ -441,21 +460,21 @@ class ProxyRelay:
                 break
             threading.Thread(target=self._handle, args=(client, peer[0]), daemon=True).start()
 
-    @staticmethod
-    def _peer_ok(peer):
+    def _peer_ok(self, peer):
         ip = ipaddress.ip_address(peer)
         ip = getattr(ip, "ipv4_mapped", None) or ip
-        return ip.is_private                   # loopback, RFC1918, link-local
+        return ip.is_loopback or any(ip in net for net in self.peers)
 
-    def route(self, host):
-        """The operation's policy for one destination: ("refuse", why) or ("ok", upstream URL or None)."""
+    def route(self, host, port):
+        """The operation's policy for one destination: ("refuse", why, None), or ("ok", upstream
+        proxy URL or None for direct, the checked addresses a direct connect may dial)."""
         if host in self.access.blocked:
-            return "refuse", "blocked for this operation"
+            return "refuse", "blocked for this operation", None
         try:
-            self.dest_check(host)
+            addrs = self.dest_check(host, port)
         except UnsafeURL as e:
-            return "refuse", str(e)
-        return "ok", self.access.pool.url(self.access.level(f"http://{host}/"))
+            return "refuse", str(e), None
+        return "ok", self.access.pool.url(self.access.level(f"http://{host}/")), addrs
 
     def _handle(self, client, peer):
         up = None
@@ -475,13 +494,13 @@ class ProxyRelay:
             if not req.host:
                 client.sendall(_reply(400, "bad request"))
                 return
-            verdict, upstream = self.route(req.host)
+            verdict, upstream, addrs = self.route(req.host, req.port)
             if verdict == "refuse":
-                self.log(f"  ! relay: refused {req.host}: {upstream}")
-                client.sendall(_reply(403, f"refused {req.host}: {upstream}"))
+                self.log(f"  ! relay: refused {req.host}:{req.port}: {upstream}")
+                client.sendall(_reply(403, f"refused {req.host}:{req.port}: {upstream}"))
                 return
             try:
-                up = self._connect(req, upstream)
+                up = self._connect(req, upstream, addrs)
             except OSError as e:
                 self.log(f"  ! relay: cannot reach {ProxyPool.label(upstream) if upstream else req.host}: {e}")
                 client.sendall(_reply(502, f"cannot reach {req.host}"))
@@ -505,9 +524,18 @@ class ProxyRelay:
                     pass
 
     @staticmethod
-    def _connect(req, upstream):
+    def _connect(req, upstream, addrs):
         if not upstream:
-            return socket.create_connection((req.host, req.port), timeout=PAGE_TIMEOUT)
+            # Direct: dial the addresses the check returned, never the name again (DNS rebinding).
+            # Through a proxy the name goes to the upstream, which resolves it on its own network,
+            # where our private ranges do not exist.
+            last = None
+            for addr in addrs:
+                try:
+                    return socket.create_connection((addr, req.port), timeout=PAGE_TIMEOUT)
+                except OSError as e:
+                    last = e
+            raise last or OSError(f"no address for {req.host}")
         scheme, host, port, _, _ = _proxy_parts(upstream)
         up = socket.create_connection((host, port), timeout=PAGE_TIMEOUT)
         if scheme == "https":
@@ -902,7 +930,7 @@ class Session:
     firecrawl(url, op="scrape", **options): (status, data), the same loop for a self-hosted
     Firecrawl (FIRECRAWL_URL) whose own traffic runs through this Session's relay."""
 
-    def __init__(self, log=None, cfg=None, check=None, dest_check=check_host):
+    def __init__(self, log=None, cfg=None, check=None, dest_check=check_dest):
         self.cfg = cfg or Config()
         self.log = log or _stderr
         self._crawls = set()                     # live Firecrawl crawl ids, deleted on close/cancel
@@ -918,7 +946,7 @@ class Session:
     def __enter__(self):
         # The relay is the way out for Chrome and for Firecrawl; plain HTTP uses the proxies itself.
         if self.cfg.enabled or self.cfg.firecrawl:
-            self.relay = ProxyRelay(self.access, self.cfg.relay_bind, self.cfg.relay_port, self.log, self.dest_check)
+            self.relay = ProxyRelay(self.access, self.cfg, self.log, self.dest_check)
             self.chrome.proxy = f"http://{self.relay.addr}"
         self._token = _current_log.set(self.log)
         return self
