@@ -1046,12 +1046,15 @@ class Session:
         {"url": url, **options}. data is Firecrawl's parsed JSON for the operation ({} on failure):
         the "data" object of a scrape, the whole {"links": [...]} reply of a map, and for a crawl
         the finished job ({"status": "completed", "data": [pages]}), polled with check() between
-        polls (poll seconds apart, wait seconds in all) and deleted on cancel or close. A scrape's
-        status is the target's (metadata.statusCode); a blocked one escalates the host and retries,
-        which takes effect because Firecrawl's traffic runs through this Session's relay (set
-        PROXY_SERVER on the Firecrawl side to the relay). Firecrawl's own base URL is an internal
-        service and is not subject to check_url; only the target is. Firecrawl 5xx, timeouts and
-        connection errors retry with backoff like fetch; a 4xx from Firecrawl is final."""
+        polls (poll seconds apart, wait seconds in all), deleted on cancel or close, and once it
+        exists never created again: polls and page fetches retry in place. A scrape's status is
+        the target's (metadata.statusCode); a blocked one escalates the host and retries, which
+        takes effect because Firecrawl's traffic runs through this Session's relay (set
+        PROXY_SERVER on the Firecrawl side to the relay). A map carries no target status, so a
+        blocked site shows as an empty or short link list, not as an escalation. Firecrawl's own
+        base URL is an internal service and is not subject to check_url; only the target is.
+        Firecrawl 5xx, timeouts and connection errors retry with backoff like fetch; a 4xx from
+        Firecrawl is final."""
         if not self.cfg.firecrawl:
             raise RuntimeError("FIRECRAWL_URL is not set: the firecrawl adapter needs a self-hosted Firecrawl "
                                "(e.g. http://firecrawl-api:3002) that routes through this service's relay")
@@ -1098,9 +1101,10 @@ class Session:
     def _target_status(data):
         """A scrape's outcome as the target saw it: (HTTP status, the content the challenge
         check reads). Firecrawl reports the target's status in metadata.statusCode."""
-        data = data or {}
-        try:
-            status = int((data.get("metadata") or {}).get("statusCode") or 200)
+        data = data if isinstance(data, dict) else {}
+        meta = data.get("metadata")
+        try:                                   # an odd reply is the target's success, not a retry
+            status = int((meta if isinstance(meta, dict) else {}).get("statusCode") or 200)
         except (TypeError, ValueError):
             status = 200
         return status, data.get("markdown") or data.get("html") or ""
@@ -1123,8 +1127,28 @@ class Session:
             data = {"error": raw[:200]}
         return r.status, data if isinstance(data, dict) else {"data": data}
 
+    def _api_retry(self, method, path, tries=3):
+        """_api with Firecrawl 5xx, timeouts and connection errors retried in place: (status,
+        JSON), or (0, {"error": ...}) when the tries are spent. Used once a crawl job exists, so a
+        hiccup never bubbles up to firecrawl()'s attempt loop, which would create a second job."""
+        last = None
+        for i in range(tries):
+            try:
+                code, data = self._api(method, path)
+                if code < 500:
+                    return code, data
+                last = f"HTTP {code}: {str(data.get('error') or '')[:120]}"
+            except Cancelled:
+                raise
+            except Exception as e:  # noqa: BLE001
+                last = e
+            time.sleep(1.5 * (i + 1))
+        return 0, {"error": str(last)}
+
     def _crawl_wait(self, cid, wait, poll):
-        """Poll a crawl job to completion; cancel (check raising) or the time cap deletes it."""
+        """Poll a crawl job to completion and read its pages; the finished job is then deleted
+        (Firecrawl keeps results otherwise). Cancel (check raising), the time cap or a job that
+        failed deletes it too. Nothing here raises except Cancelled, so the job is never re-created."""
         if not cid:
             return 0, {}
         self._crawls.add(cid)
@@ -1132,14 +1156,14 @@ class Session:
         try:
             while True:
                 self.check()
-                code, job = self._api("GET", f"/v1/crawl/{cid}")
+                code, job = self._api_retry("GET", f"/v1/crawl/{cid}")
                 state = job.get("status")
                 if code == 200 and state == "completed":
-                    self._crawls.discard(cid)
-                    return 200, self._crawl_pages(job)
-                if code == 404 or state in ("failed", "cancelled"):
-                    self.log(f"  ! firecrawl crawl {cid}: {state or f'HTTP {code}'}")
-                    self._crawls.discard(cid)
+                    pages = self._crawl_pages(job)
+                    self._crawl_delete(cid)
+                    return 200, dict(job, data=pages, next=None)
+                if code in (0, 404) or state in ("failed", "cancelled"):
+                    self.log(f"  ! firecrawl crawl {cid}: {state or job.get('error') or f'HTTP {code}'}")
                     return 0, {}
                 if time.time() > end:
                     self.log(f"  ! firecrawl crawl {cid}: still {state} after {wait}s; cancelled")
@@ -1150,18 +1174,21 @@ class Session:
                 self._crawl_delete(cid)
 
     def _crawl_pages(self, job):
-        """A finished crawl's reply with every page: Firecrawl pages large results ("next")."""
+        """Every page of a finished crawl: Firecrawl pages large results ("next"). A page that
+        still fails after its retries ends the walk with what was collected."""
         pages = list(job.get("data") or [])
         nxt = job.get("next")
         while nxt:
             self.check()
             u = urllib.parse.urlsplit(nxt)   # Firecrawl's idea of its own address; ours is FIRECRAWL_URL
-            code, more = self._api("GET", u.path + (f"?{u.query}" if u.query else ""))
+            code, more = self._api_retry("GET", u.path + (f"?{u.query}" if u.query else ""))
             if code != 200:
+                self.log(f"  ! firecrawl crawl: page {u.query or u.path} failed ({more.get('error') or f'HTTP {code}'}); "
+                         f"keeping {len(pages)} page(s)")
                 break
             pages += list(more.get("data") or [])
             nxt = more.get("next")
-        return dict(job, data=pages, next=None)
+        return pages
 
     def _crawl_delete(self, cid):
         self._crawls.discard(cid)

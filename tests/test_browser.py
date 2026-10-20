@@ -274,7 +274,7 @@ def _firecrawl_server():
     crawl (two polls of 'scraping', then completed; a 'forever' target never completes), delete."""
     import json
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-    seen = {"scrape": [], "crawl": [], "polls": 0, "deleted": []}
+    seen = {"scrape": [], "crawl": [], "polls": 0, "pages": 0, "deleted": []}
 
     class H(BaseHTTPRequestHandler):
         def _send(self, code, obj):
@@ -303,11 +303,17 @@ def _firecrawl_server():
             self._send(404, {"success": False, "error": "no such op"})
 
         def do_GET(self):
+            if "skip=2" in self.path:                                   # the second page: fails once
+                seen["pages"] += 1
+                if seen["pages"] == 1:
+                    return self._send(500, {"success": False, "error": "flaky page"})
+                return self._send(200, {"status": "completed", "data": [{"markdown": "p3"}]})
             seen["polls"] += 1
             forever = "forever" in seen["crawl"][-1]["url"]
             if seen["polls"] < 3 or forever:
                 return self._send(200, {"status": "scraping", "completed": 1, "total": 3})
-            self._send(200, {"status": "completed", "data": [{"markdown": "p1"}, {"markdown": "p2"}]})
+            self._send(200, {"status": "completed", "data": [{"markdown": "p1"}, {"markdown": "p2"}],
+                             "next": f"http://firecrawl-api:3002{self.path}?skip=2"})
 
         def do_DELETE(self):
             seen["deleted"].append(self.path.rsplit("/", 1)[1])
@@ -341,8 +347,9 @@ def check_firecrawl():
         assert status == 200 and data["markdown"] == "# Jobs"
         assert s.firecrawl("https://fine.example.com/", op="map")[1]["links"] == ["https://fine.example.com/a", "https://fine.example.com/b"]
         status, data = s.firecrawl("https://fine.example.com/", op="crawl", poll=0.01, limit=3)
-        assert status == 200 and data["status"] == "completed" and [p["markdown"] for p in data["data"]] == ["p1", "p2"]
-        assert seen["polls"] == 3 and seen["crawl"][-1]["limit"] == 3 and not seen["deleted"] and not s._crawls
+        assert status == 200 and data["status"] == "completed" and [p["markdown"] for p in data["data"]] == ["p1", "p2", "p3"]
+        assert seen["polls"] == 3 and seen["pages"] == 2 and seen["crawl"][-1]["limit"] == 3 and len(seen["crawl"]) == 1
+        assert seen["deleted"] == ["job1"] and not s._crawls                                # one job, read then deleted
         assert s.firecrawl("http://127.0.0.1:1/") == (0, {}) and s.firecrawl("http://localhost/") == (0, {})
         s.access.blocked.add("gone.example.com")
         assert s.firecrawl("https://gone.example.com/") == (403, {})
@@ -360,7 +367,7 @@ def check_firecrawl():
             pass
         else:
             raise AssertionError("cancel did not propagate")
-        assert seen["deleted"] == ["job2"] and not s._crawls
+        assert seen["deleted"] == ["job1", "job2"] and not s._crawls
     with B.Session(lambda m: None, B.Config({"JOBSCAN_BROWSER": "0"})) as s:
         try:
             s.firecrawl("https://fine.example.com/")
