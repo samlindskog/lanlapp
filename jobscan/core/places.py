@@ -6,7 +6,7 @@ import json
 import browser
 from core.boards import add_board, get_board
 from core.db import now
-from core.geo import DEDUP_M, distance_m, host_of, norm_name
+from core.geo import DEDUP_M, distance_m, host_of, norm_name, web_url
 
 # ---------------------------------------------------------------- the places table
 PLACE_COLS = ("name", "norm_name", "lat", "lon", "address", "city", "state", "phone", "website", "careers_url",
@@ -65,9 +65,10 @@ def upsert_place(conn, pl, run_id=None):
     DEDUP_M metres, or the same website host): (row, is_new). An existing row keeps what it
     resolved (website, careers page, board) and gains the union of categories and finder ids."""
     nn = pl.get("norm_name") or norm_name(pl["name"])
+    site = web_url(pl.get("website"))                  # a finder's tag or a search hit: only http(s) is kept
     row = next((r for r in conn.execute("SELECT * FROM places WHERE norm_name=%s", (nn,))
                 if r["lat"] is not None and distance_m(r["lat"], r["lon"], pl["lat"], pl["lon"]) <= DEDUP_M), None)
-    host = host_of(pl.get("website")) if pl.get("website") else None
+    host = host_of(site) if site else None
     if row is None and host:
         row = next((r for r in conn.execute("SELECT * FROM places WHERE website ILIKE %s ORDER BY id", (f"%{host}%",))
                     if host_of(r["website"]) == host), None)
@@ -79,10 +80,10 @@ def upsert_place(conn, pl, run_id=None):
             address=COALESCE(address,%s), city=COALESCE(city,%s), state=COALESCE(state,%s),
             phone=COALESCE(phone,%s), website=COALESCE(website,%s) WHERE id=%s""",
                      (t, run_id, json.dumps(cats), json.dumps(fids), pl.get("address"), pl.get("city"),
-                      pl.get("state"), pl.get("phone"), pl.get("website"), row["id"]))
+                      pl.get("state"), pl.get("phone"), site, row["id"]))
         return get_place(conn, row["id"]), False
     vals = (pl["name"], nn, pl["lat"], pl["lon"], pl.get("address"), pl.get("city"), pl.get("state"), pl.get("phone"),
-            pl.get("website"), None, None, "active", json.dumps(pl.get("finder_ids") or {}),
+            site, None, None, "active", json.dumps(pl.get("finder_ids") or {}),
             json.dumps(sorted(set(pl.get("categories") or []))), None, None, None, run_id, run_id, t, t)
     r = conn.execute(f"INSERT INTO places ({', '.join(PLACE_COLS)}) VALUES ({', '.join(['%s'] * len(PLACE_COLS))}) RETURNING *",
                      vals).fetchone()
@@ -120,7 +121,8 @@ def register_place_board(conn, row, url, session, log=lambda m: None):
 
 def update_place(conn, place_id, status=None, website=None, careers_url=None, session=None, log=lambda m: None):
     """The page's edits to a place: status (active | ignored), website, careers_url (registers
-    the board at once through the caller's Session; '' forgets the page and its board)."""
+    the board at once through the caller's Session; '' forgets the page and its board). A URL
+    that is not http(s) is a ValueError."""
     row = get_place(conn, place_id)
     if not row:
         raise KeyError(f"place {place_id}")
@@ -129,12 +131,22 @@ def update_place(conn, place_id, status=None, website=None, careers_url=None, se
             raise ValueError("status must be active or ignored")
         set_fields(conn, row, status=status)
     if website is not None:
-        site = website.strip() or None
+        site = _explicit_url(website, "website")
         set_fields(conn, row, website=site, careers_kind=None if site and row["careers_kind"] == "no_site" else row["careers_kind"])
     if careers_url is not None:
-        url = careers_url.strip()
+        url = _explicit_url(careers_url, "careers_url")
         if not url:
             set_fields(conn, row, careers_url=None, careers_kind="none", board_id=None, careers_text=None)
         else:
             register_place_board(conn, row, url, session, log)
     return get_place(conn, row["id"])
+
+
+def _explicit_url(text, what):
+    """A URL typed by the user: '' clears the field, anything else must be http(s)."""
+    if not (text or "").strip():
+        return None
+    u = web_url(text)
+    if not u:
+        raise ValueError(f"{what} must be an http(s) URL")
+    return u

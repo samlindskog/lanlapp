@@ -5,7 +5,7 @@ the run's Session."""
 import html as html_lib
 import re
 import urllib.parse
-from core.geo import host_of, norm_name, origin_of
+from core.geo import host_of, norm_name, origin_of, web_url
 from core.text import html_to_text
 
 _STOP = {"the", "and", "of", "in", "at", "for", "a", "an", "on", "to", "de", "la", "le", "los", "las", "el"}
@@ -49,9 +49,9 @@ def resembles(name, url, title=""):
 def pick_website(name, results):
     """The first search result that is not a directory and resembles the name, or None."""
     for r in results or []:
-        u = r.get("url") or ""
-        if u.startswith("http") and not is_aggregator(u) and resembles(name, u, r.get("title") or ""):
-            return u.split("#")[0]
+        u = web_url(r.get("url"))
+        if u and not is_aggregator(u) and resembles(name, u, r.get("title") or ""):
+            return u
     return None
 
 
@@ -95,8 +95,8 @@ def careers_links(html, base_url):
             continue
         text = re.sub(r"\s+", " ", html_lib.unescape(re.sub(r"<[^>]+>", " ", m[2]))).strip()
         text = " ".join(x for x in (text, attrs.get("title"), attrs.get("aria-label")) if x)
-        url = urllib.parse.urljoin(base_url, href).split("#")[0]
-        if not url.startswith("http") or is_aggregator(url):
+        url = web_url(urllib.parse.urljoin(base_url, href))
+        if not url or is_aggregator(url):
             continue
         score = _score_link(url, text, base_url)
         if score:
@@ -114,11 +114,12 @@ def careers_from_links(links, base_url):
     scored = []
     for i, link in enumerate(links or []):
         url, title = (link, "") if isinstance(link, str) else ((link or {}).get("url") or "", (link or {}).get("title") or "")
-        if not url.startswith("http") or is_aggregator(url):
+        url = web_url(url)
+        if not url or is_aggregator(url):
             continue
         score = _score_link(url, title, base_url)
         if score:
-            scored.append((-score, i, url.split("#")[0]))
+            scored.append((-score, i, url))
     return [u for _, _, u in sorted(scored)]
 
 

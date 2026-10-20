@@ -55,16 +55,21 @@ def check_websites():
     assert not careers.is_aggregator("https://firstcommunitybank.example.com/")
     assert not careers.is_aggregator("https://yelp.example.com/") and not careers.is_aggregator("https://notyelp.com/")
     assert not careers.is_aggregator("https://bbb.example.org/")       # a label is not a domain
+    assert geo.web_url("https://Acme.example.com/jobs?x=1#top") == "https://Acme.example.com/jobs?x=1"
+    assert geo.web_url(" http://a.example.com ") == "http://a.example.com"
+    for bad in ("javascript:alert(1)", "mailto:hr@acme.example.com", "www.acme.example.com", "/careers", "ftp://x.example.com/", "", None, "https://"):
+        assert geo.web_url(bad) is None, bad
     assert careers.resembles("First Community Bank", "https://www.firstcommunitybank.example.com/", "")
     assert careers.resembles("First Community Bank", "https://fcb.example.com/", "First Community Bank | Home")
     assert not careers.resembles("First Community Bank", "https://fcb.example.com/", "Some other bank")
     assert careers.resembles("Walmart", "https://walmart.com/store/123", "")
     results = [{"url": "https://www.yelp.com/biz/first-community-bank", "title": "First Community Bank - Yelp"},
                {"url": "https://www.randomnews.example.com/story", "title": "A story"},
+               {"url": "javascript:alert(1)", "title": "First Community Bank"},
                {"url": "https://www.firstcommunitybank.example.com/#top", "title": "Home"},
                {"url": "https://other.example.com/", "title": "First Community Bank"}]
     assert careers.pick_website("First Community Bank", results) == "https://www.firstcommunitybank.example.com/"
-    assert careers.pick_website("First Community Bank", results[:2]) is None
+    assert careers.pick_website("First Community Bank", results[:3]) is None
 
 
 SAMPLE = """<html><head><title>Acme</title></head><body><nav>
@@ -72,6 +77,7 @@ SAMPLE = """<html><head><title>Acme</title></head><body><nav>
 <a href="/about/careers" title="Careers at Acme">Join Our Team</a>
 <a href="https://www.indeed.com/cmp/acme/jobs">Jobs on Indeed</a>
 <a href="mailto:hr@acme.example.com">Email HR</a> <a href='/employment'>Employment</a>
+<a href="javascript:openJobs()">Jobs</a> <a href="ftp://files.acme.example.com/careers">Careers archive</a>
 <a href="https://acme.wd1.myworkdayjobs.com/External">Current openings</a>
 </nav></body></html>"""
 
@@ -82,8 +88,8 @@ def check_careers_links():
     assert set(links) == {"https://acme.example.com/about/careers", "https://acme.example.com/employment",
                           "https://acme.wd1.myworkdayjobs.com/External"}, links
     assert careers.careers_links("<a href='/x'>Contact</a>", "https://a.example.com") == []
-    m = careers.careers_from_links(["https://c.example.com/about", "https://c.example.com/join-the-team",
-                               {"url": "https://c.example.com/x", "title": "Careers"}], "https://c.example.com")
+    m = careers.careers_from_links(["https://c.example.com/about", "https://c.example.com/join-the-team", "javascript:jobs()",
+                                    {"url": "https://c.example.com/x", "title": "Careers"}], "https://c.example.com")
     assert m == ["https://c.example.com/x", "https://c.example.com/join-the-team"], m
 
 
@@ -108,8 +114,10 @@ def check_registry_and_osm():
     assert p == {"name": "City Hall", "lat": 35.1, "lon": -106.6, "address": "1 Civic Plaza", "city": "Albuquerque",
                  "state": "NM", "phone": "+1 505", "website": "https://cabq.example.gov", "category": "government",
                  "finder_id": "node/7"}, p
-    way = {"type": "way", "id": 9, "center": {"lat": 35.2, "lon": -106.7}, "tags": {"name": "Plant", "industrial": "factory"}}
+    way = {"type": "way", "id": 9, "center": {"lat": 35.2, "lon": -106.7}, "tags": {"name": "Plant", "industrial": "factory", "website": "www.plant.example.com"}}
     assert osm._place(way, "manufacturing")["finder_id"] == "way/9" and osm._place({"type": "node", "id": 1, "tags": {}}, "x") is None
+    assert osm._place(way, "manufacturing")["website"] == "https://www.plant.example.com"      # a bare host gets a scheme
+    assert osm._place({**way, "tags": {"name": "P", "website": "javascript:alert(1)"}}, "x")["website"] is None
     assert finders.names() == ["osm"] and finders.configured() == {"osm": True}
     assert osm.NAME == "osm" and osm.DISPLAY_NAME and callable(osm.find)
 
@@ -320,11 +328,13 @@ def check_pipeline():
         assert r["careers_kind"] == "adapter:firecrawl" and r["board_id"] and r["board_name"] == "Shop", r
         r = J.update_place(conn, pid, careers_url="")
         assert r["careers_kind"] == "none" and r["board_id"] is None and r["careers_url"] is None, r
-        try:
-            J.update_place(conn, pid, status="gone")
-            raise AssertionError("bad status accepted")
-        except ValueError:
-            pass
+        for bad in ({"status": "gone"}, {"website": "javascript:alert(1)"}, {"careers_url": "mailto:hr@shop.example.com"}):
+            try:
+                J.update_place(conn, pid, **bad)
+                raise AssertionError(f"accepted {bad}")
+            except ValueError:
+                pass
+        assert J.update_place(conn, pid, website="https://shop.example.com/#home")["website"] == "https://shop.example.com/"
         try:
             J.update_place(conn, 999)
             raise AssertionError("unknown place accepted")

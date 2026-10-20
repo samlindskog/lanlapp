@@ -128,6 +128,16 @@ def origin_of(url):
     return f"{u.scheme}://{u.netloc}"
 
 
+def web_url(text):
+    """A URL fit to store and link to: http(s) with a hostname, fragment dropped; anything else
+    (javascript:, mailto:, a bare path, garbage) is None. Websites and careers pages come from
+    OSM tags, search results and the page's own edits, so they are checked once, on the way in."""
+    s = urllib.parse.urlsplit((text or "").strip())
+    if s.scheme.lower() not in ("http", "https") or not s.hostname:
+        return None
+    return urllib.parse.urlunsplit((s.scheme.lower(), s.netloc, s.path, s.query, ""))
+
+
 def _merge(a, b):
     """Fill a's blanks from b; categories and finder ids are unions."""
     for k in ("address", "city", "state", "phone", "website"):

@@ -5,7 +5,7 @@ import os
 import re
 import time
 from core.client import Pacer, request
-from core.geo import CATEGORIES, ql_string, tag_selector
+from core.geo import CATEGORIES, ql_string, tag_selector, web_url
 
 NAME = "osm"
 DISPLAY_NAME = "OpenStreetMap (Overpass)"
@@ -43,10 +43,13 @@ def _place(el, category):
     if not name or "lat" not in pos:
         return None
     street = " ".join(x for x in (t.get("addr:housenumber"), t.get("addr:street")) if x)
+    site = (t.get("website") or t.get("contact:website") or t.get("url") or "").strip()
+    if site and not re.match(r"[a-zA-Z][a-zA-Z0-9+.-]*:", site):   # no scheme at all: tags often read "www.example.com"
+        site = "https://" + site
     return {"name": name, "lat": float(pos["lat"]), "lon": float(pos["lon"]),
             "address": street or None, "city": t.get("addr:city"), "state": t.get("addr:state"),
             "phone": t.get("phone") or t.get("contact:phone"),
-            "website": t.get("website") or t.get("contact:website") or t.get("url"),
+            "website": web_url(site),                  # anything but http(s) is dropped here
             "category": category, "finder_id": f"{el.get('type')}/{el.get('id')}"}
 
 
