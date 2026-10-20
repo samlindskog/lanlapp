@@ -1,6 +1,8 @@
 """One HTTP call for the side services a geographic scan talks to (Nominatim, SearXNG, Overpass).
-These are not career sites: no Chrome, no proxy escalation, no Session; plain http.client with
-the service's own timeout, like embed.py's OpenAI call. Each client paces itself."""
+These are not career sites: no Chrome, no proxy escalation, no Session. The connection code
+follows browser.py's http.client use (Session._api to Firecrawl) with embed.py's SSL context;
+each service sets its own timeout and the clients pace themselves (the public instances ask
+for one request a second or two)."""
 import http.client
 import json
 import threading

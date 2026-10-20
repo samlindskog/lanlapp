@@ -53,6 +53,8 @@ def check_websites():
     assert careers.is_aggregator("https://www.yelp.com/biz/x") and careers.is_aggregator("https://m.facebook.com/x")
     assert careers.is_aggregator("https://yelp.ca/x") and careers.is_aggregator("https://www.bbb.org/x")
     assert not careers.is_aggregator("https://firstcommunitybank.example.com/")
+    assert not careers.is_aggregator("https://yelp.example.com/") and not careers.is_aggregator("https://notyelp.com/")
+    assert not careers.is_aggregator("https://bbb.example.org/")       # a label is not a domain
     assert careers.resembles("First Community Bank", "https://www.firstcommunitybank.example.com/", "")
     assert careers.resembles("First Community Bank", "https://fcb.example.com/", "First Community Bank | Home")
     assert not careers.resembles("First Community Bank", "https://fcb.example.com/", "Some other bank")

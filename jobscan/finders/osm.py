@@ -5,7 +5,7 @@ import os
 import re
 import time
 from core.client import Pacer, request
-from core.geo import CATEGORIES, tag_selector
+from core.geo import CATEGORIES, ql_string, tag_selector
 
 NAME = "osm"
 DISPLAY_NAME = "OpenStreetMap (Overpass)"
@@ -18,18 +18,13 @@ def configured():
     return True
 
 
-def _ql_string(s):
-    """A string inside an Overpass QL filter: backslashes and quotes escaped."""
-    return s.replace("\\", "\\\\").replace('"', '\\"')
-
-
 def _name_filter(keywords):
     """keywords -> a case-insensitive name regex filter ("a, b" matches either), or ""."""
     words = [w.strip() for w in re.split(r"[,|]", keywords or "") if w.strip()]
     if not words:
         return ""
     rx = "|".join(re.sub(r"([.^$*+?()\[\]{}\\])", r"\\\1", w) for w in words)   # only regex metacharacters
-    return f'["name"~"{_ql_string(rx)}",i]'
+    return f'["name"~"{ql_string(rx)}",i]'
 
 
 def build_query(center, radius_m, selectors, keywords=None):

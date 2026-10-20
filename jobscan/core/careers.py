@@ -11,17 +11,22 @@ from core.text import html_to_text
 _STOP = {"the", "and", "of", "in", "at", "for", "a", "an", "on", "to", "de", "la", "le", "los", "las", "el"}
 
 # ---------------------------------------------------------------- websites
-# Directory and social hosts a web search returns instead of the business's own site (matched
-# on any label of the host, so yelp.ca and m.facebook.com count too).
-AGGREGATORS = {"yelp", "facebook", "instagram", "linkedin", "indeed", "glassdoor", "yellowpages", "mapquest",
-               "bbb", "tripadvisor", "google", "wikipedia", "nextdoor", "foursquare", "twitter", "youtube",
-               "healthgrades", "zocdoc", "opentable", "manta", "chamberofcommerce", "zillow", "loopnet",
-               "zoominfo", "crunchbase", "dnb", "superpages", "hotfrog", "cylex", "niche", "greatschools",
-               "usnews", "ziprecruiter", "simplyhired", "bing", "apple", "waze", "doordash", "grubhub", "ubereats"}
+# Directory and social sites a web search returns instead of the business's own: registrable
+# domains, matched as the host itself or any subdomain (m.facebook.com), never by a mere label
+# (a business at yelp.example.com is not Yelp).
+AGGREGATORS = {"yelp.com", "yelp.ca", "facebook.com", "fb.com", "instagram.com", "linkedin.com", "indeed.com",
+               "glassdoor.com", "yellowpages.com", "yellowpages.ca", "mapquest.com", "bbb.org", "tripadvisor.com",
+               "tripadvisor.ca", "google.com", "wikipedia.org", "nextdoor.com", "foursquare.com", "twitter.com",
+               "x.com", "youtube.com", "healthgrades.com", "zocdoc.com", "opentable.com", "manta.com",
+               "chamberofcommerce.com", "zillow.com", "loopnet.com", "zoominfo.com", "crunchbase.com", "dnb.com",
+               "superpages.com", "hotfrog.com", "cylex.us", "cylex-usa.com", "niche.com", "greatschools.org",
+               "usnews.com", "ziprecruiter.com", "simplyhired.com", "bing.com", "apple.com", "waze.com",
+               "doordash.com", "grubhub.com", "ubereats.com"}
 
 
 def is_aggregator(url):
-    return any(label in AGGREGATORS for label in (host_of(url) or "").split("."))
+    h = host_of(url) or ""
+    return any(h == d or h.endswith("." + d) for d in AGGREGATORS)
 
 
 def name_tokens(name):
