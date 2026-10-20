@@ -19,10 +19,11 @@ Agent API  : JSON over HTTP, documented at GET /api  (also in .claude/skills/job
   POST /api/boards/<id>/delete    remove a board (its jobs stay, detached)
   GET  /api/adapters              adapters available: name, display_name, kind (family | site)
   GET  /api/sources               adapters with their last scan (older name for /api/adapters)
-  GET  /api/jobs?verdict=yes,maybe&action=none&closing=open|closed|week&source=&board=&days=&q=&pending=1&run=<id>
+  GET  /api/jobs?verdict=yes,maybe&action=none&closing=open|closed|week&source=&board=&origin=&days=&q=&pending=1&run=<id>
                                   (each job carries board_id, board_name, board_platform e.g. "Workday",
-                                   board_adapter, board_source_url: the board it was scanned from, and
-                                   run_id: the scan run that stored it first; run= filters on that)
+                                   board_adapter, board_source_url: the board it was scanned from, board_origin
+                                   (manual | geo) with place_name/place_address/place_website/... for a geo board,
+                                   and run_id: the scan run that stored it first; run= filters on that)
   GET  /api/jobs/<id>?text=0      job + documents + verdict/action history
   GET  /api/jobs/<id>/sections    primary document split into named sections (board adapter decides)
   GET  /api/jobs/<id>/section?name=<heading>[&kind=<kind>]   one section (default: the board's key section)
@@ -36,8 +37,18 @@ Agent API  : JSON over HTTP, documented at GET /api  (also in .claude/skills/job
   POST /api/scan                  {boards?:[id..], source?, days?:7, all?:false, refetch?:false} -> {run_id}
                                   (boards = ids; source = every board of one adapter; neither = all enabled)
   POST /api/refresh               {ids?:[..]} or {filter:"open-qualifying"}       -> {run_id}
+  POST /api/geo/scan              {center, radius_km?:10, categories?, keywords?, tags?, finders?, include?, exclude?,
+                                   max_places?:300, recheck_days?:30, rediscover?:false, days?:7} -> {run_id, center}
+                                  (a geographic scan: businesses around the centre from OpenStreetMap, their
+                                   careers pages registered as boards with origin geo and scanned; run kind 'geo')
+  GET  /api/geo/categories        the category registry (key, label, default) and finders, with what is configured
+  GET  /api/geo/center?center=    'lat, lng' / a Google Maps link parsed, an address geocoded -> {lat, lon, label}
+  GET  /api/places?run=&status=&careers_kind=&bbox=s,w,n,e&q=&limit=100&before=<id>   places found, newest first
+  GET  /api/places/<id>           one place, with the text of its careers page
+  POST /api/places/<id>           {status?: active|ignored, website?, careers_url?}  (careers_url registers a board now)
   GET  /api/runs?kind=scan&status=done&limit=20&before=<id>   runs newest first (args, request, summary as
-                                  objects, no log; before = id cursor); scans persist, refresh runs are transient (ids like t3)
+                                  objects, no log; before = id cursor); scans and geo runs persist, refresh runs are
+                                  transient (ids like t3)
   GET  /api/runs/<id>             one run: status, log, progress (board/posting in flight, counters), summary, request
   POST /api/runs/<id>/cancel      stop a running run at its next fetch -> status 'cancelled'
   POST /api/runs/<id>/repeat      start a new run from the stored request (scan: same boards/days/all/refetch;
@@ -163,6 +174,12 @@ ROUTES = [
     ("POST", r"/api/runs/(\d+)/repeat", "repeat_run", lambda m, qs, b: {"run_id": m[0]}, 202),
     ("GET", r"/api/events", "events", lambda m, qs, b: _q(qs, b), 200),
     ("POST", r"/api/scan", "scan", lambda m, qs, b: b, 202),
+    ("POST", r"/api/geo/scan", "geo_scan", lambda m, qs, b: b, 202),
+    ("GET", r"/api/geo/categories", "geo_categories", lambda m, qs, b: {}, 200),
+    ("GET", r"/api/geo/center", "resolve_center", lambda m, qs, b: _q(qs, b), 200),
+    ("GET", r"/api/places", "places", lambda m, qs, b: _q(qs, b), 200),
+    ("GET", r"/api/places/(\d+)", "get_place", lambda m, qs, b: {"id": m[0]}, 200),
+    ("POST", r"/api/places/(\d+)", "set_place", lambda m, qs, b: _q(qs, b, id=m[0]), 200),
     ("POST", r"/api/boards", "add_boards", lambda m, qs, b: b, 201),
     ("POST", r"/api/boards/(\d+)", "update_board", lambda m, qs, b: _q(qs, b, id=m[0]), 200),
     ("POST", r"/api/boards/(\d+)/delete", "delete_board", lambda m, qs, b: {"id": m[0]}, 200),

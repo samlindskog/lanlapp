@@ -125,9 +125,13 @@ SELECT j.*, v.verdict, v.eligible_grades, v.reason AS verdict_reason, v.assessed
        a.action, a.action_date, a.resume_dir, a.note AS action_note,
        (SELECT MAX(fetched_at) FROM documents WHERE job_id = j.id) AS last_fetched,
        (e.job_id IS NOT NULL) AS embedded,
-       b.name AS board_name, b.url AS board_source_url, b.adapter AS board_adapter
+       b.name AS board_name, b.url AS board_source_url, b.adapter AS board_adapter, b.origin AS board_origin,
+       p.name AS place_name, p.address AS place_address, p.city AS place_city, p.state AS place_state,
+       p.lat AS place_lat, p.lon AS place_lon, p.website AS place_website, p.careers_url AS place_careers_url,
+       p.phone AS place_phone
 FROM jobs j
 LEFT JOIN boards b ON b.id = j.board_id
+LEFT JOIN places p ON p.id = (SELECT MIN(id) FROM places WHERE board_id = b.id)
 LEFT JOIN verdicts v ON v.id = (SELECT MAX(id) FROM verdicts WHERE job_id = j.id)
 LEFT JOIN verdicts c ON c.id = (SELECT MAX(id) FROM verdicts WHERE job_id = j.id AND author = 'claude')
 LEFT JOIN actions  a ON a.id = (SELECT MAX(id) FROM actions  WHERE job_id = j.id)
@@ -135,13 +139,16 @@ LEFT JOIN embeddings e ON e.job_id = j.id
 """
 
 def list_jobs(conn, verdict=None, action=None, open_only=False, source=None, days=None,
-              pending_only=False, q=None, board=None, closing=None, run=None):
+              pending_only=False, q=None, board=None, closing=None, run=None, origin=None):
     """Filters are ANDed. verdict/action: comma lists ('none' = unset). closing: 'open' (no close
     date or not yet closed), 'closed', or 'week' (closes within 7 days); open_only is 'open'.
-    run: jobs first stored by that scan run (jobs.run_id)."""
+    run: jobs first stored by that scan run (jobs.run_id). origin: the board's origin (manual |
+    geo); a geo board's place (name, address, website...) rides along as place_* fields."""
     where, params = ["TRUE"], []
     if source:
         where.append("j.source=%s"); params.append(source)
+    if origin:
+        where.append("b.origin=%s"); params.append(origin)
     if run:
         where.append("j.run_id=%s"); params.append(int(run))
     if board:
@@ -176,7 +183,7 @@ def list_jobs(conn, verdict=None, action=None, open_only=False, source=None, day
         ql = q.lower()
         rows = [r for r in rows if ql in " ".join(str(r.get(k) or "") for k in
                 ("title", "location", "series", "announcement_no", "verdict_reason",
-                 "action_note", "pay_plan", "board_name", "board_platform")).lower()]
+                 "action_note", "pay_plan", "board_name", "board_platform", "place_name", "place_address")).lower()]
     files = {}
     for f in list_resumes(conn):
         files.setdefault(f["job_id"], []).append({"id": f["id"], "name": f["filename"], "kind": f["kind"],

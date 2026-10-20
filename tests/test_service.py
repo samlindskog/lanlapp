@@ -3,7 +3,8 @@ tool has a well-formed schema, every HTTP route points at a known operation, and
 expose the same set of operations (minus the HTTP-only ones and the auth/file paths). Then a
 transient run against a fake database: it reports progress and lines to the event stream, and
 cancel_run stops it at its next check with status 'cancelled'. Then, on the same fake database,
-the runs list (filters, parsed columns, cursor) and repeat_run's refusals."""
+the runs list (filters, parsed columns, cursor) and repeat_run's refusals. Then the geographic
+operations: validation, the registry, and repeat_run replaying a geo_scan request."""
 import os
 import sys
 import threading
@@ -106,6 +107,41 @@ def test_runs_list_and_repeat():
         runs.J.db = real_db
 
 
+def test_geo_doors():
+    """The geographic operations validate before touching the browser slot or the network
+    (coordinates and Maps links are parsed, never geocoded), and repeat_run replays a stored
+    geo_scan request through call() like any other operation."""
+    assert service.call("resolve_center", {"center": "35.0844, -106.6504"}) == {"lat": 35.0844, "lon": -106.6504, "label": "35.08440, -106.65040"}
+    assert service.call("resolve_center", {"center": "https://www.google.com/maps/@35.08,-106.65,15z"})["lat"] == 35.08
+    cats = service.call("geo_categories", {})
+    assert {c["key"] for c in cats["categories"]} == set(service.J.CATEGORIES) and any(c["default"] for c in cats["categories"])
+    assert [f["name"] for f in cats["finders"]] == ["osm"] and cats["finders"][0]["configured"] is True
+    assert set(cats) >= {"websearch", "firecrawl", "geocode"}
+    for bad in ({}, {"center": "35, -106", "radius_km": 0}, {"center": "35, -106", "categories": ["nope"]},
+                {"center": "35,-106", "finders": ["nope"]}, {"center": "35,-106", "include": "(a+)+$"},
+                {"center": "35,-106", "max_places": 0}, {"center": ""}):
+        try:
+            service.call("geo_scan", bad)
+            raise AssertionError(f"geo_scan accepted {bad}")
+        except ValueError:
+            pass
+    try:
+        service.call("places", {"bbox": "1,2,3"})
+        raise AssertionError("places accepted a 3-number bbox")
+    except ValueError:
+        pass
+    real_get, real_op = runs.get, service.OPERATIONS["geo_scan"]
+    seen = []
+    runs.get = lambda rid: {"id": 7, "kind": "geo", "status": "done",
+                            "request": '{"op": "geo_scan", "args": {"center": "35, -106", "finders": [], "radius_km": 3}}'}
+    service.OPERATIONS["geo_scan"] = (lambda a: seen.append(a) or {"run_id": 99, "status": "running"}, real_op[1], real_op[2])
+    try:
+        out = service.call("repeat_run", {"run_id": "7"})
+    finally:
+        runs.get, service.OPERATIONS["geo_scan"] = real_get, real_op
+    assert out == {"run_id": 99, "status": "running", "repeated_from": 7, "dropped": []} and seen == [{"center": "35, -106", "finders": [], "radius_km": 3}], (out, seen)
+
+
 def main():
     for name, (fn, desc, schema) in service.OPERATIONS.items():
         assert callable(fn), name
@@ -115,8 +151,11 @@ def main():
     tools = service.mcp_tools()
     names = {t["name"] for t in tools}
     assert names <= set(service.OPERATIONS)
-    assert {"boards", "add_boards", "scan", "refresh", "list_jobs", "upload_resume", "logs", "runs", "cancel_run", "repeat_run"} <= names, names
+    assert {"boards", "add_boards", "scan", "refresh", "list_jobs", "upload_resume", "logs", "runs", "cancel_run", "repeat_run",
+            "geo_scan", "geo_categories", "resolve_center", "places", "get_place", "set_place"} <= names, names
     assert "run" in service.OPERATIONS["list_jobs"][2]["properties"] and "run_id" in service.SUMMARY_FIELDS
+    assert "origin" in service.OPERATIONS["list_jobs"][2]["properties"] and {"board_origin", "place_name", "place_website"} <= set(service.SUMMARY_FIELDS)
+    assert "geo" in service.OPERATIONS["runs"][2]["properties"]["kind"]["enum"]
     for meth, pat, op, build, status in server.ROUTES:
         assert op in service.OPERATIONS, (pat, op)
         assert meth in ("GET", "POST") and status in (200, 201, 202), pat
@@ -131,6 +170,8 @@ def main():
     print("runs: progress + log events streamed, cancel_run -> cancelled: ok")
     test_runs_list_and_repeat()
     print("runs list: kind/status/limit/before, parsed columns; repeat_run refuses transient and unknown ids: ok")
+    test_geo_doors()
+    print("geo: resolve_center parses, geo_categories lists the registry, geo_scan/places validate, repeat_run replays geo_scan: ok")
 
 
 if __name__ == "__main__":
