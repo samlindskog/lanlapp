@@ -74,7 +74,13 @@ def test_run_events_and_cancel():
         assert [e["line"] for e in run_evs if e["line"]] == ["step 1", "! cancelled"], run_evs
         assert run_evs[-1]["status"] == "cancelled" and run_evs[-1]["progress"]["total"] == 3
         assert any(e["kind"] == "log" and e.get("run") == rid and "cancel" in e["msg"] for e in evs), evs
-        assert logbuf.wait_events(logbuf.current_seq(), 0.05) == []
+        # The worker publishes its last events just after the status flips; let them drain, then the
+        # stream must be quiet (a fixed 50 ms here was flaky under load).
+        for _ in range(40):
+            if logbuf.wait_events(logbuf.current_seq(), 0.05) == []:
+                break
+        else:
+            raise AssertionError("events kept arriving after the run finished")
         try:
             service.call("cancel_run", {"run_id": rid})
             raise AssertionError("cancelling a finished run must be a KeyError (404)")
