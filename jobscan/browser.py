@@ -656,11 +656,16 @@ def _reply(status, text):
             f"Connection: close\r\n\r\n").encode() + body
 
 
+def net_error(exc):
+    """The net::ERR_* code in a Chrome exception, or None."""
+    m = re.search(r"net::(ERR_[A-Z_]+)", str(exc))
+    return m.group(1) if m else None
+
+
 def tunnel_error(exc):
     """The net::ERR_PROXY_*/ERR_TUNNEL_* code in a Chrome exception, or None: these mean the relay
     answered the tunnel with a refusal (or is not there), not that Chrome itself is broken."""
-    m = re.search(r"net::(ERR_[A-Z_]+)", str(exc))
-    code = m.group(1) if m else ""
+    code = net_error(exc) or ""
     return code if code.startswith("ERR_PROXY") or code.startswith("ERR_TUNNEL") else None
 
 
@@ -965,6 +970,13 @@ class Chrome:
                     code = tunnel_error(e)
                     if code and self.relay is not None and self.relay.alive():
                         return 0, f"net::{code}"           # the relay refused this tunnel: Chrome itself is fine
+                    site = None if code else net_error(e)
+                    if site:
+                        # ERR_SSL_PROTOCOL_ERROR, ERR_CONNECTION_RESET, ERR_CERT_*...: the site did
+                        # not answer, Chrome did. Not a breaker tick, no restart: fetch sees a
+                        # network failure for this URL alone.
+                        self.log(f"  ! browser: net::{site} on {url[:80]}")
+                        return 0, f"net::{site}"
                     if e.__class__.__name__ == "TimeoutException":
                         # A page that never finishes loading is the site's problem, not Chrome's: it
                         # is not counted towards MAX_FAILURES (two slow sites must not hand a whole
@@ -1055,7 +1067,7 @@ class Session:
             status, body = transport(url, method, data, headers, accept, proxy)
             if status in (404, 410):
                 return "done", (status, "")
-            if status == 0 and body.startswith("net::ERR_") and proxy:
+            if status == 0 and proxy and tunnel_error(body):
                 return "blocked", f"proxy refused ({body[5:]})"
             if looks_blocked(status, body):
                 return "blocked", f"blocked (HTTP {status})"

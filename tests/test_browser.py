@@ -505,6 +505,17 @@ def check_relay_down():
         s.chrome._start = lambda: (_ for _ in ()).throw(RuntimeError("no chrome in tests"))
         assert s.chrome.request("https://slow.example.com/") == (408, "")
         assert s.chrome._failures == 0 and s.chrome._drv is None    # no breaker tick; the browser was closed
+    class _TlsDriver(_StubDriver):
+        def get(self, url):
+            raise RuntimeError("Message: unknown error: net::ERR_SSL_PROTOCOL_ERROR\n(Session info: chrome=155)")
+
+    with B.Session(lambda m: None, B.Config(env)) as s:            # a site's TLS/connection error is the site's failure
+        s.chrome._drv = _TlsDriver()
+        s.chrome._start = lambda: (_ for _ in ()).throw(RuntimeError("no chrome in tests"))
+        assert s.chrome.request("https://broken.example.com/") == (0, "net::ERR_SSL_PROTOCOL_ERROR")
+        assert s.chrome._failures == 0 and s.chrome._drv is not None  # no breaker tick, no restart
+        assert s.chrome.request("https://broken.example.com/") == (0, "net::ERR_SSL_PROTOCOL_ERROR")
+        assert s.chrome._failures == 0
     with B.Session(lambda m: None, B.Config(env)) as s:            # the accept loop survives a bad connection
         c = socket.create_connection(("127.0.0.1", s.relay.port))
         c.close()
