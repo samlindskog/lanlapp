@@ -230,7 +230,10 @@ are skipped; the result's domain must be built from the name, or its title must 
 city or state together with a distinctive word of the name), else marked `no_site`. Each website is fetched through
 the run's browser Session and searched for a careers page: a careers/jobs/employment link on the
 homepage, then the common paths (`/careers`, `/jobs`, ...), then a Firecrawl site map when
-`FIRECRAWL_URL` is set. Each careers page becomes an ordinary board with origin `geo` through the
+`FIRECRAWL_URL` is set. A careers page that lists nothing itself but hands off to a portal (an
+`<iframe>`, an applicant system on another host such as a Munis self-service site, a vendor's board) is
+followed one hop: the portal becomes the board (`places.portal_url`; the human page stays `careers_url`),
+an adapter that recognises it winning outright. Each careers page becomes an ordinary board with origin `geo` through the
 normal adapter detection (an unrecognised page goes to the `firecrawl` adapter when Firecrawl is
 configured), so its jobs have one parent: job -> board -> place. The run then scans the boards it
 registered or re-checked with the run's include/exclude title regexes and a *location filter*: a

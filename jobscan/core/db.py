@@ -134,7 +134,8 @@ CREATE TABLE IF NOT EXISTS places (
     state TEXT,
     phone TEXT,
     website TEXT,
-    careers_url TEXT,
+    careers_url TEXT,                       -- the human careers page
+    portal_url TEXT,                        -- where it hands off (an applicant portal, an iframe); the board when set
     careers_kind TEXT,
     status TEXT NOT NULL DEFAULT 'active',  -- active | ignored (skipped by later runs)
     finder_ids TEXT,                        -- JSON {finder: id in that source}
@@ -149,6 +150,7 @@ CREATE TABLE IF NOT EXISTS places (
 );
 CREATE INDEX IF NOT EXISTS places_norm_name ON places(norm_name);
 CREATE INDEX IF NOT EXISTS places_board ON places(board_id);
+ALTER TABLE places ADD COLUMN IF NOT EXISTS portal_url TEXT;
 CREATE TABLE IF NOT EXISTS embeddings (
     job_id INTEGER PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
     model TEXT NOT NULL,

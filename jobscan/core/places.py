@@ -9,7 +9,7 @@ from core.db import now
 from core.geo import DEDUP_M, distance_m, host_of, norm_name, web_url
 
 # ---------------------------------------------------------------- the places table
-PLACE_COLS = ("name", "norm_name", "lat", "lon", "address", "city", "state", "phone", "website", "careers_url",
+PLACE_COLS = ("name", "norm_name", "lat", "lon", "address", "city", "state", "phone", "website", "careers_url", "portal_url",
               "careers_kind", "status", "finder_ids", "categories", "careers_text", "last_checked", "board_id",
               "first_run_id", "last_run_id", "first_seen", "last_seen")
 _LIST_COLS = ", ".join(f"p.{c}" for c in ("id",) + PLACE_COLS if c != "careers_text")
@@ -83,7 +83,7 @@ def upsert_place(conn, pl, run_id=None):
                       pl.get("state"), pl.get("phone"), site, row["id"]))
         return get_place(conn, row["id"]), False
     vals = (pl["name"], nn, pl["lat"], pl["lon"], pl.get("address"), pl.get("city"), pl.get("state"), pl.get("phone"),
-            site, None, None, "active", json.dumps(pl.get("finder_ids") or {}),
+            site, None, None, None, "active", json.dumps(pl.get("finder_ids") or {}),
             json.dumps(sorted(set(pl.get("categories") or []))), None, None, None, run_id, run_id, t, t)
     r = conn.execute(f"INSERT INTO places ({', '.join(PLACE_COLS)}) VALUES ({', '.join(['%s'] * len(PLACE_COLS))}) RETURNING *",
                      vals).fetchone()
@@ -103,11 +103,18 @@ def fallback_adapter():
     return "firecrawl" if browser.Config().firecrawl else None
 
 
+def board_url_for(row):
+    """What a place's board is registered from: the portal its careers page hands off to when
+    one was found, else the careers page itself."""
+    return row.get("portal_url") or row.get("careers_url")
+
+
 def register_place_board(conn, row, url, session, log=lambda m: None):
-    """Make the place's careers page a board (origin 'geo'): the board, or None when registration
-    failed (logged; careers_kind 'unresolved' so the next run tries again). Several places may
-    share one board (branches of one company, one corporate careers page): the board was named
-    after the first business, so once a second place joins it is renamed to the page's host."""
+    """Make url (the place's portal or careers page, board_url_for) a board (origin 'geo'): the
+    board, or None when registration failed (logged; careers_kind 'unresolved' so the next run
+    tries again). careers_url stays the human page. Several places may share one board (branches
+    of one company, one corporate careers page): the board was named after the first business,
+    so once a second place joins it is renamed to the page's host."""
     try:
         b = add_board(conn, url, name=row["name"], fallback_adapter=fallback_adapter(), session=session, origin="geo")
     except browser.Cancelled:
@@ -115,9 +122,9 @@ def register_place_board(conn, row, url, session, log=lambda m: None):
     except Exception as e:  # noqa: BLE001
         conn.rollback()
         log(f"  ! {row['name']}: board not registered for {url}: {e.__class__.__name__}: {e}")
-        set_fields(conn, row, careers_url=url, careers_kind="unresolved")
+        set_fields(conn, row, careers_url=row.get("careers_url") or url, careers_kind="unresolved")
         return None
-    set_fields(conn, row, careers_url=url, careers_kind=f"adapter:{b['adapter']}", board_id=b["id"])
+    set_fields(conn, row, careers_url=row.get("careers_url") or url, careers_kind=f"adapter:{b['adapter']}", board_id=b["id"])
     others = conn.execute("SELECT COUNT(*) AS n FROM places WHERE board_id=%s AND id<>%s", (b["id"], row["id"])).fetchone()["n"]
     host = host_of(b["url"])
     if others and host and b["name"] != host:
@@ -143,8 +150,9 @@ def update_place(conn, place_id, status=None, website=None, careers_url=None, se
     if careers_url is not None:
         url = _explicit_url(careers_url, "careers_url")
         if not url:
-            set_fields(conn, row, careers_url=None, careers_kind="none", board_id=None, careers_text=None)
-        else:
+            set_fields(conn, row, careers_url=None, portal_url=None, careers_kind="none", board_id=None, careers_text=None)
+        else:                                          # typed by hand: this page is the board, no hop
+            set_fields(conn, row, careers_url=url, portal_url=None)
             register_place_board(conn, row, url, session, log)
     return get_place(conn, row["id"])
 

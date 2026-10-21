@@ -17,6 +17,11 @@ import finders  # noqa: E402
 from core import careers, geo, geoscan, places  # noqa: E402
 from core import places as places_mod  # noqa: E402
 from helpers import FakeSession  # noqa: E402
+import browser  # noqa: E402
+
+# sources.detect() guards a URL (DNS lookup) before it probes the page; every host here is a fixture
+# served by a FakeSession, so the guard is a no-op for this file. No test here may reach the network.
+browser.check_url = lambda url: url
 
 
 def check_center():
@@ -120,6 +125,71 @@ def check_careers_links():
     m = careers.careers_from_links(["https://c.example.com/about", "https://c.example.com/join-the-team", "javascript:jobs()",
                                     {"url": "https://c.example.com/x", "title": "Careers"}], "https://c.example.com")
     assert m == ["https://c.example.com/x", "https://c.example.com/join-the-team"], m
+
+
+LONG = "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. " * 3
+LIBRARY = "https://library.example.org/get-involved/employment"
+MUNIS = "https://santafenm.munis.example.net/ess/employmentopportunities/default.aspx"
+LIBRARY_HTML = (f"<html><head><title>Employment</title></head><body><nav><a href='/'>Home</a> <a href='/about'>About the library</a> "
+                f"<a href='https://www.facebook.com/library'>Facebook</a></nav><p>{LONG}</p><p>The library hires through the City of Santa Fe. "
+                f"<a href='{MUNIS}'>City of Santa Fe Employment Opportunities</a></p></body></html>")
+COURTS_HTML = ("<html><body><h1>Careers</h1><p>Current career opportunities can be found below.</p>"
+               '<iframe src="https://www.governmentjobs.com/careers/nmcourts" width="100%"></iframe>' f"<p>{LONG}</p></body></html>")
+COLLEGE_HTML = (f"<html><body><nav><a href='/'>Home</a> <a href='/about'>About</a> <a href='/about/contact'>Contact us</a></nav>"
+                f"<p>{LONG}</p><p>Santa Fe College is an equal opportunity employer.</p></body></html>")
+
+
+def check_portal_hop():
+    """A careers page that hands off: the three real shapes (an external applicant portal, an
+    embedded widget, nothing), an adapter recognising the target, the ranking and its cap, the
+    aggregator skip, and no hop when the page lists postings itself."""
+    portal_page = f"<html><head><title>Employment Opportunities</title></head><body><h1>Current openings</h1><p>{LONG}{LONG}</p><p>Apply now.</p></body></html>"
+    pages = {MUNIS: portal_page}
+    s = FakeSession(lambda u, **k: (200, pages[u]) if u in pages else (404, ""))
+    text = J.html_to_text(LIBRARY_HTML)
+    lines = []
+    # 1. the library: prose plus a link to the city's Munis self-service portal on another host
+    assert careers.portal_candidates(LIBRARY_HTML, LIBRARY) == [MUNIS]
+    assert careers.portal_hop(s, LIBRARY, LIBRARY_HTML, text, lines.append) == (MUNIS, "portal")
+    assert lines == [f"  careers page hands off to {MUNIS} (portal)"], lines
+    # 2. the courts: the listing is an iframe; its src is a NEOGOV board, so the adapter wins outright
+    courts = "https://nmcourts.example.gov/careers/"
+    assert careers.portal_candidates(COURTS_HTML, courts) == ["https://www.governmentjobs.com/careers/nmcourts"]
+    hop = careers.portal_hop(s, courts, COURTS_HTML, J.html_to_text(COURTS_HTML), lines.append)
+    assert hop and hop[1] == "neogov" and "governmentjobs.com/careers/nmcourts" in hop[0], hop
+    # 3. the college: navigation and prose, nothing to hop to
+    assert careers.portal_candidates(COLLEGE_HTML, "https://santafe.example.edu/about/jobs") == []
+    assert careers.portal_hop(s, "https://santafe.example.edu/about/jobs", COLLEGE_HTML, J.html_to_text(COLLEGE_HTML), lines.append) is None
+    # an anchor to a Workday tenant: detect() by URL pattern
+    wd = f"<html><body><p>{LONG}</p><a href='https://nmcourts.wd1.myworkdayjobs.com/External'>View open positions</a></body></html>"
+    hop = careers.portal_hop(s, courts, wd, "x", lines.append)
+    assert hop and hop[1] == "workday" and "myworkdayjobs.com" in hop[0], hop
+    # ranking: iframes, then the site's own portal paths, then other hosts; aggregators out; three at most
+    ranked = ("<html><body>"
+              '<iframe src="https://www.youtube.com/embed/abc"></iframe>'
+              '<iframe src="https://widget.example.net/jobs?org=1"></iframe>'
+              "<a href='https://www.linkedin.com/company/x/jobs'>Jobs on LinkedIn</a>"
+              "<a href='/about/benefits'>Benefits</a>"
+              "<a href='https://other.example.net/about'>Our partners</a>"
+              "<a href='/careers/apply'>How to apply</a>"
+              "<a href='/jobs/portal'>Job portal</a>"
+              "<a href='https://portal1.example.net/x'>Openings</a>"
+              "<a href='https://portal2.example.net/y'>Apply here</a>"
+              "</body></html>")
+    base = "https://site.example.org/careers"
+    assert careers.portal_candidates(ranked, base) == ["https://widget.example.net/jobs?org=1", "https://site.example.org/careers/apply",
+                                                        "https://site.example.org/jobs/portal"]
+    no_iframes = ranked.replace('<iframe src="https://widget.example.net/jobs?org=1"></iframe>', "")
+    assert careers.portal_candidates(no_iframes, base) == ["https://site.example.org/careers/apply", "https://site.example.org/jobs/portal",
+                                                            "https://portal1.example.net/x"]
+    assert careers.MAX_HOPS == 3
+    # a page that lists postings itself (links to job detail pages) is the board: no hop, iframe or not
+    listing = COURTS_HTML + "<a href='/jobs/123-budget-analyst'>Budget Analyst</a><a href='/jobs/124-clerk'>Clerk</a>"
+    assert careers.has_listing(listing, courts) and not careers.has_listing(COURTS_HTML, courts)
+    assert careers.portal_hop(s, courts, listing, "x", lines.append) is None
+    # a candidate whose page is thin and says nothing of openings is not a portal
+    pages["https://portal1.example.net/x"] = "<html><body><p>Hello.</p></body></html>"
+    assert careers.portal_hop(s, base, no_iframes, LONG, lines.append) is None
 
 
 def check_card_filter():
@@ -270,6 +340,9 @@ PAGES = {
     "https://bad.example.com/": _page("Bad") + '<a href="/careers">Careers</a>',
     "https://bad.example.com/careers": _page("Careers at Bad"),
     "https://acme-branch.example.com/": _page("Acme Branch") + '<a href="https://acme.example.com/about/careers">Careers</a>',
+    "https://library.example.org/": _page("Library") + '<a href="/get-involved/employment">Employment</a>',
+    LIBRARY: LIBRARY_HTML,                                 # hands off to the city's portal
+    MUNIS: f"<html><head><title>Employment Opportunities</title></head><body><h1>Current openings</h1><p>{LONG}{LONG}</p></body></html>",
 }
 PLACES = [
     {"name": "Acme Corp", "lat": 35.0, "lon": -106.0, "website": "https://acme.example.com/", "category": "finance", "finder_id": "node/1"},
@@ -282,6 +355,7 @@ PLACES = [
     {"name": "Nowhere Ltd", "lat": 35.06, "lon": -106.0, "city": "Albuquerque", "category": "finance", "finder_id": "node/8"},
     {"name": "Acme Corp", "lat": 35.5, "lon": -106.0, "category": "finance", "finder_id": "node/9"},   # 55 km away: another place
     {"name": "Acme Branch", "lat": 35.07, "lon": -106.0, "website": "https://acme-branch.example.com/", "category": "retail", "finder_id": "node/10"},  # shares Acme's careers page
+    {"name": "Library", "lat": 35.08, "lon": -106.0, "website": "https://library.example.org/", "category": "government", "finder_id": "node/11"},  # careers page hands off to a portal
 ]
 SEARCH = {'First Community Bank Albuquerque NM': [{"url": "https://www.yelp.com/biz/fcb", "title": "First Community Bank - Yelp"},
                                                    {"url": "https://bank.example.com/", "title": "First Community Bank - Albuquerque, NM"}],
@@ -484,7 +558,7 @@ def check_pipeline():
         sm = J.geo_scan(conn, params, s, log=lines.append, progress=p, check=lambda: None, run_id=42)
         assert FakeFinder.calls == [((35.0, -106.0), 5000.0, ["finance", "retail"], "acme", [])], FakeFinder.calls
         assert phases == ["discovering", "resolving", "careers", "scanning", "done"], phases
-        want = {"discovered": 9, "new_places": 9, "resolved": 1, "no_site": 2, "with_careers": 5, "boards_new": 3, "boards_scanned": 3, "new": 4}
+        want = {"discovered": 10, "new_places": 10, "resolved": 1, "no_site": 2, "with_careers": 6, "boards_new": 4, "boards_scanned": 4, "new": 4}
         assert {k: sm[k] for k in want} == want, sm
         rows = {r["name"]: r for r in conn.places.values()}
         acme = [r for r in conn.places.values() if r["name"] == "Acme Corp"]
@@ -507,8 +581,14 @@ def check_pipeline():
                         for u in ("https://clinic.example.com", "https://shop.example.com")], maps   # only after links and paths failed
         assert [a["url"] for a in added] == ["https://acme.example.com/about/careers", "https://bank.example.com/jobs",
                                              "https://clinic.example.com/join-the-team", "https://bad.example.com/careers",
-                                             "https://acme.example.com/about/careers"], added
+                                             "https://acme.example.com/about/careers", MUNIS], added
         assert all(a["origin"] == "geo" and a["fallback_adapter"] == "firecrawl" and a["session"] is s for a in added), added
+        # The library's careers page hands off to the city's portal: the human page stays careers_url,
+        # the portal is portal_url and is what the board was registered from.
+        assert rows["Library"]["careers_url"] == LIBRARY and rows["Library"]["portal_url"] == MUNIS, rows["Library"]
+        assert conn.boards[rows["Library"]["board_id"]]["url"] == MUNIS and rows["Library"]["careers_kind"] == "adapter:firecrawl"
+        assert any(ln == f"  careers page hands off to {MUNIS} (portal)" for ln in lines) and any(f"-> {MUNIS} (portal)" in ln for ln in lines), lines[-10:]
+        assert all(r.get("portal_url") is None for n, r in rows.items() if n != "Library")
         assert all(b["origin"] == "geo" for b in conn.boards.values())
         assert rows["First Community Bank"]["careers_kind"] == "adapter:firecrawl"   # found at the common path /jobs
         assert len(scanned) == 1 and scanned[0]["session"] is s and scanned[0]["days"] == 14 and scanned[0]["run_id"] == 42
@@ -516,24 +596,25 @@ def check_pipeline():
         # The automatic location filter: the centre's city/state plus the places' (First Community
         # Bank and Nowhere Ltd are in Albuquerque, NM), state in both forms, on every board scanned.
         auto = r"\b(Rio Rancho|Albuquerque|New Mexico|NM)\b"
-        assert [b["adapter"] for b in sb] == ["workday", "firecrawl", "firecrawl"] and all(b["params"] == {"include": "analyst", "location": auto} for b in sb), sb
+        assert [b["adapter"] for b in sb] == ["workday", "firecrawl", "firecrawl", "firecrawl"] and all(b["params"] == {"include": "analyst", "location": auto} for b in sb), sb
         assert sm["location"] == auto and any(ln == f"location filter: {auto}" for ln in lines), lines[-8:]
         assert "https://shop.example.com/careers" in fetched and "https://bank.example.com/jobs" in fetched
-        assert any("not configured" in ln for ln in lines) and any("discovered 9 place(s) (10 before dedup)" in ln for ln in lines), lines
+        assert any("not configured" in ln for ln in lines) and any("discovered 10 place(s) (11 before dedup)" in ln for ln in lines), lines
         # A repeat: nothing new, resolved places are left alone, the two unresolved ones are retried,
         # and the places' known boards are scanned again for the area.
         fetched.clear(); added.clear(); scanned.clear(); maps.clear(); phases.clear()
         sm2 = J.geo_scan(conn, params, s, log=lines.append, progress=p, check=lambda: None, run_id=43)
         assert {k: sm2[k] for k in ("discovered", "new_places", "resolved", "no_site", "with_careers", "boards_new", "boards_scanned")} \
-            == {"discovered": 9, "new_places": 0, "resolved": 0, "no_site": 0, "with_careers": 0, "boards_new": 0, "boards_scanned": 3}, sm2
+            == {"discovered": 10, "new_places": 0, "resolved": 0, "no_site": 0, "with_careers": 0, "boards_new": 0, "boards_scanned": 4}, sm2
         assert [a["url"] for a in added] == ["https://bad.example.com/careers"] and not maps, (added, maps)
-        assert len(scanned) == 1 and sorted(b["id"] for b in scanned[0]["boards"]) == [1, 2, 3], scanned
+        assert len(scanned) == 1 and sorted(b["id"] for b in scanned[0]["boards"]) == [1, 2, 3, 4], scanned
         assert fetched == ["https://down.example.com/"], fetched
         assert all(r["last_run_id"] == 43 and r["first_run_id"] == 42 for r in conn.places.values())
         # rediscover: every site is fetched again and every board re-registered (then scanned).
         fetched.clear(); added.clear()
         sm3 = J.geo_scan(conn, {**params, "rediscover": True, "location": r"\bSanta Fe\b"}, s, log=lines.append, progress=p, check=lambda: None, run_id=44)
-        assert sm3["boards_new"] == 0 and sm3["boards_scanned"] == 3 and len(added) == 5 and "https://acme.example.com/" in fetched, (sm3, added)
+        assert sm3["boards_new"] == 0 and sm3["boards_scanned"] == 4 and len(added) == 6 and "https://acme.example.com/" in fetched, (sm3, added)
+        assert rows["Library"]["portal_url"] == MUNIS and added[-1]["url"] == MUNIS          # a rediscover re-evaluates the hop
         assert sm3["location"] == r"\bSanta Fe\b" and all(b["params"]["location"] == r"\bSanta Fe\b" for b in scanned[-1]["boards"])   # explicit wins
         sm4 = J.geo_scan(conn, {**params, "center_place": {}, "rediscover": True}, s, log=lines.append, progress=p, check=lambda: None, run_id=45)
         assert sm4["location"] == r"\b(Albuquerque|New Mexico|NM)\b", sm4["location"]                 # no centre place: the places' alone
@@ -549,6 +630,7 @@ def check_pipeline():
         assert J.update_place(conn, pid, status="ignored")["status"] == "ignored"
         r = J.update_place(conn, pid, careers_url="https://shop.example.com/hidden-jobs", session=s)
         assert r["careers_kind"] == "adapter:firecrawl" and r["board_id"] and r["board_name"] == "Shop", r
+        assert r["careers_url"] == "https://shop.example.com/hidden-jobs" and r["portal_url"] is None   # typed by hand: no hop
         r = J.update_place(conn, pid, careers_url="")
         assert r["careers_kind"] == "none" and r["board_id"] is None and r["careers_url"] is None, r
         for bad in ({"status": "gone"}, {"website": "javascript:alert(1)"}, {"careers_url": "mailto:hr@shop.example.com"}):
@@ -576,6 +658,8 @@ def main():
     print("website picking: aggregators skipped, name resemblance: ok")
     check_careers_links()
     print("careers links: ok")
+    check_portal_hop()
+    print("portal hop: external applicant portal, iframe (adapter wins), nothing, Workday anchor, ranking + cap, aggregator skip, own listing: ok")
     check_card_filter()
     print("card filter: title include/exclude + location, unknown locations kept: ok")
     check_location_regex()

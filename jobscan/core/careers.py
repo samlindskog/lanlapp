@@ -131,11 +131,11 @@ def _score_link(url, text, base):
     return score
 
 
-def careers_links(html, base_url):
-    """Candidate careers URLs from a page's anchors, best first (anchor text over href match,
-    same host over external, page order for ties); directory hosts and non-links are dropped."""
-    scored = []
-    for i, m in enumerate(_A_RE.finditer(html or "")):
+def anchors(html, base_url):
+    """(absolute http(s) URL, visible text + title + aria-label) for every real link on a page,
+    in page order; directory hosts, fragments and non-web schemes are dropped."""
+    out = []
+    for m in _A_RE.finditer(html or ""):
         attrs = {k.lower(): html_lib.unescape(a or b or c or "") for k, a, b, c in _ATTR_RE.findall(m[1])}
         href = (attrs.get("href") or "").strip()
         if not href or href.startswith(("#", "mailto:", "tel:", "javascript:")):
@@ -143,8 +143,16 @@ def careers_links(html, base_url):
         text = re.sub(r"\s+", " ", html_lib.unescape(re.sub(r"<[^>]+>", " ", m[2]))).strip()
         text = " ".join(x for x in (text, attrs.get("title"), attrs.get("aria-label")) if x)
         url = web_url(urllib.parse.urljoin(base_url, href))
-        if not url or is_aggregator(url):
-            continue
+        if url and not is_aggregator(url):
+            out.append((url, text))
+    return out
+
+
+def careers_links(html, base_url):
+    """Candidate careers URLs from a page's anchors, best first (anchor text over href match,
+    same host over external, page order for ties); directory hosts and non-links are dropped."""
+    scored = []
+    for i, (url, text) in enumerate(anchors(html, base_url)):
         score = _score_link(url, text, base_url)
         if score:
             scored.append((-score, i, url))
@@ -170,50 +178,133 @@ def careers_from_links(links, base_url):
     return [u for _, _, u in sorted(scored)]
 
 
-def _page_ok(session, url):
-    """(True, text) when the URL serves a real page: 200, enough text, not an error page."""
+def _page(session, url):
+    """(ok, text, html): ok when the URL serves a real page: 200, enough text, not an error page."""
     status, body = session.fetch(url)
     if status != 200 or not body:
-        return False, None
+        return False, None, None
     t = _TITLE_RE.search(body)
     if t and re.search(r"not found|404|error", t[1], re.I):
-        return False, None
+        return False, None, body
     text = html_to_text(body)
     if len(text) < MIN_PAGE_CHARS:
-        return False, None
-    return True, text[:20000]
+        return False, None, body
+    return True, text[:20000], body
+
+
+def _page_ok(session, url):
+    ok, text, _ = _page(session, url)
+    return ok, text
+
+
+# ---------------------------------------------------------------- the hop to a portal
+# A careers page often hands off: the postings live in an applicant portal on another host, an
+# embedded widget, or a vendor's board. Registering the page itself then yields nothing.
+PORTAL_RE = re.compile(r"jobs|careers?|apply|applicant|recruit|employment|opportunit|munis|selfservice|workday|"
+                       r"myworkdayjobs|governmentjobs|icims|applytojob|bamboohr|paylocity|lever\.co|greenhouse|workable|"
+                       r"jobvite|ultipro|ukg|taleo|successfactors|adp\.com|hirebridge|jazzhr|breezy|smartrecruiters|"
+                       r"dayforce|paycom|paycor|clearcompany|jobaline|indeed\.com/cmp|linkedin\.com/company/.*jobs", re.I)
+OPENINGS_RE = re.compile(r"apply|opening|position|job|career|vacanc|opportunit", re.I)
+# A link to one posting: the page lists its openings itself, so there is nothing to hop to.
+JOB_DETAIL_RE = re.compile(r"/jobs?/[^/?#]+|/postings?/|/positions?/|/openings?/|/vacanc|requisition|jobid|job_id|req_?id|/apply/", re.I)
+# Text of a page that lists openings (what the hop's target must read like, if no adapter knows it).
+LISTING_TEXT_RE = re.compile(r"\b(openings?|vacanc(y|ies)|apply now|positions? available|job (titles?|listings?|postings?)|"
+                             r"requisition|search (for )?jobs)\b", re.I)
+_IFRAME_RE = re.compile(r"""<iframe\b[^>]*\bsrc\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))""", re.I)
+MAX_HOPS = 3
+
+
+def has_listing(html, base_url):
+    """Does the careers page list postings itself: at least two distinct links to job detail pages."""
+    hits = {u for u, _ in anchors(html, base_url)
+            if JOB_DETAIL_RE.search(urllib.parse.urlsplit(u).path + "?" + urllib.parse.urlsplit(u).query)}
+    return len(hits) >= 2
+
+
+def portal_candidates(html, careers_url):
+    """Where a careers page may hand off, best first: its iframes, then the site's own portal
+    paths, then portal hosts elsewhere (an anchor on another host, or one matching PORTAL_RE,
+    whose text or path speaks of openings). Directory hosts and the page itself are dropped; at
+    most MAX_HOPS."""
+    page_host, tiers = host_of(careers_url), ([], [], [])
+    for m in _IFRAME_RE.finditer(html or ""):
+        u = web_url(urllib.parse.urljoin(careers_url, html_lib.unescape(m[1] or m[2] or m[3] or "")))
+        if u and not is_aggregator(u):
+            tiers[0].append(u)
+    for u, text in anchors(html, careers_url):
+        if u == careers_url.split("#")[0]:
+            continue
+        external = host_of(u) != page_host
+        if not (external or PORTAL_RE.search((host_of(u) or "") + urllib.parse.urlsplit(u).path)):
+            continue
+        if not OPENINGS_RE.search(f"{text} {urllib.parse.urlsplit(u).path}"):
+            continue
+        tiers[2 if external else 1].append(u)
+    out, seen = [], set()
+    for u in tiers[0] + tiers[1] + tiers[2]:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out[:MAX_HOPS]
+
+
+def portal_hop(session, careers_url, html, text, log):
+    """(portal_url, kind) when the careers page hands its openings off to a portal, else None.
+    Only when the page lists nothing itself. Each candidate in order: an adapter that recognises
+    it (sources.detect) wins outright, kind = the adapter's name; otherwise the first whose page
+    has more text than the careers page or reads like a listing, kind 'portal' (a board on the
+    fallback adapter)."""
+    if has_listing(html, careers_url):
+        return None
+    import sources as S
+    for u in portal_candidates(html, careers_url):
+        hit = S.detect(u, session)
+        if hit:
+            name, board = hit
+            target = board.get("url") or u
+            log(f"  careers page hands off to {target} ({name})")
+            return target, name
+        ok, ptext, _ = _page(session, u)
+        if ok and (len(ptext) > len(text or "") or LISTING_TEXT_RE.search(ptext)):
+            log(f"  careers page hands off to {u} (portal)")
+            return u, "portal"
+    return None
 
 
 def discover_careers(session, site, log, firecrawl=False):
-    """(careers_url, page_text, how) for a business website: a careers link on the homepage,
+    """(careers_url, page_text, how, hop) for a business website: a careers link on the homepage,
     then the common paths, then a Firecrawl site map when one is configured. how is 'link',
-    'path' or 'map'; (None, None, 'none') when the site has no such page and
-    (None, None, 'unresolved') when the homepage could not be fetched (retried next run)."""
+    'path' or 'map'; hop is portal_hop's (url, kind) when the page hands off, else None.
+    (None, None, 'none', None) when the site has no such page and (None, None, 'unresolved',
+    None) when the homepage could not be fetched (retried next run)."""
     status, html = session.fetch(site)
     if not html:
         log(f"  ! {site}: homepage not fetched (HTTP {status})")
-        return None, None, "unresolved"
+        return None, None, "unresolved", None
+
+    def found(u, text, body, how):
+        return u, text, how, portal_hop(session, u, body, text, log)
     tried = set()
     for u in careers_links(html, site)[:4]:
         tried.add(u)
-        ok, text = _page_ok(session, u)
+        ok, text, body = _page(session, u)
         if ok:
-            return u, text, "link"
+            return found(u, text, body, "link")
     origin = origin_of(site)
     for path in COMMON_PATHS:
         u = origin + path
         if u in tried:
             continue
         tried.add(u)
-        ok, text = _page_ok(session, u)
+        ok, text, body = _page(session, u)
         if ok:
-            return u, text, "path"
+            return found(u, text, body, "path")
     if firecrawl:
         st, data = session.firecrawl(origin, "map", search="careers jobs employment", limit=20)
         for u in careers_from_links((data or {}).get("links"), origin)[:4]:
             if u in tried:
                 continue
-            ok, text = _page_ok(session, u)
+            ok, text, body = _page(session, u)
             if ok:
-                return u, text, "map"
-    return None, None, "none"
+                return found(u, text, body, "map")
+    return None, None, "none", None

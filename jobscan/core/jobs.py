@@ -128,6 +128,7 @@ SELECT j.*, v.verdict, v.eligible_grades, v.reason AS verdict_reason, v.assessed
        b.name AS board_name, b.url AS board_source_url, b.adapter AS board_adapter, b.origin AS board_origin,
        p.name AS place_name, p.address AS place_address, p.city AS place_city, p.state AS place_state,
        p.lat AS place_lat, p.lon AS place_lon, p.website AS place_website, p.careers_url AS place_careers_url,
+       p.portal_url AS place_portal_url,
        p.phone AS place_phone
 FROM jobs j
 LEFT JOIN boards b ON b.id = j.board_id
