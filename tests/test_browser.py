@@ -493,6 +493,18 @@ def check_relay_down():
         except Exception:  # noqa: BLE001  (the restart attempt fails: no Chrome here)
             pass
         assert s.chrome._failures >= 1, s.chrome._failures
+    class TimeoutException(Exception):                             # selenium's, by name
+        pass
+
+    class _SlowDriver(_StubDriver):
+        def get(self, url):
+            raise TimeoutException("Message: timeout: Timed out receiving message from renderer: -0.002")
+
+    with B.Session(lambda m: None, B.Config(env)) as s:            # a slow page is the site's failure, not Chrome's
+        s.chrome._drv = _SlowDriver()
+        s.chrome._start = lambda: (_ for _ in ()).throw(RuntimeError("no chrome in tests"))
+        assert s.chrome.request("https://slow.example.com/") == (408, "")
+        assert s.chrome._failures == 0 and s.chrome._drv is None    # no breaker tick; the browser was closed
     with B.Session(lambda m: None, B.Config(env)) as s:            # the accept loop survives a bad connection
         c = socket.create_connection(("127.0.0.1", s.relay.port))
         c.close()

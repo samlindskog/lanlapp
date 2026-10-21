@@ -965,6 +965,14 @@ class Chrome:
                     code = tunnel_error(e)
                     if code and self.relay is not None and self.relay.alive():
                         return 0, f"net::{code}"           # the relay refused this tunnel: Chrome itself is fine
+                    if e.__class__.__name__ == "TimeoutException":
+                        # A page that never finishes loading is the site's problem, not Chrome's: it
+                        # is not counted towards MAX_FAILURES (two slow sites must not hand a whole
+                        # run to plain HTTP). The browser is restarted so a stuck renderer does not
+                        # poison the next page, and 408 tells fetch not to retry.
+                        self.log(f"  ! browser: page timeout on {url[:80]}; browser restarted")
+                        self.close()
+                        return 408, ""
                     # A tunnel error with no relay to answer it is a browser failure, not a route
                     # decision: counting it lets MAX_FAILURES hand the session to plain HTTP.
                     self._failed(f"relay down (net::{code})" if code else f"{e.__class__.__name__}: {str(e)[:160]}")
