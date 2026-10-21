@@ -3,6 +3,7 @@ of the site, name resemblance, careers-link heuristics over a homepage's anchors
 paths, and a Firecrawl site map. Pure functions plus discover_careers(), which fetches through
 the run's Session."""
 import html as html_lib
+import math
 import re
 import urllib.parse
 from core.geo import host_of, norm_name, origin_of, rx_escape, state_forms, web_url
@@ -31,7 +32,12 @@ AGGREGATORS = {"yelp.com", "yelp.ca", "facebook.com", "fb.com", "instagram.com",
                "chamberofcommerce.com", "zillow.com", "loopnet.com", "zoominfo.com", "crunchbase.com", "dnb.com",
                "superpages.com", "hotfrog.com", "cylex.us", "cylex-usa.com", "niche.com", "greatschools.org",
                "usnews.com", "ziprecruiter.com", "simplyhired.com", "bing.com", "apple.com", "waze.com",
-               "doordash.com", "grubhub.com", "ubereats.com"}
+               "doordash.com", "grubhub.com", "ubereats.com",
+               # profile and directory hosts: a doctor's WebMD page names the practice and the city,
+               # and its careers link is WebMD's own
+               "webmd.com", "vitals.com", "doximity.com", "psychologytoday.com", "sharecare.com", "caredash.com",
+               "ratemds.com", "npino.com", "npidb.org", "findatopdoc.com", "buzzfile.com", "bizapedia.com",
+               "opencorporates.com", "angi.com", "thumbtack.com", "houzz.com", "trustpilot.com"}
 
 
 def is_aggregator(url):
@@ -51,27 +57,64 @@ def key_tokens(name):
 
 
 def registrable_domain(url):
-    """'riograndecu' for https://www.riograndecu.org/x: the label the business registered
-    (the one before the public suffix; co.uk-style suffixes are skipped), letters and digits only."""
+    """'riograndecu' for https://www.riograndecu.org/x: the label the business registered (the
+    one before the public suffix; co.uk-style suffixes are skipped), lower-case letters, digits
+    and hyphens (the last two only ever separate words)."""
     labels = (host_of(url) or "").split(".")
     if len(labels) < 2:
         return ""
     label = labels[-3] if len(labels) >= 3 and labels[-2] in ("co", "com", "org", "net", "gov", "edu", "ac") else labels[-2]
-    return re.sub(r"[^a-z0-9]", "", label)
+    return re.sub(r"[^a-z0-9-]", "", label)
+
+
+def label_words(label, words):
+    """(whole, acronym): the indexes of `words` that spell `label` end to end, each word used
+    once, digits and hyphens skipped, plus at most one acronym of a contiguous run of the words
+    left over (riograndecu = rio + grande + cu for credit union); None when it cannot be spelled.
+    Whole words only: "foot" is not "footlocker", "edward" is not "edwardjones"."""
+    n = len(label)
+
+    def go(pos, used, acr):
+        while pos < n and not label[pos].isalpha():
+            pos += 1
+        if pos == n:
+            return used, acr
+        for i, w in enumerate(words):
+            if i not in used and label.startswith(w, pos):
+                r = go(pos + len(w), used | {i}, acr)
+                if r:
+                    return r
+        if acr is None:
+            free = [i for i in range(len(words)) if i not in used]
+            for a in range(len(free)):
+                for b in range(a + 2, len(free) + 1):
+                    run = free[a:b]
+                    if run[-1] - run[0] != len(run) - 1:        # the run must be contiguous in the name
+                        break
+                    acro = "".join(words[i][0] for i in run)
+                    if label.startswith(acro, pos):
+                        r = go(pos + len(acro), used, frozenset(run))
+                        if r:
+                            return r
+        return None
+    return go(0, frozenset(), None)
 
 
 def domain_matches(name, url):
-    """Rule 1: the registered domain carries a distinctive word of the name (riograndecu.org
-    for Rio Grande Credit Union), or the whole name when it has no distinctive word
-    (firstcommunitybank.com); weloans.com for a State Farm agent carries nothing."""
-    dom = registrable_domain(url)
-    if not dom:
+    """Rule 1: the registered label is spelled from the name's words (label_words), with at least
+    one whole word, and at least one distinctive word when the name has any. riograndecu.org for
+    Rio Grande Credit Union, bankofalbuquerque.com, firstcommunitybank.com (no distinctive word:
+    the whole name); not footlocker.ca for Foot & Ankle Specialist, not edwardjones.com for
+    Edward Ned Siegel, not fcb.example.com (an acronym alone)."""
+    label, words = registrable_domain(url), norm_name(name).split()
+    if not label or not words:
         return False
-    distinct = [t for t in name_tokens(name) if t not in GENERIC]
-    if distinct:
-        return any(t in dom for t in distinct)
-    toks = name_tokens(name)
-    return bool(toks) and all(t in dom for t in toks)
+    spelled = label_words(label, words)
+    if not spelled or not spelled[0]:
+        return False
+    whole, acr = spelled
+    distinct = {i for i, w in enumerate(words) if len(w) >= 3 and w not in GENERIC and w not in _STOP}
+    return not distinct or bool((whole | (acr or frozenset())) & distinct and whole & distinct)
 
 
 def mentions_place(text, city=None, state=None):
@@ -84,20 +127,34 @@ def mentions_place(text, city=None, state=None):
                 or (abbr and re.search(r"\b" + abbr + r"\b", t)))
 
 
+def title_names(name, title):
+    """Does a result's title carry the business's distinctive words in order: at least 70% of
+    them as one contiguous run ("Monica Valdez - State Farm agent" for State Farm - Monica
+    Valdez; "Best credit unions in New Mexico" does not name Rio Grande Credit Union)."""
+    keys, words = key_tokens(name), name_tokens(title)        # both without stop words and initials
+    if not keys or not words:
+        return False
+    need = max(1, math.ceil(0.7 * len(keys)))
+    for i in range(len(keys)):
+        for j in range(i + need, len(keys) + 1):
+            run = keys[i:j]
+            if any(words[k:k + len(run)] == run for k in range(len(words) - len(run) + 1)):
+                return True
+    return False
+
+
 def pick_website(name, results, city=None, state=None):
     """The business's own site among search results, or None. Never a directory host. Rule 1
-    (preferred): the domain is built from the name (domain_matches). Rule 2: the title or
-    snippet names the place's city or state and carries a distinctive word of the name (a
-    local listing on a site named otherwise)."""
-    hits = [(web_url(r.get("url")), f"{r.get('title') or ''} {r.get('snippet') or ''}") for r in results or []]
-    hits = [(u, text) for u, text in hits if u and not is_aggregator(u)]
-    for u, _ in hits:
+    (preferred): the domain is spelled from the name (domain_matches). Rule 2: the title names
+    the business (title_names) and the title or snippet names the place's city or state (a local
+    listing on a site named otherwise)."""
+    hits = [(web_url(r.get("url")), r.get("title") or "", r.get("snippet") or "") for r in results or []]
+    hits = [(u, t, s) for u, t, s in hits if u and not is_aggregator(u)]
+    for u, _, _ in hits:
         if domain_matches(name, u):
             return u
-    keys = key_tokens(name)
-    for u, text in hits:
-        words = set(norm_name(text).split())
-        if mentions_place(text, city, state) and any(k in words for k in keys):
+    for u, title, snippet in hits:
+        if title_names(name, title) and mentions_place(f"{title} {snippet}", city, state):
             return u
     return None
 

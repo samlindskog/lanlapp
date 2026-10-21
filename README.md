@@ -226,8 +226,8 @@ within 150 m or by website host, and kept in the `places` table across runs. A p
 is looked up through the web search when `SEARXNG_URL` is set (one query per 2 s; when the engines
 are throttled and answer nothing, the place stays `unresolved` for the next run, the run pauses 60 s
 after three such answers in a row and skips the remaining lookups after three more; directory hosts such as Yelp or Facebook
-are skipped; the result's domain must be built from the name, or its title must name the place's
-city or state together with a distinctive word of the name), else marked `no_site`. Each website is fetched through
+and profile/directory hosts such as WebMD are skipped; the result's domain must be spelled from the name's words, or its title must name the business and the place's
+city or state), else marked `no_site`. Each website is fetched through
 the run's browser Session and searched for a careers page: a careers/jobs/employment link on the
 homepage, then the common paths (`/careers`, `/jobs`, ...), then a Firecrawl site map when
 `FIRECRAWL_URL` is set. A careers page that lists nothing itself but hands off to a portal (an

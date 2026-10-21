@@ -66,14 +66,30 @@ def check_websites():
     for bad in ("javascript:alert(1)", "mailto:hr@acme.example.com", "www.acme.example.com", "/careers", "ftp://x.example.com/", "", None, "https://"):
         assert geo.web_url(bad) is None, bad
     assert careers.registrable_domain("https://www.riograndecu.org/careers") == "riograndecu"
-    assert careers.registrable_domain("https://jobs.first-community.co.uk/") == "firstcommunity" and careers.registrable_domain("http://localhost/") == ""
+    assert careers.registrable_domain("https://jobs.first-community.co.uk/") == "first-community" and careers.registrable_domain("http://localhost/") == ""
+    assert careers.is_aggregator("https://doctor.webmd.com/doctor/richard-skurla-x") and careers.is_aggregator("https://www.psychologytoday.com/us/therapists/x")
+    assert careers.is_aggregator("https://www.glassdoor.com/x") and careers.is_aggregator("https://www.bbb.org/x") and not careers.is_aggregator("https://webmd.example.com/")
     assert careers.key_tokens("State Farm - Monica Valdez") == ["monica", "valdez"] and careers.key_tokens("The Aragon Agency") == ["aragon"]
     assert careers.key_tokens("First Community Bank") == ["first", "community", "bank"]       # all generic: the whole name counts
-    # Rule 1: the domain is built from the name.
+    # Rule 1: the domain's label is spelled from the name's words (whole words, one acronym of the
+    # leftovers allowed), never by a substring.
+    assert careers.label_words("riograndecu", ["rio", "grande", "credit", "union"]) == (frozenset({0, 1}), frozenset({2, 3}))
+    assert careers.label_words("bank-of-albuquerque2", ["bank", "of", "albuquerque"]) == (frozenset({0, 1, 2}), None)
+    assert careers.label_words("footlocker", ["foot", "and", "ankle", "specialist"]) is None
     assert careers.domain_matches("Rio Grande Credit Union", "https://www.riograndecu.org/")
     assert careers.domain_matches("First Community Bank", "https://www.firstcommunitybank.com/")
     assert careers.domain_matches("Walmart", "https://walmart.com/store/123")
-    assert not careers.domain_matches("First Community Bank", "https://fcb.example.com/")
+    for name, url in (("Walgreens", "https://www.walgreens.com/"), ("Aspen Dental", "https://www.aspendental.com/"),
+                      ("Concentra Urgent Care", "https://www.concentra.com/"), ("Planned Parenthood", "https://www.plannedparenthood.org/"),
+                      ("Bank of Albuquerque", "https://www.bankofalbuquerque.com/"), ("Sunrise Bank", "https://www.sunrise.bank/"),
+                      ("First Community Bank", "https://first-community-bank.com/")):
+        assert careers.domain_matches(name, url), (name, url)
+    # the three real false positives: a token that is only a prefix of the label, and a directory
+    assert not careers.domain_matches("Foot & Ankle Specialist", "https://www.footlocker.ca/")
+    assert not careers.domain_matches("Edward Ned Siegel, Elliot H Rapoport Clinical Psychology", "https://www.edwardjones.com/")
+    assert not careers.domain_matches("Skurla, DO", "https://doctor.webmd.com/doctor/richard-skurla-do-x")
+    assert not careers.domain_matches("First Community Bank", "https://fcb.example.com/")                 # an acronym alone
+    assert not careers.domain_matches("Rio Grande Credit Union", "https://rgcu.example.com/")              # likewise
     assert not careers.domain_matches("State Farm - Monica Valdez", "https://weloans.com/store/monica-valdez-state-farm-insurance-agent-2bdfbef9")
     assert not careers.domain_matches("The Aragon Agency", "https://www.enqa.eu/membership-database/acpua-aragon-agency-for-quality-assurance")
     assert not careers.domain_matches("Albuquerque Insurance Agency", "https://www.agency.example.com/")   # generic words only, not all present
@@ -94,8 +110,24 @@ def check_websites():
     rgcu = [{"url": "https://www.yelp.com/biz/rio-grande-credit-union-albuquerque", "title": "Rio Grande Credit Union - Albuquerque, NM - Yelp"},
             {"url": "https://www.nerdwallet.example.com/best-credit-unions", "title": "Best credit unions in New Mexico", "snippet": "Rio Grande Credit Union and others"},
             {"url": "https://www.riograndecu.org/", "title": "Home"}]
-    assert careers.pick_website("Rio Grande Credit Union", rgcu, "Albuquerque", "NM") == "https://www.riograndecu.org/"   # rule 1 beats an earlier rule-2 hit
-    assert careers.pick_website("Rio Grande Credit Union", rgcu[:2], "Albuquerque", "NM") == rgcu[1]["url"]             # rule 2 alone
+    assert careers.pick_website("Rio Grande Credit Union", rgcu, "Albuquerque", "NM") == "https://www.riograndecu.org/"   # rule 1
+    assert careers.pick_website("Rio Grande Credit Union", rgcu[:2], "Albuquerque", "NM") is None     # a listicle names the place, not the business
+    # Rule 2 needs the business named in the title (its distinctive words in order), not a stray word
+    assert careers.title_names("State Farm - Monica Valdez", "Monica Valdez - State Farm Insurance Agent in Albuquerque, NM")
+    assert careers.title_names("Rio Grande Credit Union", "Rio Grande Credit Union - Albuquerque, NM | Home")
+    assert careers.title_names("Edward Ned Siegel, Elliot H Rapoport Clinical Psychology", "Edward Siegel, Elliot Rapoport Clinical Psychology - Santa Fe")   # 5 of 7 in a run
+    assert not careers.title_names("Edward Ned Siegel, Elliot H Rapoport Clinical Psychology", "Edward Jones | Santa Fe, NM Financial Advisor")
+    assert not careers.title_names("Edward Ned Siegel, Elliot H Rapoport Clinical Psychology", "Clinical Psychology in Santa Fe")   # 2 of 7
+    assert not careers.title_names("Rio Grande Credit Union", "Best credit unions in New Mexico")
+    assert not careers.title_names("Foot & Ankle Specialist", "Foot Locker Santa Fe | Shoes")
+    local = [{"url": "https://santafepodiatry.example.net/", "title": "Foot & Ankle Specialist of Santa Fe, NM"}]
+    assert careers.pick_website("Foot & Ankle Specialist", local, "Santa Fe", "NM") == local[0]["url"]  # rule 2, as intended
+    # the three real cases from the Santa Fe rediscovery run: all None
+    assert careers.pick_website("Foot & Ankle Specialist", [{"url": "https://www.footlocker.ca/", "title": "Foot Locker Canada | Santa Fe"}], "Santa Fe", "NM") is None
+    assert careers.pick_website("Edward Ned Siegel, Elliot H Rapoport Clinical Psychology",
+                                [{"url": "https://www.edwardjones.com/", "title": "Edward Jones | Santa Fe, NM Financial Advisor"}], "Santa Fe", "NM") is None
+    assert careers.pick_website("Skurla, DO", [{"url": "https://doctor.webmd.com/doctor/richard-skurla-do-abc",
+                                                "title": "Dr. Richard Skurla, DO | Santa Fe, NM | WebMD"}], "Santa Fe", "NM") is None
     results = [{"url": "https://www.yelp.com/biz/first-community-bank", "title": "First Community Bank - Yelp"},
                {"url": "https://www.randomnews.example.com/story", "title": "A story"},
                {"url": "javascript:alert(1)", "title": "First Community Bank"},
