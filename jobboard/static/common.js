@@ -190,6 +190,7 @@ window.JB = (() => {
           + cell("Place", walking && p.place_name ? `${p.place_index}/${p.discovered || "?"} · ${p.place_name}` : null, "span")
           + cell("Places found", p.discovered ?? sm.discovered) + cell("New places", p.new_places ?? sm.new_places)
           + cell("Websites found", p.resolved ?? sm.resolved) + cell("No website", p.no_site ?? sm.no_site)
+          + cell("Lookups throttled", (p.search_unavailable ?? sm.search_unavailable) || null)
           + cell("Careers pages", p.with_careers ?? sm.with_careers) + cell("New boards", p.boards_new ?? sm.boards_new);
       }
       if (r.kind === "scan" || (r.kind === "geo" && (p.boards_total != null || sm.boards))) {

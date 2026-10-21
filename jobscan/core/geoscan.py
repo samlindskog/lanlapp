@@ -4,6 +4,7 @@ the boards this run registered or re-checked, all inside the one Session the run
 defined by its parameters alone (centre, radius, categories, keywords, finders, filters); the run
 row keeps them, so the Scans page repeats or edits it."""
 import datetime as dt
+import time
 
 import browser
 import finders as F
@@ -15,6 +16,17 @@ from core.geo import DEFAULT_CATEGORIES, dedup, location_regex
 from core.places import register_place_board, set_fields, upsert_place
 from core.scan import Progress, scan_boards
 
+THROTTLE_STREAK, THROTTLE_PAUSE = 3, 60      # throttled lookups in a row that pause the run, and for how long
+_sleep = time.sleep                           # tests stub this
+
+
+def _pause(seconds, check):
+    """Wait, one second at a time, so a cancel still lands within a second."""
+    for _ in range(int(seconds)):
+        check()
+        _sleep(1)
+
+
 # ---------------------------------------------------------------- the pipeline
 def geo_scan(conn, params, session, log=print, progress=None, check=None, run_id=None):
     """One geographic scan: discover (finders) -> places table -> websites (web search) ->
@@ -24,7 +36,9 @@ def geo_scan(conn, params, session, log=print, progress=None, check=None, run_id
     regex; None = built from the places' and the centre's city/state, center_place), max_places,
     recheck_days, rediscover, days. progress fields: phase (discovering | resolving | careers | scanning |
     done), place_index/place_name, the counters discovered, new_places, resolved, no_site,
-    with_careers, boards_new, then scan_boards' own. check() runs before every network call."""
+    search_unavailable (lookups the throttled search could not answer; those places stay
+    unresolved), with_careers, boards_new, then scan_boards' own. check() runs before every
+    network call."""
     p, check = progress or Progress(), check or (lambda: None)
     center = (float(params["lat"]), float(params["lon"]))
     radius_m = float(params.get("radius_km") or 10) * 1000
@@ -73,24 +87,42 @@ def geo_scan(conn, params, session, log=print, progress=None, check=None, run_id
     cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=recheck_days)).isoformat(timespec="seconds")
     stale = lambda r: rediscover or not r.get("last_checked") or r["last_checked"] < cutoff  # noqa: E731
 
-    # 2. websites
-    p.update(phase="resolving")
+    # 2. websites. A throttled search engine is not "no such site": the place stays unresolved
+    # for the next run. Three throttled answers in a row pause the run once (60 s); three more
+    # after that skip the remaining lookups, so 300 places never hammer the engines.
+    p.update(phase="resolving", search_unavailable=0)
+    streak, paused, skipping = 0, False, False
     for i, row in enumerate(rows):
         p.update(place_index=i + 1, place_name=row["name"])
         if row["status"] != "active" or row.get("website") or (row.get("careers_kind") == "no_site" and not stale(row)):
             continue
-        site = None
-        if websearch.configured():
+        site, throttled = None, skipping
+        if websearch.configured() and not skipping:
             check()
-            q = " ".join(x for x in (f'"{row["name"]}"', row.get("city"), row.get("state")) if x)
+            q = websearch.query_for(row["name"], row.get("city"), row.get("state"))
             try:
                 site = pick_website(row["name"], websearch.search(q), city=row.get("city"), state=row.get("state"))
+                streak = 0
+            except websearch.SearchUnavailable as e:
+                throttled, streak = True, streak + 1
+                log(f"{row['name']}: web search unavailable ({e})")
+                if streak >= THROTTLE_STREAK and not paused:
+                    paused, streak = True, 0
+                    log(f"web search throttled {THROTTLE_STREAK} times in a row; pausing {THROTTLE_PAUSE} s")
+                    _pause(THROTTLE_PAUSE, check)
+                elif streak >= THROTTLE_STREAK:
+                    skipping = True
+                    log(f"web search still throttled {THROTTLE_STREAK} times after the pause; skipping the remaining "
+                        "website lookups of this run (those places stay unresolved and are retried next run)")
             except Exception as e:  # noqa: BLE001
                 log(f"  ! web search failed for {row['name']}: {e}")
         if site:
             set_fields(conn, row, website=site, careers_kind=None)
             p.add(resolved=1)
             log(f"{row['name']}: website {site}")
+        elif throttled:
+            set_fields(conn, row, careers_kind="unresolved", last_checked=now())
+            p.add(search_unavailable=1)
         else:
             set_fields(conn, row, careers_kind="no_site", last_checked=now())
             p.add(no_site=1)
@@ -151,5 +183,5 @@ def geo_scan(conn, params, session, log=print, progress=None, check=None, run_id
         log("no boards to scan")
         sm = {"cards": 0, "new": 0, "known": 0, "carried": 0, "embedded": 0, "boards": [], "failed": [], "need_judgment": []}
     p.update(phase="done", place_name=None, board=None, job_title=None)
-    return {k: p.state.get(k, 0) for k in ("discovered", "new_places", "resolved", "no_site", "with_careers", "boards_new")} \
+    return {k: p.state.get(k, 0) for k in ("discovered", "new_places", "resolved", "no_site", "search_unavailable", "with_careers", "boards_new")} \
         | {"boards_scanned": len(sel), "location": location} | sm

@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.join(HERE, "..", "jobscan"))
 import jobscan as J  # noqa: E402
 import finders  # noqa: E402
 from core import careers, geo, geoscan, places  # noqa: E402
+from core import places as places_mod  # noqa: E402
 from helpers import FakeSession  # noqa: E402
 
 
@@ -282,9 +283,139 @@ PLACES = [
     {"name": "Acme Corp", "lat": 35.5, "lon": -106.0, "category": "finance", "finder_id": "node/9"},   # 55 km away: another place
     {"name": "Acme Branch", "lat": 35.07, "lon": -106.0, "website": "https://acme-branch.example.com/", "category": "retail", "finder_id": "node/10"},  # shares Acme's careers page
 ]
-SEARCH = {'"First Community Bank" Albuquerque NM': [{"url": "https://www.yelp.com/biz/fcb", "title": "First Community Bank - Yelp"},
+SEARCH = {'First Community Bank Albuquerque NM': [{"url": "https://www.yelp.com/biz/fcb", "title": "First Community Bank - Yelp"},
                                                    {"url": "https://bank.example.com/", "title": "First Community Bank - Albuquerque, NM"}],
-          '"Nowhere Ltd" Albuquerque': [{"url": "https://www.yellowpages.com/x", "title": "Nowhere Ltd"}]}
+          'Nowhere Ltd Albuquerque': [{"url": "https://www.yellowpages.com/x", "title": "Nowhere Ltd"}]}
+
+
+def check_websearch():
+    """The query form, and a throttled SearXNG reply (no results, engines suspended) raising
+    SearchUnavailable instead of looking like 'no such site'."""
+    from core import websearch as W
+    assert W.query_for("First Community Bank", "Albuquerque", "NM") == "First Community Bank Albuquerque NM"
+    assert W.query_for(" Nowhere Ltd ", None, "") == "Nowhere Ltd" and W.query_for("X", "Santa Fe", None) == "X Santa Fe"
+    throttled = {"query": "x", "results": [], "unresponsive_engines": [["brave", "Suspended: too many requests"],
+                                                                         ["duckduckgo", "CAPTCHA"], ["google cse", "Suspended: too many requests"]]}
+    assert W.unresponsive(throttled) == ["brave: too many requests", "duckduckgo: CAPTCHA", "google cse: too many requests"]
+    assert W.unresponsive({"results": []}) == [] and W.unresponsive([]) == [] and W.unresponsive({"unresponsive_engines": [["bing"]]}) == ["bing: unresponsive"]
+    saved = W.SEARXNG_URL, W.request, W._pace.wait
+    replies, calls = [], []
+    W.SEARXNG_URL, W._pace.wait = "http://searxng:8080", lambda: calls.append("paced")
+    W.request = lambda url, **k: replies.pop(0) if not isinstance(replies[0], Exception) else (_ for _ in ()).throw(replies.pop(0))
+    try:
+        replies.append((200, throttled))
+        try:
+            W.search("First Community Bank Albuquerque NM")
+            raise AssertionError("a throttled reply must raise")
+        except W.SearchUnavailable as e:
+            assert str(e) == "brave: too many requests, duckduckgo: CAPTCHA, google cse: too many requests" and len(e.reasons) == 3, e
+        for reply in ((502, {"text": "bad gateway"}), (200, "not json"), OSError("timed out")):
+            replies.append(reply)
+            try:
+                W.search("x")
+                raise AssertionError(f"{reply} must raise")
+            except W.SearchUnavailable as e:
+                assert e.reasons[0].startswith("searxng: "), e.reasons
+        replies.append((200, {"results": [], "unresponsive_engines": []}))
+        assert W.search("x") == []                                                   # a genuine empty answer
+        replies.append((200, {"results": [{"url": "https://a.example.com/", "title": "A", "content": "s"}],
+                              "unresponsive_engines": [["brave", "Suspended: too many requests"]]}))
+        assert W.search("x") == [{"url": "https://a.example.com/", "title": "A", "snippet": "s"}]   # some engines answered
+        assert len(calls) == 6 and W._pace.interval == 2.0                           # every query paced, 2 s apart
+        assert W.search("   ") == []                                                  # nothing to ask: no request
+    finally:
+        W.SEARXNG_URL, W.request, W._pace.wait = saved
+
+
+def _geo_fakes(places, search):
+    """A pipeline harness: a finder returning `places`, `search(q)` as the web search, boards and
+    scans stubbed. Returns (conn, lines, sleeps, restore)."""
+    class Finder:
+        NAME = DISPLAY_NAME = "fake"
+        configured = staticmethod(lambda: True)
+        find = staticmethod(lambda *a: [dict(p) for p in places])
+
+    def add_board(conn, url, name=None, session=None, origin="manual", fallback_adapter=None, **k):
+        b = {"id": len(conn.boards) + 1, "adapter": "firecrawl", "key": url, "name": name, "url": url, "params": None,
+             "enabled": 1, "origin": origin, "added_at": "t"}
+        conn.boards[b["id"]] = b
+        return {**b, "params": {}, "enabled": True}
+    saved = (finders.names, finders.load, places_mod.add_board, geoscan.scan_boards, geoscan.websearch.configured,
+             geoscan.websearch.search, geoscan._sleep)
+    sleeps = []
+    finders.names, finders.load = (lambda: ["fake"]), (lambda n: Finder)
+    places_mod.add_board = add_board
+    geoscan.scan_boards = lambda conn, boards, **k: {"cards": 0, "new": 0, "known": 0, "carried": 0, "embedded": 0, "boards": [], "failed": [], "need_judgment": []}
+    geoscan.websearch.configured, geoscan.websearch.search = (lambda: True), search
+    geoscan._sleep = sleeps.append
+
+    def restore():
+        (finders.names, finders.load, places_mod.add_board, geoscan.scan_boards, geoscan.websearch.configured,
+         geoscan.websearch.search, geoscan._sleep) = saved
+    return FakeConn(), [], sleeps, restore
+
+
+def check_throttled_search():
+    """Throttled lookups mark places unresolved (not no_site), count as search_unavailable, pause
+    the run once after 3 in a row, skip the rest after 3 more; a genuine [] is still no_site."""
+    from core import websearch as W
+    towns = [{"name": f"Shop {i}", "lat": 35.0 + i / 100, "lon": -106.0, "city": "Santa Fe", "state": "NM", "category": "retail",
+              "finder_id": f"node/{i}"} for i in range(10)]
+    asked = []
+
+    def always_down(q, n=5):
+        asked.append(q)
+        raise W.SearchUnavailable(["brave: too many requests", "duckduckgo: CAPTCHA"])
+    conn, lines, sleeps, restore = _geo_fakes(towns, always_down)
+    params = {"lat": 35.0, "lon": -106.0, "radius_km": 5, "categories": ["retail"], "finders": None, "days": 7}
+    try:
+        sm = J.geo_scan(conn, params, FakeSession(lambda u, **k: (404, "")), log=lines.append, progress=J.Progress(), check=lambda: None, run_id=1)
+        assert asked == [f"Shop {i} Santa Fe NM" for i in range(6)], asked              # 3, pause, 3, skip
+        assert sleeps == [1] * 60, len(sleeps)                                             # one 60 s pause, cancel-checkable
+        assert sm["search_unavailable"] == 10 and sm["no_site"] == 0 and sm["resolved"] == 0, sm
+        assert all(r["careers_kind"] == "unresolved" and r["last_checked"] for r in conn.places.values())
+        assert sum("web search unavailable (brave: too many requests, duckduckgo: CAPTCHA)" in ln for ln in lines) == 6, lines
+        assert any("pausing 60 s" in ln for ln in lines) and any("skipping the remaining website lookups" in ln for ln in lines), lines
+        # A cancel during the pause lands within a second.
+        asked.clear(); sleeps.clear()
+        ticks = []
+
+        def cancel_in_pause():
+            ticks.append(1)
+            if len(ticks) > 5:
+                raise J.browser.Cancelled("stop")
+        try:
+            J.geo_scan(FakeConn(), params, FakeSession(lambda u, **k: (404, "")), log=lines.append, progress=J.Progress(), check=cancel_in_pause, run_id=2)
+            raise AssertionError("cancel did not propagate")
+        except J.browser.Cancelled:
+            pass
+        assert len(asked) == 3 and len(sleeps) < 60, (asked, sleeps)
+    finally:
+        restore()
+    # The engines recover after the pause: the streak resets, lookups go on, a genuine [] is no_site.
+    asked.clear()
+    state = {"n": 0}
+
+    def recovering(q, n=5):
+        asked.append(q)
+        state["n"] += 1
+        if state["n"] <= 3 or state["n"] == 5:
+            raise W.SearchUnavailable(["brave: too many requests"])
+        return []
+    conn, lines, sleeps, restore = _geo_fakes(towns, recovering)
+    try:
+        sm = J.geo_scan(conn, params, FakeSession(lambda u, **k: (404, "")), log=lines.append, progress=J.Progress(), check=lambda: None, run_id=3)
+        assert len(asked) == 10 and len(sleeps) == 60, (len(asked), len(sleeps))         # every place asked, one pause
+        assert sm["search_unavailable"] == 4 and sm["no_site"] == 6, sm
+        kinds = [conn.places[i]["careers_kind"] for i in sorted(conn.places)]
+        assert kinds == ["unresolved"] * 3 + ["no_site", "unresolved"] + ["no_site"] * 5, kinds
+        # Next run: the unresolved ones are asked again, the no_site ones wait for recheck_days.
+        asked.clear()
+        geoscan.websearch.search = lambda q, n=5: asked.append(q) or []
+        sm2 = J.geo_scan(conn, params, FakeSession(lambda u, **k: (404, "")), log=lines.append, progress=J.Progress(), check=lambda: None, run_id=4)
+        assert len(asked) == 4 and sm2["no_site"] == 4 and sm2["search_unavailable"] == 0, (asked, sm2)
+    finally:
+        restore()
 
 
 def check_pipeline():
@@ -451,6 +582,10 @@ def main():
     print("location_regex + state forms + Nominatim reverse parsing: ok")
     check_registry_and_osm()
     print("category registry + Overpass query/parse: ok")
+    check_websearch()
+    print("websearch: unquoted query, SearchUnavailable on a throttled reply, [] only for a genuine empty answer: ok")
+    check_throttled_search()
+    print("throttled lookups: unresolved not no_site, pause after 3, skip after 3 more, counters, recovery: ok")
     check_pipeline()
     print("pipeline over fakes: discover -> places -> websites -> careers -> boards (origin geo, firecrawl fallback) -> scan; repeat; rediscover; cancel; edits: ok")
 
