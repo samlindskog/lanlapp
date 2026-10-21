@@ -137,9 +137,11 @@ LONE_WORD_LETTERS = 7           # "walmart", "walgreens", "concentra" pass; "que
 
 # Government buildings and generic facilities are not businesses with a website of their own; their
 # employer is the agency, which OSM usually lists under its own name too. No web lookup for them.
-FACILITY_RE = re.compile(r"\bbuilding\s*$|\b(fire station|post office|station #?\d+|division|office of|headquarters|complex|"
-                         r"courthouse|warehouse|training facility|annex|substation|jury services|detention center|"
-                         r"maintenance yard|pump station|water treatment|transfer station|parking (garage|structure))\b", re.I)
+# Physical structures only: an agency ("Office of the State Engineer", "Taxation and Revenue
+# Department", "CYFD") is an employer with a careers page of its own and is not matched.
+FACILITY_RE = re.compile(r"\bbuilding\s*$|\bcomplex\s*$|\b(fire station|station #?\d+|post office|courthouse|warehouse|"
+                         r"training facility|annex|substation|parking (garage|structure)|pump station|"
+                         r"water treatment( plant)?|transfer station|maintenance yard|judicial complex)\b", re.I)
 
 
 def looks_like_facility(name):

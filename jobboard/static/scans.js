@@ -62,7 +62,7 @@
         ${sm.location ? `<small>location filter ${esc(sm.location)}</small>` : ""}
         ${sm.search_unavailable ? `<small style="color:var(--maybe)">${sm.search_unavailable} lookups throttled, retried next run</small>` : ""}
         ${sm.facilities ? `<small class="muted">${sm.facilities} buildings and stations skipped</small>` : ""}
-        ${sm.relookups ? `<small class="muted">${sm.relookups} websites re-resolved, ${sm.websites_changed ?? 0} changed</small>` : ""}
+        ${sm.relookups || sm.websites_changed ? `<small class="muted">${sm.relookups ?? 0} websites re-resolved, ${sm.websites_changed ?? 0} changed${sm.facilities_cleared ? `, ${sm.facilities_cleared} no longer facilities` : ""}</small>` : ""}
         ${sm.need_judgment && sm.need_judgment.length ? `<small>${sm.need_judgment.length} need judgment</small>` : ""}`;
     }
     if (r.kind === "refresh" && sm.refreshed != null) return `${sm.refreshed} refreshed${sm.failed ? ` · <span style="color:var(--no)">${sm.failed} failed</span>` : ""}`;

@@ -141,10 +141,15 @@ def check_websites():
     assert careers.domain_matches("Oculus Eye Care", "https://www.oculuseyecare.com/")         # oculus is one of two distinctive words
     # facilities are not businesses: no lookup at all
     for fac in ("Villagra Building", "Arthur G. Sanchez Building", "United States Post Office", "Santa Fe Fire Station #3",
-                "Chief Tom K. Broome II Fire Department Training Facility", "District Court Jury Services", "Office of the State Engineer",
-                "Santa Fe County Public Works Division", "PNM Substation", "Bataan Memorial Building Annex"):
+                "Santa Fe Fire Station #9", "Chief Tom K. Broome II Fire Department Training Facility", "PNM Substation",
+                "Bataan Memorial Building Annex", "Steve Herrera Judicial Complex", "Santa Fe County Public Safety Complex",
+                "Canyon Road Water Treatment Plant", "Sandoval Street Parking Garage"):
         assert careers.looks_like_facility(fac), fac
-    for biz in ("Rio Grande Credit Union", "Santa Fe Public Library", "Building Blocks Daycare", "Station Grill", "Complexions Spa"):
+    # agencies and offices are employers with careers pages of their own, not structures
+    for biz in ("Rio Grande Credit Union", "Santa Fe Public Library", "Building Blocks Daycare", "Station Grill", "Complexions Spa",
+                "Office of the State Engineer", "CYFD", "Administration and Business Office", "Taxation and Revenue Department",
+                "Public Education Department", "New Mexico State Capitol", "District Court Jury Services",
+                "Santa Fe County Public Works Division", "Santa Fe County Adult Detention Center", "PNM Headquarters"):
         assert not careers.looks_like_facility(biz), biz
     assert careers.pick_website("Villagra Building", [{"url": "https://www.villagra.example.com/", "title": "Villagra Building Santa Fe, NM"}], "Santa Fe", "NM") is None
     # run 22's false positives, all None
@@ -529,18 +534,23 @@ def _geo_fakes(places, search):
 
 
 def check_relookup():
-    """relookup resolves every place's website again: unchanged -> nothing; changed or gone ->
-    careers fields cleared and the old board disabled only once no place points at it; a
-    facility loses any website it had."""
+    """relookup sees every place again: a tag-less place is searched again (unchanged -> nothing;
+    changed or gone -> careers fields cleared, the old board disabled only once no place points
+    at it); a tagged place is never searched and gets its tag back if a past search replaced it;
+    a facility loses any website it had; a place the narrowed facility rule no longer matches
+    becomes a normal place; boards pointed at again are enabled again in the same run."""
     careers_pages = {"https://www.walgreens.com/": _page("Walgreens") + '<a href="/careers">Careers</a>',
                      "https://www.walgreens.com/careers": _page("Walgreens careers"),
                      "https://photo.walgreens.example.net/": _page("Walgreens Photo") + '<a href="https://www.walgreens.com/careers">Careers</a>',
                      "https://www.concentra.com/": _page("Concentra") + '<a href="/jobs">Jobs</a>',
-                     "https://www.concentra.com/jobs": _page("Jobs at Concentra")}
+                     "https://www.concentra.com/jobs": _page("Jobs at Concentra"),
+                     "https://www.ose.example.gov/": _page("Office of the State Engineer") + '<a href="/careers">Careers</a>',
+                     "https://www.ose.example.gov/careers": _page("OSE careers")}
     towns = [{"name": "Walgreens", "lat": 35.0, "lon": -106.0, "website": "https://www.walgreens.com/", "city": "Santa Fe", "state": "NM", "category": "retail", "finder_id": "n/1"},
              {"name": "Walgreens Photo", "lat": 35.1, "lon": -106.0, "city": "Santa Fe", "state": "NM", "category": "retail", "finder_id": "n/2"},   # no tag: the search finds its site
              {"name": "Concentra Urgent Care", "lat": 35.2, "lon": -106.0, "website": "https://www.concentra.com/", "city": "Santa Fe", "state": "NM", "category": "healthcare", "finder_id": "n/3"},
-             {"name": "Villagra Building", "lat": 35.3, "lon": -106.0, "website": "https://www.villagra.example.com/", "city": "Santa Fe", "state": "NM", "category": "government", "finder_id": "n/4"}]
+             {"name": "Villagra Building", "lat": 35.3, "lon": -106.0, "website": "https://www.villagra.example.com/", "city": "Santa Fe", "state": "NM", "category": "government", "finder_id": "n/4"},
+             {"name": "Office of the State Engineer", "lat": 35.4, "lon": -106.0, "website": "https://www.ose.example.gov/", "city": "Santa Fe", "state": "NM", "category": "government", "finder_id": "n/5"}]
     photo = [{"url": "https://photo.walgreens.example.net/", "title": "Walgreens Photo - Santa Fe, NM"}]
     answers = {"Walgreens Photo Santa Fe NM": photo}      # query -> the search's results
     asked = []
@@ -556,43 +566,50 @@ def check_relookup():
         rows = {r["name"]: r for r in conn.places.values()}
         assert asked == ["Walgreens Photo Santa Fe NM"] and sm["resolved"] == 1 and sm["relookups"] == 0 and sm["websites_changed"] == 0
         assert rows["Walgreens"]["board_id"] == rows["Walgreens Photo"]["board_id"] == 1 and rows["Concentra Urgent Care"]["board_id"] == 2
+        assert rows["Office of the State Engineer"]["board_id"] == 3                           # an agency, not a facility
         assert rows["Villagra Building"]["careers_kind"] == "unresolved" and rows["Villagra Building"]["website"]   # a facility with a site, before relookup
-        # relookup: Walgreens unchanged, Walgreens Photo gone, Concentra moved, the building is a facility
+        # What run 24 left behind: a search had replaced Concentra's tag with a stranger's site and
+        # orphaned its board; the old facility rule had stripped the agency and orphaned its board.
+        c, ose = rows["Concentra Urgent Care"], rows["Office of the State Engineer"]
+        c.update(website="https://supreme.com/", careers_url=None, portal_url=None, careers_text=None, careers_kind="unresolved", board_id=None)
+        ose.update(website=None, careers_url=None, portal_url=None, careers_text=None, careers_kind="facility", board_id=None)
+        conn.boards[2]["enabled"] = conn.boards[3]["enabled"] = 0
+        # relookup: tagged places are never searched; Concentra gets its tag back and its board
+        # re-enabled in this run; the agency is a normal place again; Walgreens Photo (no tag) is
+        # searched again and has gone; the building is a facility and loses its site
         asked.clear()
-        answers = {"Walgreens Santa Fe NM": [{"url": "https://www.walgreens.com/", "title": "Walgreens"}],
+        answers = {"Walgreens Santa Fe NM": [{"url": "https://www.walgreens.net/", "title": "Walgreens"}],      # would win if tags could be searched
                    "Concentra Urgent Care Santa Fe NM": [{"url": "https://www.concentra.net/", "title": "Concentra"}]}
         geoscan.websearch.search = lambda q, n=5: asked.append(q) or answers.get(q, [])
         sm2 = J.geo_scan(conn, {**params, "relookup": True}, s, log=lines.append, progress=J.Progress(), check=lambda: None, run_id=2)
-        assert asked == ["Walgreens Santa Fe NM", "Walgreens Photo Santa Fe NM", "Concentra Urgent Care Santa Fe NM"], asked
-        assert sm2["relookups"] == 3 and sm2["websites_changed"] == 2 and sm2["facilities"] == 1, sm2
-        w, wp, c, v = (rows[n] for n in ("Walgreens", "Walgreens Photo", "Concentra Urgent Care", "Villagra Building"))
-        assert w["website"] == "https://www.walgreens.com/" and w["board_id"] == 1 and w["careers_url"] == "https://www.walgreens.com/careers"   # unchanged: untouched
+        assert asked == ["Walgreens Photo Santa Fe NM"], asked                                  # the one tag-less place
+        assert sm2["relookups"] == 1 and sm2["websites_changed"] == 2 and sm2["facilities"] == 1 and sm2["facilities_cleared"] == 1, sm2   # changed: Concentra back to its tag, Photo gone
+        assert sm2["with_careers"] == 2 and sm2["boards_scanned"] == 3, sm2                    # Concentra and the agency re-discovered; all three known boards scanned
+        w, wp, c, v, ose = (rows[n] for n in ("Walgreens", "Walgreens Photo", "Concentra Urgent Care", "Villagra Building", "Office of the State Engineer"))
+        assert w["website"] == "https://www.walgreens.com/" and w["board_id"] == 1 and w["careers_url"] == "https://www.walgreens.com/careers"   # the tag: untouched
         assert wp["website"] is None and wp["careers_kind"] == "no_site" and wp["board_id"] is None and wp["careers_url"] is None
         assert conn.boards[1]["enabled"] == 1                                                  # Walgreens still points at board 1
-        assert c["website"] == "https://www.concentra.net/" and c["board_id"] is None and c["careers_url"] is None and c["portal_url"] is None
-        assert c["careers_kind"] == "unresolved" and conn.boards[2]["enabled"] == 0            # re-discovered (new site answers nothing); its old board orphaned
+        assert c["website"] == "https://www.concentra.com/" and c["careers_url"] == "https://www.concentra.com/jobs" and c["board_id"] == 2
+        assert conn.boards[2]["enabled"] == 1 and any(ln == "board [2] Concentra Urgent Care enabled again: a place points at it" for ln in lines), lines[-14:]
+        assert any(ln == "Concentra Urgent Care: website https://supreme.com/ -> https://www.concentra.com/ (the finder's tag)" for ln in lines), lines[-14:]
+        assert ose["website"] == "https://www.ose.example.gov/" and ose["careers_kind"] == "adapter:firecrawl" and ose["board_id"] == 3 and conn.boards[3]["enabled"] == 1
+        assert any(ln == "Office of the State Engineer: not a facility any more; looked up like any other place" for ln in lines)
         assert v["website"] is None and v["careers_kind"] == "facility" and v["board_id"] is None
-        assert any(ln == "Concentra Urgent Care: website https://www.concentra.com/ -> https://www.concentra.net/" for ln in lines), lines[-12:]
         assert any(ln == "Walgreens Photo: website https://photo.walgreens.example.net/ -> none" for ln in lines)
-        assert any(ln == "board [2] Concentra Urgent Care disabled: no place points at it now" for ln in lines), lines[-12:]
-        assert not any("board [1]" in ln and "disabled" in ln for ln in lines)
-        # a third relookup: the search finds nothing for Walgreens, but the finder's own tag still
-        # says walgreens.com, so nothing changes; Concentra's new site is not the tag, so it goes
-        asked.clear(); answers = {}
+        assert not any("disabled" in ln for ln in lines), [ln for ln in lines if "disabled" in ln]
+        # a third relookup changes nothing: tagged places keep their tags, the tag-less one stays unresolved
+        asked.clear()
         sm3 = J.geo_scan(conn, {**params, "relookup": True}, s, log=lines.append, progress=J.Progress(), check=lambda: None, run_id=3)
-        assert sm3["relookups"] == 2 and sm3["websites_changed"] == 1, sm3                   # Walgreens kept, Concentra gone
-        assert conn.boards[1]["enabled"] == 1 and rows["Walgreens"]["website"] == "https://www.walgreens.com/" and rows["Walgreens"]["board_id"] == 1
-        assert rows["Concentra Urgent Care"]["website"] is None and rows["Concentra Urgent Care"]["careers_kind"] == "no_site"
-        # a fourth: Walgreens moves to another domain of its own, so board 1 is orphaned now
-        answers = {"Walgreens Santa Fe NM": [{"url": "https://www.walgreens.net/", "title": "Walgreens"}]}
+        assert asked == ["Walgreens Photo Santa Fe NM"] and sm3["relookups"] == 0 and sm3["websites_changed"] == 0 and sm3["facilities_cleared"] == 0, sm3
+        assert [conn.boards[i]["enabled"] for i in (1, 2, 3)] == [1, 1, 1] and rows["Concentra Urgent Care"]["board_id"] == 2
+        # a lone tag-less place that moves: the usual change, its orphaned board disabled
+        answers = {"Walgreens Photo Santa Fe NM": [{"url": "https://photo2.walgreens.example.net/", "title": "Walgreens Photo - Santa Fe, NM"}]}
+        rows["Walgreens Photo"].update(website="https://photo.walgreens.example.net/", board_id=4, careers_kind="adapter:firecrawl")
+        conn.boards[4] = {"id": 4, "adapter": "firecrawl", "key": "x", "name": "Walgreens Photo", "url": "x", "params": None, "enabled": 1, "origin": "geo"}
         sm4 = J.geo_scan(conn, {**params, "relookup": True}, s, log=lines.append, progress=J.Progress(), check=lambda: None, run_id=4)
-        # Concentra got its tag's site back from the finder (kept), found its careers page again and
-        # re-pointed at board 2, which comes back enabled; Walgreens moved, so board 1 is orphaned.
-        assert sm4["relookups"] == 2 and sm4["websites_changed"] == 1 and conn.boards[1]["enabled"] == 0, sm4
-        assert rows["Walgreens"]["website"] == "https://www.walgreens.net/" and rows["Walgreens"]["board_id"] is None
-        assert rows["Concentra Urgent Care"]["website"] == "https://www.concentra.com/" and rows["Concentra Urgent Care"]["board_id"] == 2
-        assert conn.boards[2]["enabled"] == 1 and any(ln == "board [2] Concentra Urgent Care enabled again: a place points at it" for ln in lines), lines[-8:]
-        assert any(ln == "board [1] walgreens.com disabled: no place points at it now" for ln in lines), lines[-8:]   # renamed to its host when shared
+        assert sm4["relookups"] == 1 and sm4["websites_changed"] == 1 and conn.boards[4]["enabled"] == 0, sm4
+        assert rows["Walgreens Photo"]["website"] == "https://photo2.walgreens.example.net/" and rows["Walgreens Photo"]["board_id"] is None
+        assert any(ln == "board [4] Walgreens Photo disabled: no place points at it now" for ln in lines), lines[-8:]
     finally:
         restore()
 

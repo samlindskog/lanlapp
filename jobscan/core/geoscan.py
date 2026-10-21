@@ -48,9 +48,10 @@ def geo_scan(conn, params, session, log=print, progress=None, check=None, run_id
     on the boards this run registered or re-checked. params: lat, lon, radius_km, categories,
     keywords, tags, finders (None = all configured), include, exclude, location (a card-location
     regex; None = built from the places' and the centre's city/state, center_place), max_places,
-    recheck_days, rediscover, relookup (resolve every place's website again under the current
-    rules; a changed answer resets its careers page and board: counters relookups,
-    websites_changed), days. progress fields: phase (discovering | resolving | careers | scanning |
+    recheck_days, rediscover, relookup (see every place again: a tag-less place is searched
+    again, a tagged place gets its finder tag back, a former facility becomes a normal place; a
+    changed website resets the careers page and board: counters relookups, websites_changed,
+    facilities_cleared), days. progress fields: phase (discovering | resolving | careers | scanning |
     done), place_index/place_name, the counters discovered, new_places, resolved, no_site, facilities (buildings
     and stations: no lookup, the agency hires),
     search_unavailable (lookups the throttled search could not answer; those places stay
@@ -109,10 +110,13 @@ def geo_scan(conn, params, session, log=print, progress=None, check=None, run_id
     # 2. websites. A throttled search engine is not "no such site": the place stays unresolved
     # for the next run. Three throttled answers in a row pause the run once (60 s); three more
     # after that skip the remaining lookups, so 300 places never hammer the engines.
-    # With relookup, every active place is resolved again under the current rules and compared
-    # with what it had: a changed answer resets its careers page and board (a board no place
-    # points at any more is disabled), an unchanged one is left alone.
-    p.update(phase="resolving", search_unavailable=0, relookups=0, websites_changed=0)
+    # The finder's own website tag (OSM website=) is authoritative: such a place is never searched
+    # and its website is the tag. Only tag-less places are searched. With relookup, every active
+    # place is seen again: a tag-less place is resolved again under the current rules and compared
+    # with what it had, a tagged place gets its tag back if a past search had replaced it, a place
+    # the narrowed facility rule no longer matches becomes a normal place; a changed website resets
+    # the careers page and board (a board no place points at any more is disabled).
+    p.update(phase="resolving", search_unavailable=0, relookups=0, websites_changed=0, facilities_cleared=0)
     streak, paused, skipping = 0, False, False
     for i, row in enumerate(rows):
         p.update(place_index=i + 1, place_name=row["name"])
@@ -126,7 +130,17 @@ def geo_scan(conn, params, session, log=print, progress=None, check=None, run_id
             set_fields(conn, row, careers_kind="facility", last_checked=now())
             p.add(facilities=1)
             continue
-        had = row.get("website")
+        if row.get("careers_kind") == "facility":     # classed so by an older, broader rule: a normal place again
+            log(f"{row['name']}: not a facility any more; looked up like any other place")
+            set_fields(conn, row, careers_kind=None)
+            p.add(facilities_cleared=1)
+        had, tag = row.get("website"), row.get("finder_website")
+        if tag:                                         # the tag is the website; a search never replaces it
+            if had != tag:
+                log(f"{row['name']}: website {had or 'none'} -> {tag} (the finder's tag)")
+                _forget_site(conn, row, tag, log)
+                p.add(websites_changed=1)
+            continue
         if had:
             p.add(relookups=1)
         site, throttled = None, skipping
@@ -152,8 +166,6 @@ def geo_scan(conn, params, session, log=print, progress=None, check=None, run_id
         if had:                                         # a relookup: compare, never downgrade on a throttled answer
             if throttled:
                 p.add(search_unavailable=1)
-            elif site is None and had == row.get("finder_website"):
-                pass                                    # the finder (an OSM tag) still says so: a search that found nothing does not outrank it
             elif site != had:
                 log(f"{row['name']}: website {had} -> {site or 'none'}")
                 _forget_site(conn, row, site, log)
@@ -236,5 +248,5 @@ def geo_scan(conn, params, session, log=print, progress=None, check=None, run_id
         sm = {"cards": 0, "new": 0, "known": 0, "carried": 0, "embedded": 0, "boards": [], "failed": [], "need_judgment": []}
     p.update(phase="done", place_name=None, board=None, job_title=None)
     return {k: p.state.get(k, 0) for k in ("discovered", "new_places", "resolved", "no_site", "facilities", "search_unavailable",
-                                            "relookups", "websites_changed", "with_careers", "boards_new")} \
+                                            "relookups", "websites_changed", "facilities_cleared", "with_careers", "boards_new")} \
         | {"boards_scanned": len(sel), "location": location} | sm
