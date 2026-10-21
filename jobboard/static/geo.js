@@ -33,6 +33,7 @@
             a.include ? `include ${a.include}` : "", a.exclude ? `exclude ${a.exclude}` : "",
             a.location ? `location ~ ${a.location}` : `location: auto${placeLabel(a.center_place)}`,
             `≤ ${a.max_places ?? 300} places`, `re-check after ${a.recheck_days ?? 30} d${a.rediscover ? " (all now)" : ""}`,
+            a.relookup ? "websites re-resolved" : "",
             `postings from the last ${a.days ?? 7} days`].filter(Boolean).join(" · ");
   }
   function describeSummary(sm) {
@@ -58,6 +59,7 @@
         <label>Max places <input type="number" id="geoMax" min="1" max="5000" value="300"></label>
         <label>Re-check after <input type="number" id="geoRecheck" min="0" max="365" value="30"> days</label>
         <label class="chk"><input type="checkbox" id="geoRediscover"> re-check every place now</label>
+        <label class="chk" title="Resolve every place's website again under the current rules; a changed answer resets its careers page and board"><input type="checkbox" id="geoRelookup"> re-resolve websites</label>
       </div>
       <div><span class="muted">Categories</span> <a href="#" id="geoCatsDefault" class="muted">defaults</a> · <a href="#" id="geoCatsNone" class="muted">none</a><div class="chips" id="geoCats"></div></div>
       <label>Keywords in place names<input type="text" id="geoKeywords" placeholder="optional: bank, credit union (any of)" autocomplete="off"></label>
@@ -119,14 +121,14 @@
                tags: $("#geoTags").value.split("\n").map((x) => x.trim()).filter(Boolean), finders: checked("geofinder"),
                include: $("#geoInclude").value.trim(), exclude: $("#geoExclude").value.trim(), location: $("#geoLocation").value.trim(),
                max_places: Number($("#geoMax").value || 300), recheck_days: Number($("#geoRecheck").value || 0),
-               rediscover: $("#geoRediscover").checked };
+               rediscover: $("#geoRediscover").checked, relookup: $("#geoRelookup").checked };
     },
     // Edit and run on the Scans page: the stored request's args. center_text is what was typed
     // (an address is geocoded again on this interactive path; a Repeat uses the stored coordinates).
     prefill(panel, a) {
       $("#geoCenter").value = a.center_text || a.center || ""; $("#geoRadius").value = a.radius_km ?? 10;
       $("#geoMax").value = a.max_places ?? 300; $("#geoRecheck").value = a.recheck_days ?? 30;
-      $("#geoRediscover").checked = !!a.rediscover; $("#geoKeywords").value = a.keywords || "";
+      $("#geoRediscover").checked = !!a.rediscover; $("#geoRelookup").checked = !!a.relookup; $("#geoKeywords").value = a.keywords || "";
       $("#geoTags").value = Array.isArray(a.tags) ? a.tags.join("\n") : (a.tags || "");
       $("#geoInclude").value = a.include || ""; $("#geoExclude").value = a.exclude || ""; $("#geoLocation").value = a.location || "";
       const cats = a.categories || meta.categories.filter((c) => c.default).map((c) => c.key);

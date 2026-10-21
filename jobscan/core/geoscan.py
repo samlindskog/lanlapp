@@ -9,7 +9,7 @@ import time
 import browser
 import finders as F
 from core import websearch
-from core.boards import get_board
+from core.boards import get_board, update_board
 from core.careers import discover_careers, looks_like_facility, pick_website
 from core.db import now
 from core.geo import DEFAULT_CATEGORIES, dedup, location_regex
@@ -27,6 +27,20 @@ def _pause(seconds, check):
         _sleep(1)
 
 
+def _forget_site(conn, row, site, log):
+    """A place's website changed (or went): the new site (None allowed) replaces it, the careers
+    page, portal, text and kind are cleared so the careers step discovers again, and the board it
+    pointed at is let go; a board no other place points at any more is disabled."""
+    old = row.get("board_id")
+    set_fields(conn, row, website=site, careers_url=None, portal_url=None, careers_text=None, careers_kind=None, board_id=None)
+    if not old:
+        return
+    others = conn.execute("SELECT COUNT(*) AS n FROM places WHERE board_id=%s AND id<>%s", (old, row["id"])).fetchone()["n"]
+    if not others:
+        b = update_board(conn, old, enabled=False)
+        log(f"board [{old}] {b['name']} disabled: no place points at it now")
+
+
 # ---------------------------------------------------------------- the pipeline
 def geo_scan(conn, params, session, log=print, progress=None, check=None, run_id=None):
     """One geographic scan: discover (finders) -> places table -> websites (web search) ->
@@ -34,7 +48,9 @@ def geo_scan(conn, params, session, log=print, progress=None, check=None, run_id
     on the boards this run registered or re-checked. params: lat, lon, radius_km, categories,
     keywords, tags, finders (None = all configured), include, exclude, location (a card-location
     regex; None = built from the places' and the centre's city/state, center_place), max_places,
-    recheck_days, rediscover, days. progress fields: phase (discovering | resolving | careers | scanning |
+    recheck_days, rediscover, relookup (resolve every place's website again under the current
+    rules; a changed answer resets its careers page and board: counters relookups,
+    websites_changed), days. progress fields: phase (discovering | resolving | careers | scanning |
     done), place_index/place_name, the counters discovered, new_places, resolved, no_site, facilities (buildings
     and stations: no lookup, the agency hires),
     search_unavailable (lookups the throttled search could not answer; those places stay
@@ -47,6 +63,7 @@ def geo_scan(conn, params, session, log=print, progress=None, check=None, run_id
     names = F.names() if params.get("finders") is None else list(params["finders"])
     max_places = int(params.get("max_places") or 300)
     recheck_days, rediscover = int(params.get("recheck_days") or 30), bool(params.get("rediscover"))
+    relookup = bool(params.get("relookup"))
     include, exclude, days = params.get("include") or None, params.get("exclude") or None, int(params.get("days") or 7)
     firecrawl = bool(browser.Config().firecrawl)
     p.update(phase="discovering", place_index=0, place_name=None, discovered=0, new_places=0, resolved=0,
@@ -80,6 +97,7 @@ def geo_scan(conn, params, session, log=print, progress=None, check=None, run_id
     rows = []
     for pl in places:
         row, new = upsert_place(conn, pl, run_id)
+        row["finder_website"] = pl.get("website")        # what the finder itself said (an OSM tag), for relookup
         rows.append(row)
         if new:
             p.add(new_places=1)
@@ -91,16 +109,26 @@ def geo_scan(conn, params, session, log=print, progress=None, check=None, run_id
     # 2. websites. A throttled search engine is not "no such site": the place stays unresolved
     # for the next run. Three throttled answers in a row pause the run once (60 s); three more
     # after that skip the remaining lookups, so 300 places never hammer the engines.
-    p.update(phase="resolving", search_unavailable=0)
+    # With relookup, every active place is resolved again under the current rules and compared
+    # with what it had: a changed answer resets its careers page and board (a board no place
+    # points at any more is disabled), an unchanged one is left alone.
+    p.update(phase="resolving", search_unavailable=0, relookups=0, websites_changed=0)
     streak, paused, skipping = 0, False, False
     for i, row in enumerate(rows):
         p.update(place_index=i + 1, place_name=row["name"])
-        if row["status"] != "active" or row.get("website") or (row.get("careers_kind") in ("no_site", "facility") and not stale(row)):
+        if row["status"] != "active":
             continue
-        if looks_like_facility(row["name"]):          # a building or station: its employer is the agency
+        if not relookup and (row.get("website") or (row.get("careers_kind") in ("no_site", "facility") and not stale(row))):
+            continue
+        if looks_like_facility(row["name"]):          # a building or station: its employer is the agency; no site of its own
+            if row.get("website") or row.get("board_id"):
+                _forget_site(conn, row, None, log)
             set_fields(conn, row, careers_kind="facility", last_checked=now())
             p.add(facilities=1)
             continue
+        had = row.get("website")
+        if had:
+            p.add(relookups=1)
         site, throttled = None, skipping
         check()                                         # also while skipped places are only marked
         if websearch.configured() and not skipping:
@@ -121,6 +149,18 @@ def geo_scan(conn, params, session, log=print, progress=None, check=None, run_id
                         "website lookups of this run (those places stay unresolved and are retried next run)")
             except Exception as e:  # noqa: BLE001
                 log(f"  ! web search failed for {row['name']}: {e}")
+        if had:                                         # a relookup: compare, never downgrade on a throttled answer
+            if throttled:
+                p.add(search_unavailable=1)
+            elif site is None and had == row.get("finder_website"):
+                pass                                    # the finder (an OSM tag) still says so: a search that found nothing does not outrank it
+            elif site != had:
+                log(f"{row['name']}: website {had} -> {site or 'none'}")
+                _forget_site(conn, row, site, log)
+                p.add(websites_changed=1)
+                if not site:
+                    set_fields(conn, row, careers_kind="no_site", last_checked=now())
+            continue
         if site:
             set_fields(conn, row, website=site, careers_kind=None)
             p.add(resolved=1)
@@ -195,5 +235,6 @@ def geo_scan(conn, params, session, log=print, progress=None, check=None, run_id
         log("no boards to scan")
         sm = {"cards": 0, "new": 0, "known": 0, "carried": 0, "embedded": 0, "boards": [], "failed": [], "need_judgment": []}
     p.update(phase="done", place_name=None, board=None, job_title=None)
-    return {k: p.state.get(k, 0) for k in ("discovered", "new_places", "resolved", "no_site", "facilities", "search_unavailable", "with_careers", "boards_new")} \
+    return {k: p.state.get(k, 0) for k in ("discovered", "new_places", "resolved", "no_site", "facilities", "search_unavailable",
+                                            "relookups", "websites_changed", "with_careers", "boards_new")} \
         | {"boards_scanned": len(sel), "location": location} | sm

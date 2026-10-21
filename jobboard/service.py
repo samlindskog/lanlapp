@@ -405,7 +405,8 @@ def geo_scan(args):
                 "exclude": J.check_regex(args.get("exclude"), "exclude"),
                 "location": J.check_regex(args.get("location"), "location"),
                 "max_places": max_places, "recheck_days": max(0, _int(args.get("recheck_days"), 30)),
-                "rediscover": _bool(args.get("rediscover")), "days": _int(args.get("days"), 7)}
+                "rediscover": _bool(args.get("rediscover")), "relookup": _bool(args.get("relookup")),
+                "days": _int(args.get("days"), 7)}
     # The centre's city and state feed the automatic location filter. Looked up once, after every
     # argument is known good; the stored request carries the answer, so a repeat never asks again.
     place = args.get("center_place") if isinstance(args.get("center_place"), dict) else None
@@ -579,6 +580,7 @@ OPERATIONS = {
                     max_places={"type": "integer", "default": 300},
                     recheck_days={"type": "integer", "default": 30, "description": "re-check a place's careers page after this many days"},
                     rediscover={"type": "boolean", "default": False, "description": "re-check every place now"},
+                    relookup={"type": "boolean", "default": False, "description": "resolve every place's website again under the current rules; a changed answer resets its careers page and board (a board no place points at any more is disabled)"},
                     days={"type": "integer", "default": 7, "description": "postings within the last N days on the boards scanned"}) | {"required": ["center"]}),
     "geo_categories": (geo_categories, "The category registry for geographic scans (key, label, default) and the finders, with what is configured here (web search for websites, Firecrawl for careers pages).", _S()),
     "resolve_center": (resolve_center, "Resolve a geographic scan centre: 'lat, lng' or a Google Maps link are parsed, anything else geocoded -> lat, lon, label.", {"type": "object", "properties": {"center": _str}, "required": ["center"]}),
