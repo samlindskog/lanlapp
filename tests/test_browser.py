@@ -321,6 +321,10 @@ def _firecrawl_server():
                 return self._send(200, {"success": True, "id": f"job{len(seen['crawl'])}"})
             if self.path == "/v1/extract":
                 seen["extract"].append(req)
+                if "sync" in " ".join(req["urls"]):                     # the self-hosted v1 shape: finished at once
+                    return self._send(200, {"success": True, "data": {"openings": [{"title": "Teller"}]}, "extractId": "x",
+                                            "totalUrlsScraped": 3, "tokensBilled": 1200, "sources": {},
+                                            "warnings": ["/v1/extract is deprecated. Use /v2/scrape with formats including a 'json' format object"]})
                 return self._send(200, {"success": True, "id": f"ex{len(seen['extract'])}"})
             self._send(404, {"success": False, "error": "no such op"})
 
@@ -368,7 +372,8 @@ def check_firecrawl():
     srv, port, seen = _firecrawl_server()
     cfg = B.Config({"JOBSCAN_BROWSER": "0", "FIRECRAWL_URL": f"http://127.0.0.1:{port}/", "JOBSCAN_RELAY_PORT": "0",
                     "JOBSCAN_RELAY_BIND": "127.0.0.1", "JOBSCAN_PROXY": "http://u:p@gw.example.net:7000", "JOBSCAN_PROXY_TRIES": "2"})
-    with B.Session(lambda m: None, cfg) as s:
+    logged = []
+    with B.Session(logged.append, cfg) as s:
         assert s.relay is not None                                                       # Firecrawl needs the relay
         status, data = s.firecrawl("https://fine.example.com/jobs", delay=0, formats=["markdown"])
         assert status == 200 and data["markdown"] == "# Jobs" and seen["scrape"][-1]["formats"] == ["markdown"]
@@ -388,17 +393,25 @@ def check_firecrawl():
         assert len(seen["scrape"]) == 5                                                  # none of those reached Firecrawl
         urls = ["https://fine.example.com/careers", "https://fine.example.com/careers/*"]
         status, data = s.firecrawl(urls[0], op="extract", poll=0.01, urls=urls, prompt="openings", schema={"type": "object"}, limit=5)
-        assert status == 200 and data == {"openings": [{"title": "Cook"}]}, (status, data)
+        assert status == 200 and data["data"] == {"openings": [{"title": "Cook"}]} and data["status"] == "completed", (status, data)
         req = seen["extract"][-1]
         assert "url" not in req and req["urls"] == urls and req["prompt"] == "openings" and req["limit"] == 5, req
         assert seen["xpolls"] == {"ex1": 3} and not s._jobs and seen["deleted"] == ["job1"]  # polled; nothing to delete
+        # the synchronous shape (self-hosted v1): the result in the POST reply, no job, no poll;
+        # the cost fields come along, the deprecation warning is logged once per Session
+        for _ in range(2):
+            status, data = s.firecrawl("https://sync.example.com/", op="extract", poll=0.01, urls=["https://sync.example.com/careers/*"])
+            assert status == 200 and data["data"] == {"openings": [{"title": "Teller"}]}, (status, data)
+            assert (data["totalUrlsScraped"], data["tokensBilled"]) == (3, 1200) and not s._jobs
+        assert seen["xpolls"] == {"ex1": 3} and len(seen["extract"]) == 3
+        assert [m for m in logged if "deprecated" in m] == ["  ! firecrawl extract: /v1/extract is deprecated. Use /v2/scrape with formats including a 'json' format object"], logged
         assert s.firecrawl("https://failing.example.com/", op="extract", poll=0.01, urls=["https://failing.example.com/*"]) == (0, {})
-        assert seen["xpolls"]["ex2"] == 1 and not s._jobs
+        assert seen["xpolls"]["ex4"] == 1 and not s._jobs
         # one private or blocked URL in the list refuses the whole call before any request
         assert s.firecrawl(urls[0], op="extract", urls=[urls[0], "http://10.0.0.5/*"]) == (0, {})
         assert s.firecrawl(urls[0], op="extract", urls=[urls[0], "http://localhost/jobs"]) == (0, {})
         assert s.firecrawl(urls[0], op="extract", urls=["https://gone.example.com/*"]) == (403, {})
-        assert len(seen["extract"]) == 2
+        assert len(seen["extract"]) == 4
     calls = []
 
     def check():
@@ -421,7 +434,7 @@ def check_firecrawl():
             pass
         else:
             raise AssertionError("cancel did not propagate")
-        assert not s._jobs and seen["deleted"] == ["job1", "job2"] and seen["xpolls"]["ex3"] == 1   # polling just stops
+        assert not s._jobs and seen["deleted"] == ["job1", "job2"] and seen["xpolls"]["ex5"] == 1   # polling just stops
 
     def cancelled():
         raise B.Cancelled()

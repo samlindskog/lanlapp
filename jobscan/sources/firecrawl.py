@@ -108,9 +108,12 @@ def _listing_link(board, page):
 
 def _crawl(session, board, link, max_pages):
     """The pages of a bounded crawl under a listing sub-page, extracted like the board page:
-    [(page, its URL)]."""
+    [(page, its URL)]. Two levels below the listing, wherever it sits: Firecrawl's maxDepth is
+    the absolute path depth and refuses a start URL deeper than it, so the relative bound is
+    maxDiscoveryDepth and maxDepth is set from the listing's own depth."""
     log(f"  {board['name']}: no openings on the page; crawling {link}")
-    status, job = session.firecrawl(link, "crawl", limit=max_pages, maxDepth=2,
+    depth = len([s for s in split_url(link).path.split("/") if s])
+    status, job = session.firecrawl(link, "crawl", limit=max_pages, maxDiscoveryDepth=2, maxDepth=depth + 2,
                                     scrapeOptions={"formats": LIST_FORMATS, "jsonOptions": JSON_OPTIONS})
     return [(p, _page_url(p, link)) for p in (job.get("data") or [])] if status == 200 else []
 
@@ -132,13 +135,16 @@ def _extract(session, board, after, max_pages):
     """The third tier: Firecrawl explores the board page and the pages under its directory and
     reads them with its LLM, which reaches openings behind a widget, a search form or scattered
     sub-pages. Costs tokens per page, so bounded by limit and kept to the host; shaped like a
-    scraped page so the cards come out the same way: [(page, URL)]."""
+    scraped page so the cards come out the same way: ([(page, URL)], the cost as a log note)."""
     patterns = _patterns(board["url"])
     log(f"  {board['name']}: no openings from the {after}; extracting {' '.join(patterns)}")
-    status, data = session.firecrawl(board["url"], "extract", urls=[board["url"], *patterns], prompt=EXTRACT_PROMPT,
-                                     schema=SCHEMA, limit=min(max_pages, EXTRACT_PAGES), enableWebSearch=False,
-                                     includeSubdomains=False, allowExternalLinks=False, ignoreInvalidURLs=True)
-    return [({"json": data}, board["url"])] if status == 200 else []
+    status, reply = session.firecrawl(board["url"], "extract", urls=[board["url"], *patterns], prompt=EXTRACT_PROMPT,
+                                      schema=SCHEMA, limit=min(max_pages, EXTRACT_PAGES), enableWebSearch=False,
+                                      includeSubdomains=False, allowExternalLinks=False, ignoreInvalidURLs=True)
+    if status != 200:
+        return [], ""
+    note = ", ".join(f"{reply[k]} {what}" for k, what in (("totalUrlsScraped", "pages"), ("tokensBilled", "tokens")) if k in reply)
+    return [({"json": reply.get("data")}, board["url"])], (", " + note if note else "")
 
 
 def _extract_due(board, since_days):
@@ -164,17 +170,17 @@ def list_jobs(session, board, since_days=None, max_pages=100):
     if status != 200:
         log(f"  ! firecrawl: no page for {board['name']} (HTTP {status})")
         return []
-    tier, pages = "scrape", [(page, board["url"])]
+    tier, pages, note = "scrape", [(page, board["url"])], ""
     if not _openings(page):
         link = _listing_link(board, page)
         if link:                      # the page is a front door; the list is one level in
             tier, pages = "crawl", _crawl(session, board, link, max_pages)
         if not any(_openings(p) for p, _ in pages) and _extract_due(board, since_days):
-            tier, pages = "extract", _extract(session, board, tier, max_pages)
+            tier, (pages, note) = "extract", _extract(session, board, tier, max_pages)
     cards = dedupe([_card(board, o, u) for p, u in pages for o in _openings(p)])
     if tier == "extract" and pages:   # completed (a failed one is retried next scan)
         _remember(board, len(cards))
-    log(f"  {board['name']}: {len(cards)} cards ({tier})")
+    log(f"  {board['name']}: {len(cards)} cards ({tier}{note})")
     return within(cards, since_days)
 
 

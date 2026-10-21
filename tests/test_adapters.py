@@ -306,7 +306,15 @@ def check_firecrawl(mod):
     assert [c["title"] for c in cards] == ["Clerk", "Clerk"] and cards[0]["source_id"] != cards[1]["source_id"], cards
     assert mod.list_jobs(s, board, since_days=None, max_pages=3)[0]["source_id"] == cards[0]["source_id"]   # stable across scans
     op, url, o = s.calls[-1]
-    assert (op, url, o["limit"], o["maxDepth"], o["scrapeOptions"]["formats"]) == ("crawl", "https://www.example.org/jobs/", 3, 2, ["markdown", "links", "json"]), s.calls
+    assert (op, url, o["limit"], o["maxDiscoveryDepth"], o["maxDepth"], o["scrapeOptions"]["formats"]) == ("crawl", "https://www.example.org/jobs/", 3, 2, 3, ["markdown", "links", "json"]), s.calls
+    # a listing deep in the site: the crawl is still two levels below it (Firecrawl's maxDepth is
+    # the absolute path depth and refuses a start URL deeper than it; the bound is maxDiscoveryDepth)
+    deep = "https://www.nmhealth.org/about/asd/hr/jobs/publications/"
+    s.calls.clear()
+    s.firecrawl = lambda url, op="scrape", **o: (s.calls.append((op, url, o)) or (200, {**front, "links": [deep]} if op == "scrape" else crawled))
+    mod.list_jobs(s, {**board, "url": "https://www.nmhealth.org/about/asd/hr/"}, since_days=None, max_pages=3)
+    op, url, o = s.calls[1]
+    assert (op, url, o["maxDiscoveryDepth"], o["maxDepth"]) == ("crawl", deep, 2, 7), s.calls
     # junk the extraction returns now and then (a link to the list, not an opening) is dropped,
     # on the front page (which then still crawls its listing sub-page) and on crawled pages alike
     for junk in ("View all jobs", "See All Jobs", "Search jobs", "Browse Jobs by Category", "Jobs", "Careers", "Openings", "Positions", "all open jobs"):
@@ -325,12 +333,18 @@ def check_firecrawl(mod):
     # extraction over the board page and its directory; its openings become cards like the scrape's
     # (same ids: the link, else the board page + text), junk dropped the same way
     s.calls.clear()
-    extracted = {"openings": [{"title": "View all jobs"}, {"title": "Teller", "url": "/careers/teller-7", "location": "Santa Fe, NM"},
-                              {"title": "Cook", "location": "Taos, NM", "snippet": "Lunch."}, {"title": "  "}]}
+    extracted = {"data": {"openings": [{"title": "View all jobs"}, {"title": "Teller", "url": "/careers/teller-7", "location": "Santa Fe, NM"},
+                                       {"title": "Cook", "location": "Taos, NM", "snippet": "Lunch."}, {"title": "  "}]},
+                 "totalUrlsScraped": 3, "tokensBilled": 1200}
     empty_crawl = {"status": "completed", "data": [{"json": {"openings": []}, "metadata": {"sourceURL": "https://www.example.org/jobs/"}}]}
     s.firecrawl = lambda url, op="scrape", **o: (s.calls.append((op, url, o)) or (200, {"scrape": front, "crawl": empty_crawl, "extract": extracted}[op]))
+    import browser
+    logs = []
+    token = browser._current_log.set(logs.append)
     cards = mod.list_jobs(s, board, since_days=None, max_pages=3)
+    browser._current_log.reset(token)
     assert [c["title"] for c in cards] == ["Teller", "Cook"] and [c[0] for c in s.calls] == ["scrape", "crawl", "extract"], (cards, s.calls)
+    assert logs[-1].endswith("2 cards (extract, 3 pages, 1200 tokens)"), logs                  # the tier and its cost
     teller, cook = cards
     assert teller["url"] == teller["board_url"] == "https://www.example.org/careers/teller-7" and teller["location"] == "Santa Fe, NM"
     assert cook["url"] is None and cook["board_url"] == s.BOARD and cook["snippet"] == "Lunch." and len(cook["source_id"]) == 40
@@ -359,10 +373,9 @@ def check_firecrawl(mod):
     # EXTRACT_RETRY_DAYS on a windowed scan; a stale or fruitful memory, a forgotten one (refetch)
     # and a whole-board scan run it; a failed extraction leaves no memory, so the next scan retries
     import datetime as dt
-    import browser
     today, logs = dt.date.today(), []
     token = browser._current_log.set(logs.append)
-    fruitless = {"scrape": front, "crawl": empty_crawl, "extract": {"openings": []}}
+    fruitless = {"scrape": front, "crawl": empty_crawl, "extract": {"data": {"openings": []}}}
     s.firecrawl = lambda url, op="scrape", **o: (s.calls.append((op, url, o)) or (200, fruitless[op]))
     b = {**board, "params": {}}
     s.calls.clear()
@@ -407,7 +420,7 @@ def check_adapter_memory():
             pass
     front = {"markdown": "# Hi", "links": [], "json": {"openings": []}}
     s = FirecrawlSession()
-    s.firecrawl = lambda url, op="scrape", **o: (s.calls.append((op, url, o)) or (200, front if op == "scrape" else {"openings": []}))
+    s.firecrawl = lambda url, op="scrape", **o: (s.calls.append((op, url, o)) or (200, front if op == "scrape" else {"data": {"openings": []}}))
     board = {"id": 7, "adapter": "firecrawl", "key": "firecrawl:" + s.BOARD, "name": "Example", "url": s.BOARD, "params": {}, "enabled": True}
     memory = {"firecrawl": {"extract_at": dt.date.today().isoformat(), "extract_found": 0}}
     try:

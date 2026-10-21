@@ -991,6 +991,7 @@ class Session:
         self.cfg = cfg or Config()
         self.log = log or _stderr
         self._jobs = set()                       # live Firecrawl (kind, id) jobs, dropped on close/cancel
+        self._warned = set()                     # Firecrawl ops whose deprecation warning was logged
         self.check = check or (lambda: None)     # raises Cancelled to stop the operation; run before every fetch
         self.dest_check = dest_check             # the relay's destination guard; tests swap it to allow loopback
         self.pool = ProxyPool(self.cfg.proxy, self.cfg.proxy_tries, self.cfg.countries)
@@ -1108,12 +1109,15 @@ class Session:
         op "extract" is Firecrawl's LLM-driven extraction over a set of pages: the body is
         {"urls": [...], "prompt": ..., "schema": ..., **options} (no "url"; a URL ending in /*
         lets Firecrawl explore the pages under it), and url names the site for the escalation
-        state and the log. It is a polled job like a crawl: (200, the extracted object) once
-        completed, (0, {}) when it failed, was cancelled, or is still running after wait seconds.
-        Every URL in urls passes check_url (without its trailing /*) and the blocked-host check
-        before the request. The API has no DELETE for extract jobs, so a cancel or close just
-        stops polling and the job finishes or expires on Firecrawl's side. Like a scrape's json
-        format it needs the LLM key in Firecrawl's environment (OPENAI_API_KEY)."""
+        state and the log. The reply is (200, envelope) with envelope["data"] the extracted
+        object and, when Firecrawl reports them, "totalUrlsScraped" and "tokensBilled" (cost);
+        (0, {}) when it failed, was cancelled, or is still running after wait seconds. The
+        self-hosted v1 endpoint answers synchronously (data in the POST reply); a reply with an
+        id instead is a job polled like a crawl. Every URL in urls passes check_url (without its
+        trailing /*) and the blocked-host check before the request. The API has no DELETE for
+        extract jobs, so a cancel or close just stops polling and the job finishes or expires on
+        Firecrawl's side. A deprecation warning in a reply is logged once per Session. Like a
+        scrape's json format it needs the LLM key in Firecrawl's environment (OPENAI_API_KEY)."""
         if not self.cfg.firecrawl:
             raise RuntimeError("FIRECRAWL_URL is not set: the firecrawl adapter needs a self-hosted Firecrawl "
                                "(e.g. http://firecrawl-api:3002) that routes through this service's relay")
@@ -1131,7 +1135,8 @@ class Session:
             if code >= 400 or not reply.get("success", True):
                 self.log(f"  ! firecrawl {op} refused {url}: HTTP {code} {str(reply.get('error') or '')[:160]}")
                 return "done", (0, {})
-            if op != "scrape":                 # map: the links; crawl, extract: the new job's id
+            self._warn_once(op, reply)
+            if op != "scrape":                 # map: the links; crawl, extract: the new job's id (or its result)
                 return "done", (200, reply)
             data = reply.get("data") or {}
             status, content = self._target_status(data)
@@ -1145,8 +1150,18 @@ class Session:
         if op == "crawl" and status == 200:    # the job exists: from here on nothing re-creates it
             return self._crawl_wait(data.get("id"), wait, poll)
         if op == "extract" and status == 200:
+            if "data" in data and not data.get("id"):   # answered synchronously: the result itself
+                return self._extract_result(data)
             return self._extract_wait(data.get("id"), wait, poll)
         return status, data
+
+    def _warn_once(self, op, reply):
+        """Firecrawl's warnings ride along in every reply; a deprecation notice is worth one log
+        line per Session, not one per call."""
+        for w in reply.get("warnings") or []:
+            if "deprecat" in str(w).lower() and op not in self._warned:
+                self._warned.add(op)
+                self.log(f"  ! firecrawl {op}: {str(w)[:200]}")
 
     def _refused(self, urls):
         """The guards _attempts applies to its one URL, over an extract's list: (0, {}) for a URL
@@ -1253,16 +1268,20 @@ class Session:
         return 200, dict(job, data=pages, next=None)
 
     def _extract_wait(self, eid, wait, poll):
-        """An extract job polled to completion: (200, the extracted object). A job reports [] as
-        data while it runs, so a list is read defensively; there is nothing to delete."""
+        """An extract job polled to completion, then read like a synchronous reply; there is
+        nothing to delete."""
         code, job = self._poll("extract", eid, wait, poll)
         self._forget("extract", eid)
-        if code != 200:
-            return code, job
-        data = job.get("data")
+        return self._extract_result(job) if code == 200 else (code, job)
+
+    @staticmethod
+    def _extract_result(reply):
+        """(200, envelope): Firecrawl's reply with "data" the extracted object itself. A job
+        reports [] as data while it runs, so a list is read defensively."""
+        data = reply.get("data")
         if isinstance(data, list):
             data = data[0] if data and isinstance(data[0], dict) else {}
-        return 200, data if isinstance(data, dict) else {}
+        return 200, dict(reply, data=data if isinstance(data, dict) else {})
 
     def _crawl_pages(self, job):
         """Every page of a finished crawl: Firecrawl pages large results ("next"). A page that
