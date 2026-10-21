@@ -180,7 +180,8 @@ best-effort and the days window is advisory there. When neither that page nor a 
 listing sub-page yields an opening (a careers page whose jobs sit behind an applicant-tracking widget,
 a search form or scattered sub-pages), the board goes to Firecrawl's LLM-driven extraction over the
 page and its directory (`/v1/extract`), which needs the LLM key (`OPENAI_API_KEY`) in Firecrawl's
-environment. Each board can carry `include` / `exclude` regexes on
+environment; an extraction that found nothing is not repeated for a week (remembered in the board's
+params; a whole-board scan or `refetch` overrides). Each board can carry `include` / `exclude` regexes on
 posting titles so a 4,000-job Workday tenant only yields the analyst roles. A scan walks any set of
 boards in one run; the web page's Scan dialog lists them with checkboxes and an add-by-URL box.
 

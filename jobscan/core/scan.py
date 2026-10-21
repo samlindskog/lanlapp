@@ -1,7 +1,9 @@
 """Scans and refreshes: walk boards through one Session, store documents, carry verdicts, embed."""
+import copy
+
 import browser
 from core.adapters import load_source
-from core.boards import _card_filter, _location_filter, _session, _title_filter, add_board, get_board, list_boards
+from core.boards import _card_filter, _location_filter, _session, _title_filter, add_board, get_board, list_boards, update_board
 from core.db import _store_documents, _update_fields, now
 from core.embed import embed_if_possible
 from core.text import html_to_text
@@ -36,14 +38,23 @@ def scan_board(conn, board, session, days=7, all_=False, limit=None, refetch=Fal
     include/exclude title regexes and its location regex (unknown locations pass). progress: a
     Progress (board-level fields are set by the caller);
     session.check() is run between postings so a cancel lands between fetches. run_id: the
-    persisted run this scan belongs to, recorded on every job it stores first (jobs.run_id)."""
+    persisted run this scan belongs to, recorded on every job it stores first (jobs.run_id).
+    Adapter memory: an adapter may record state in board["params"] under its own name (the
+    firecrawl adapter: when its costly extract tier last ran and what it found); a change made
+    by list_jobs is persisted, and refetch, a forced full re-read, forgets it first."""
     p = progress or Progress()
     src = load_source(board["adapter"])
     conn.execute("""INSERT INTO sources VALUES (%s,%s,%s)
         ON CONFLICT (name) DO UPDATE SET display_name=EXCLUDED.display_name, board_url=EXCLUDED.board_url""",
                  (board["adapter"], src.DISPLAY_NAME, board["url"]))
     conn.commit()
+    params = board["params"] = dict(board.get("params") or {})
+    before = copy.deepcopy(params)
+    if refetch:
+        params[board["adapter"]] = None    # None drops the key when persisted (update_board)
     cards = src.list_jobs(session, board, since_days=None if all_ else days, max_pages=max_pages)
+    if params != before:
+        update_board(conn, board["id"], params=params)
     title_ok, loc_ok = _title_filter(board), _location_filter(board)
     by_title = sum(1 for c in cards if not title_ok(c.get("title")))
     by_location = sum(1 for c in cards if title_ok(c.get("title")) and not loc_ok(c.get("location")))

@@ -9,7 +9,9 @@ service.add_boards), or when the caller forces adapter "firecrawl".
              itself lists none, bounded by max_pages and two levels deep
     extract  when both found none: Firecrawl's LLM-driven extraction over the board page and the
              pages under its directory (…/careers/*), for openings behind an applicant-tracking
-             widget, a search form or scattered sub-pages; bounded by EXTRACT_PAGES
+             widget, a search form or scattered sub-pages; bounded by EXTRACT_PAGES, and after one
+             that found nothing rested for EXTRACT_RETRY_DAYS (remembered in the board's params
+             under "firecrawl", persisted by scan_board; a whole-board scan or a refetch overrides)
     scrape   one posting, markdown + html: the stored document
 
 The tiers run cheap-first and the log names the one that produced the cards. since_days is
@@ -17,6 +19,7 @@ advisory only: a generic page rarely dates its postings, so an opening without a
 kept (within() keeps unknown ages) and every scan re-lists the whole page. Registration (verify)
 asks for markdown alone so it spends no LLM tokens.
 """
+import datetime as dt
 import hashlib
 import re
 import urllib.parse
@@ -42,6 +45,8 @@ EXTRACT_PROMPT = ("Extract only the concrete job openings this employer lists on
                   "applicant-tracking or search pages they lead to, " + OPENING_FIELDS + " Give every opening's own URL "
                   "and location whenever shown. If no concrete openings are listed, return an empty list.")
 EXTRACT_PAGES = 20                    # the extraction's page budget: every page it reads costs LLM tokens
+EXTRACT_RETRY_DAYS = 7                # a fruitless extraction is not repeated on every scan: once a week per board
+ROOT_PATHS = ("/careers", "/jobs", "/employment", "/join-us")   # where a site-root board's openings would hang
 LIST_FORMATS = ["markdown", "links", "json"]
 # What the extraction still returns now and then: a link to the list, not an opening on it.
 JUNK_TITLE_RE = re.compile(r"^(view|see|search|browse|explore|all)\b.*\bjobs?\b|^(jobs?|careers?|openings?|positions?)$", re.I)
@@ -81,6 +86,8 @@ def _card(board, o, page_url):
     title, loc, snippet = o["title"].strip(), (o.get("location") or "").strip(), (o.get("snippet") or "").strip()
     # no link: the page it was found on and its text are all that identify it, so two like-named
     # openings on different pages stay apart while the same page content keeps its id across scans
+    # (two link-less openings with the same title, location and snippet on one page, as the extract
+    # tier may report for a site, are indistinguishable input and collapse into one card by design)
     ident = url or "|".join((page_url, title, loc, snippet))
     return {"source_id": hashlib.sha1(ident.encode()).hexdigest(), "title": title, "location": loc,
             "age_days": days_since(o.get("posted")), "open_date": iso_date(o.get("posted")),
@@ -108,14 +115,17 @@ def _crawl(session, board, link, max_pages):
     return [(p, _page_url(p, link)) for p in (job.get("data") or [])] if status == 200 else []
 
 
-def _wildcard(url):
-    """The board URL's directory as a Firecrawl URL pattern (…/careers/*): the pages an
-    employer's careers section hangs under, not the whole site."""
+def _patterns(url):
+    """The Firecrawl URL patterns the extraction may explore for a board: the board URL's
+    directory (…/careers/*), the pages an employer's careers section hangs under. A board at the
+    site root would make that the whole site and spend the page budget on About and Products, so
+    it gets the usual careers paths instead (a pattern matching nothing costs nothing)."""
     u = split_url(url)
     path = u.path.rstrip("/")
     if "." in path.rsplit("/", 1)[-1]:   # a file (jobs.html): its folder
         path = path.rsplit("/", 1)[0]
-    return f"{u.scheme}://{u.netloc}{path}/*"
+    base = f"{u.scheme}://{u.netloc}"
+    return [f"{base}{p}/*" for p in ([path] if path else ROOT_PATHS)]
 
 
 def _extract(session, board, after, max_pages):
@@ -123,12 +133,30 @@ def _extract(session, board, after, max_pages):
     reads them with its LLM, which reaches openings behind a widget, a search form or scattered
     sub-pages. Costs tokens per page, so bounded by limit and kept to the host; shaped like a
     scraped page so the cards come out the same way: [(page, URL)]."""
-    pattern = _wildcard(board["url"])
-    log(f"  {board['name']}: no openings from the {after}; extracting {pattern}")
-    status, data = session.firecrawl(board["url"], "extract", urls=[board["url"], pattern], prompt=EXTRACT_PROMPT,
+    patterns = _patterns(board["url"])
+    log(f"  {board['name']}: no openings from the {after}; extracting {' '.join(patterns)}")
+    status, data = session.firecrawl(board["url"], "extract", urls=[board["url"], *patterns], prompt=EXTRACT_PROMPT,
                                      schema=SCHEMA, limit=min(max_pages, EXTRACT_PAGES), enableWebSearch=False,
                                      includeSubdomains=False, allowExternalLinks=False, ignoreInvalidURLs=True)
     return [({"json": data}, board["url"])] if status == 200 else []
+
+
+def _extract_due(board, since_days):
+    """Whether the extract tier runs: always on a whole-board scan (since_days None: all_, and a
+    refetch has forgotten the memory, see scan_board), otherwise not within EXTRACT_RETRY_DAYS
+    of an extraction that found nothing; its tokens would most likely buy nothing again."""
+    memory = (board.get("params") or {}).get("firecrawl") or {}
+    age = days_since(memory.get("extract_at"))
+    if since_days is None or memory.get("extract_found") or age is None or age >= EXTRACT_RETRY_DAYS:
+        return True
+    log(f"  {board['name']}: extract skipped: nothing found {age} day(s) ago")
+    return False
+
+
+def _remember(board, found):
+    """The adapter's memory in the board's params (persisted by scan_board): when the extract
+    tier last completed and how many openings it found."""
+    board.setdefault("params", {})["firecrawl"] = {"extract_at": dt.date.today().isoformat(), "extract_found": found}
 
 
 def list_jobs(session, board, since_days=None, max_pages=100):
@@ -141,9 +169,11 @@ def list_jobs(session, board, since_days=None, max_pages=100):
         link = _listing_link(board, page)
         if link:                      # the page is a front door; the list is one level in
             tier, pages = "crawl", _crawl(session, board, link, max_pages)
-        if not any(_openings(p) for p, _ in pages):
+        if not any(_openings(p) for p, _ in pages) and _extract_due(board, since_days):
             tier, pages = "extract", _extract(session, board, tier, max_pages)
     cards = dedupe([_card(board, o, u) for p, u in pages for o in _openings(p)])
+    if tier == "extract" and pages:   # completed (a failed one is retried next scan)
+        _remember(board, len(cards))
     log(f"  {board['name']}: {len(cards)} cards ({tier})")
     return within(cards, since_days)
 
