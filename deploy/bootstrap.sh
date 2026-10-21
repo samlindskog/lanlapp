@@ -621,7 +621,8 @@ if [ "$CRAWL" = 1 ]; then
   # SearXNG settings: settings.yml cannot read env, so the template is rendered here with the app's proxy
   # list (JOBSCAN_PROXY, same parser as the app) and the result mounted instead (compose var SEARXNG_SETTINGS,
   # persisted in .env so a hand-run `docker compose -p crawl` uses it too). It holds the proxy password:
-  # owned by the container's uid (977, the image's searxng user), 0600.
+  # root:977 0640: the entrypoint runs as root with every capability dropped (no DAC override, so it
+  # can only read files it owns), the worker as the image's searxng user, uid/gid 977.
   SEARXNG_SETTINGS=/etc/jobboard/searxng-settings.yml
   install -d -m 755 /etc/jobboard
   RENDERED=$(mktemp)
@@ -632,7 +633,7 @@ if [ "$CRAWL" = 1 ]; then
   else
     # A bind-mounted file follows the inode: the running container keeps the old content until recreated,
     # and `up -d` does not notice content changes, so force it.
-    install -m 600 -o 977 -g 977 "$RENDERED" "$SEARXNG_SETTINGS"
+    install -m 640 -o root -g 977 "$RENDERED" "$SEARXNG_SETTINGS"
     SEARXNG_RECREATE=(--force-recreate); echo "searxng settings rendered -> $SEARXNG_SETTINGS (searxng will be recreated)"
   fi
   rm -f "$RENDERED"
