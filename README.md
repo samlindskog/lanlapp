@@ -77,7 +77,7 @@ curl -s 'localhost:8080/api/search?q=budget+analyst'
 curl -s -X POST localhost:8080/api/boards -H 'Content-Type: application/json' \
      -d '{"urls":["https://bernco.wd1.myworkdayjobs.com/berncocareers", {"url":"https://www.governmentjobs.com/careers/cabq","include":"analyst|fiscal|budget"}]}'
 curl -s localhost:8080/api/boards
-curl -s -X POST localhost:8080/api/scan -H 'Content-Type: application/json' -d '{"boards":[1,2],"days":7}'   # omit boards: every enabled board
+curl -s -X POST localhost:8080/api/scan -H 'Content-Type: application/json' -d '{"boards":[1,2],"days":7}'   # omit boards: every enabled board registered by URL
 curl -s 'localhost:8080/api/runs?kind=scan&limit=20'                      # scan history; &before=<id> pages back
 curl -s -X POST localhost:8080/api/runs/42/repeat                         # the same request again, as a new run
 curl -s -X POST localhost:8080/api/geo/scan -H 'Content-Type: application/json' \

@@ -125,6 +125,9 @@ def register_place_board(conn, row, url, session, log=lambda m: None):
         set_fields(conn, row, careers_url=row.get("careers_url") or url, careers_kind="unresolved")
         return None
     set_fields(conn, row, careers_url=row.get("careers_url") or url, careers_kind=f"adapter:{b['adapter']}", board_id=b["id"])
+    if not b.get("enabled"):                          # disabled when no place pointed at it; one does again
+        b = update_board(conn, b["id"], enabled=True)
+        log(f"board [{b['id']}] {b['name']} enabled again: a place points at it")
     others = conn.execute("SELECT COUNT(*) AS n FROM places WHERE board_id=%s AND id<>%s", (b["id"], row["id"])).fetchone()["n"]
     host = host_of(b["url"])
     if others and host and b["name"] != host:

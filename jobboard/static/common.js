@@ -191,6 +191,7 @@ window.JB = (() => {
           + cell("Places found", p.discovered ?? sm.discovered) + cell("New places", p.new_places ?? sm.new_places)
           + cell("Websites found", p.resolved ?? sm.resolved) + cell("No website", p.no_site ?? sm.no_site)
           + cell("Lookups throttled", (p.search_unavailable ?? sm.search_unavailable) || null)
+          + cell("Websites re-resolved", (p.relookups ?? sm.relookups) || null) + cell("Websites changed", (p.websites_changed ?? sm.websites_changed) || null)
           + cell("Careers pages", p.with_careers ?? sm.with_careers) + cell("New boards", p.boards_new ?? sm.boards_new);
       }
       if (r.kind === "scan" || (r.kind === "geo" && (p.boards_total != null || sm.boards))) {

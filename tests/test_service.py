@@ -185,6 +185,25 @@ def test_geo_doors():
     service.J.geocode.reverse = real_reverse0
 
 
+def test_scan_selects_manual_boards():
+    """A plain scan (neither boards nor source) asks for enabled boards of origin manual only;
+    geographic boards belong to their geographic runs."""
+    real_db, real_list, calls = service.J.db, service.J.list_boards, []
+    service.J.db = FakeConn
+    service.J.list_boards = lambda conn, **k: calls.append(k) or []
+    try:
+        try:
+            service.call("scan", {})
+            raise AssertionError("an empty selection must be a ValueError")
+        except ValueError:
+            pass
+    finally:
+        service.J.db, service.J.list_boards = real_db, real_list
+    assert calls == [{"enabled_only": True, "origin": "manual"}], calls
+    assert "relookup" in service.OPERATIONS["geo_scan"][2]["properties"]
+    assert "geographic boards" in service.OPERATIONS["scan"][1]
+
+
 def main():
     for name, (fn, desc, schema) in service.OPERATIONS.items():
         assert callable(fn), name
@@ -214,6 +233,8 @@ def main():
     test_runs_list_and_repeat()
     print("runs list: kind/status/limit/before, parsed columns; repeat_run refuses transient and unknown ids: ok")
     test_geo_doors()
+    test_scan_selects_manual_boards()
+    print("scan: with neither boards nor source, only boards registered by URL (origin manual) are selected: ok")
     print("geo: resolve_center parses, geo_categories lists the registry, geo_scan/places validate, repeat_run replays geo_scan: ok")
 
 
