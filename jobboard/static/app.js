@@ -126,7 +126,7 @@
     const site = (u) => /^https?:\/\//i.test(u) ? `<a href="${esc(u)}" target="_blank" rel="noopener">${esc(u.replace(/^https?:\/\//i, "").replace(/\/$/, "").slice(0, 50))}</a>` : `<b>${esc(u.slice(0, 50))}</b>`;
     const maps = j.place_lat != null && j.place_lon != null ? `<a href="${esc(JB.geo.mapsLink(j.place_lat, j.place_lon))}" target="_blank" rel="noopener">Google Maps</a>` : "";
     return `<div>Place: <b>${esc(j.place_name)}</b> <small>(found by a geographic scan)</small>${placeAddress(j) ? ` · ${esc(placeAddress(j))}` : ""}${maps ? ` · ${maps}` : ""}</div>
-      <div>Website: ${j.place_website ? site(j.place_website) : "<b>—</b>"} · careers page: ${j.place_careers_url ? site(j.place_careers_url) : "<b>—</b>"}${j.place_phone ? ` · phone <b>${esc(j.place_phone)}</b>` : ""}</div>`;
+      <div>Website: ${j.place_website ? site(j.place_website) : "<b>—</b>"} · careers page: ${j.place_careers_url ? site(j.place_careers_url) : "<b>—</b>"}${j.place_portal_url ? ` · portal: ${site(j.place_portal_url)}` : ""}${j.place_phone ? ` · phone <b>${esc(j.place_phone)}</b>` : ""}</div>`;
   }
   function detailRow(j) {
     return `<tr class="detail"><td colspan="10">
