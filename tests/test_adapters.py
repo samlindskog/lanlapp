@@ -355,6 +355,78 @@ def check_firecrawl(mod):
     s.firecrawl = lambda url, op="scrape", **o: (s.calls.append((op, url, o)) or ((200, {**front, "links": []}) if op == "scrape" else (0, {})))
     mod.list_jobs(s, {**board, "url": "https://www.example.org/"}, since_days=None)
     assert s.calls[-1][2]["urls"] == ["https://www.example.org/", *mod._patterns("https://www.example.org/")] and len(s.calls[-1][2]["urls"]) <= 10
+    # memory (board params "firecrawl"): an extraction that found nothing rests the tier for
+    # EXTRACT_RETRY_DAYS on a windowed scan; a stale or fruitful memory, a forgotten one (refetch)
+    # and a whole-board scan run it; a failed extraction leaves no memory, so the next scan retries
+    import datetime as dt
+    import browser
+    today, logs = dt.date.today(), []
+    token = browser._current_log.set(logs.append)
+    fruitless = {"scrape": front, "crawl": empty_crawl, "extract": {"openings": []}}
+    s.firecrawl = lambda url, op="scrape", **o: (s.calls.append((op, url, o)) or (200, fruitless[op]))
+    b = {**board, "params": {}}
+    s.calls.clear()
+    assert mod.list_jobs(s, b, since_days=7) == [] and [c[0] for c in s.calls] == ["scrape", "crawl", "extract"], s.calls
+    assert b["params"]["firecrawl"] == {"extract_at": today.isoformat(), "extract_found": 0}, b["params"]
+    s.calls.clear()
+    assert mod.list_jobs(s, b, since_days=7) == [] and [c[0] for c in s.calls] == ["scrape", "crawl"], s.calls
+    assert any("extract skipped: nothing found 0 day(s) ago" in m for m in logs), logs
+    for memory in ({"extract_at": (today - dt.timedelta(days=mod.EXTRACT_RETRY_DAYS)).isoformat(), "extract_found": 0},
+                   {"extract_at": (today - dt.timedelta(days=1)).isoformat(), "extract_found": 2}, None):
+        s.calls.clear()
+        b["params"]["firecrawl"] = memory
+        mod.list_jobs(s, b, since_days=7)
+        assert [c[0] for c in s.calls] == ["scrape", "crawl", "extract"], (memory, s.calls)
+    b["params"]["firecrawl"] = {"extract_at": (today - dt.timedelta(days=2)).isoformat(), "extract_found": 0}
+    s.calls.clear()
+    assert mod.list_jobs(s, b, since_days=7) == [] and [c[0] for c in s.calls] == ["scrape", "crawl"], s.calls
+    s.calls.clear()
+    mod.list_jobs(s, b, since_days=None)
+    assert [c[0] for c in s.calls] == ["scrape", "crawl", "extract"], s.calls
+    b["params"] = {}
+    s.firecrawl = lambda url, op="scrape", **o: (s.calls.append((op, url, o)) or ((200, fruitless[op]) if op != "extract" else (0, {})))
+    mod.list_jobs(s, b, since_days=7)
+    assert "firecrawl" not in b["params"], b["params"]
+    browser._current_log.reset(token)
+
+
+def check_adapter_memory():
+    """scan_board persists the memory an adapter left in board['params'] (through update_board,
+    stubbed here), writes nothing when nothing changed, and forgets it on a refetch (the key set
+    to None, which update_board drops), so the firecrawl adapter's extract tier runs again."""
+    import datetime as dt
+    from core import scan
+    saved, real = [], scan.update_board
+    scan.update_board = lambda conn, board_id, params=None, **k: saved.append((board_id, params))
+
+    class Conn:                        # a board without cards stores nothing
+        def execute(self, *a):
+            return self
+
+        def commit(self):
+            pass
+    front = {"markdown": "# Hi", "links": [], "json": {"openings": []}}
+    s = FirecrawlSession()
+    s.firecrawl = lambda url, op="scrape", **o: (s.calls.append((op, url, o)) or (200, front if op == "scrape" else {"openings": []}))
+    board = {"id": 7, "adapter": "firecrawl", "key": "firecrawl:" + s.BOARD, "name": "Example", "url": s.BOARD, "params": {}, "enabled": True}
+    memory = {"firecrawl": {"extract_at": dt.date.today().isoformat(), "extract_found": 0}}
+    try:
+        r = scan.scan_board(Conn(), board, s, days=7, embed=False, log=lambda m: None)
+        assert r["cards"] == 0 and [c[0] for c in s.calls] == ["scrape", "extract"] and saved == [(7, memory)], (r, s.calls, saved)
+        s.calls.clear()
+        scan.scan_board(Conn(), board, s, days=7, embed=False, log=lambda m: None)                  # rested: no write
+        assert [c[0] for c in s.calls] == ["scrape"] and len(saved) == 1, (s.calls, saved)
+        s.calls.clear()
+        scan.scan_board(Conn(), board, s, days=7, refetch=True, embed=False, log=lambda m: None)    # forgotten: runs again
+        assert [c[0] for c in s.calls] == ["scrape", "extract"] and len(saved) == 1, (s.calls, saved)   # same memory: no write
+        s2 = FirecrawlSession()                                                                     # tier one: nothing to remember
+        b2 = {**board, "id": 8, "params": {"include": "zzz", **memory}}
+        scan.scan_board(Conn(), b2, s2, days=7, embed=False, log=lambda m: None)
+        assert [c[0] for c in s2.calls] == ["scrape"] and len(saved) == 1, (s2.calls, saved)
+        scan.scan_board(Conn(), b2, s2, days=7, refetch=True, embed=False, log=lambda m: None)      # the forgetting is persisted
+        assert saved[-1] == (8, {"include": "zzz", "firecrawl": None}) and len(saved) == 2, saved
+    finally:
+        scan.update_board = real
 
 
 def check_detection():
@@ -397,6 +469,8 @@ def main():
     print("detection: ok")
     check_fallback()
     print("fallback: ok")
+    check_adapter_memory()
+    print("adapter memory via scan_board: ok")
     for name, url, fixtures, want in FAMILY:
         check_family(name, url, fixtures, want)
         print(f"{name}: fixture walk ok")

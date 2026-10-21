@@ -31,6 +31,9 @@ Adapter contract (jobscan.py and jobboard/server.py rely on it; tests/test_adapt
               "params": {...whatever the adapter needs...}}
              At scan time the row from the boards table is passed: id, adapter, key, name, url,
              params (dict; may also carry include/exclude title regexes, applied by jobscan).
+             An adapter may record state in board["params"] under its own name as the key (the
+             firecrawl adapter: when its costly extract tier last ran); core.scan.scan_board
+             persists a change list_jobs made and forgets the key on a refetch.
     card     {"source_id": id unique within the board, "title", "location", "age_days" (int|None),
               "board_url": the posting's page, "card_html": "", ...adapter extras...}
     document {"kind", "url", "raw_html" (str|None), "text"}

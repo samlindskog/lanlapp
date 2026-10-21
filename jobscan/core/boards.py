@@ -95,12 +95,15 @@ def add_board(conn, url, name=None, include=None, exclude=None, adapter=None, pa
     return _board_row(r)
 
 def update_board(conn, board_id, name=None, enabled=None, include=None, exclude=None, params=None, location=None):
+    """params are merged into the board's; a None value drops its key (a cleared filter, an
+    adapter memory forgotten by a refetch, see scan_board)."""
     b = get_board(conn, int(board_id))
     if not b:
         raise KeyError(board_id)
     p = dict(b["params"])
     p.update(params or {})
     _set_filters(p, include, exclude, location)
+    p = {k: v for k, v in p.items() if v is not None}
     conn.execute("UPDATE boards SET name=%s, enabled=%s, params=%s WHERE id=%s",
                  (name or b["name"], int(b["enabled"] if enabled is None else bool(enabled)), json.dumps(p), b["id"]))
     conn.commit()
