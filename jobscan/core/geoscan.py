@@ -140,7 +140,14 @@ def geo_scan(conn, params, session, log=print, progress=None, check=None, run_id
         # URL), or stale: look again. A recent 'none' waits for recheck_days.
         if (not url and row.get("careers_kind") != "none") or stale(row):
             check()
-            url, text, how, hop = discover_careers(session, row["website"], log, firecrawl)
+            try:
+                url, text, how, hop = discover_careers(session, row["website"], log, firecrawl)
+            except browser.Cancelled:
+                raise
+            except Exception as e:  # noqa: BLE001  one place must never end the run
+                log(f"  ! {row['name']}: discovery failed: {e.__class__.__name__}: {str(e)[:120]}")
+                set_fields(conn, row, last_checked=now(), careers_kind="unresolved")
+                continue
             set_fields(conn, row, careers_url=url, portal_url=hop[0] if hop else None, careers_text=text,
                        last_checked=now(), careers_kind=row.get("careers_kind") if url else how)
             if not url:

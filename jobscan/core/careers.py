@@ -6,6 +6,7 @@ import html as html_lib
 import math
 import re
 import urllib.parse
+import browser
 from core.geo import host_of, norm_name, origin_of, rx_escape, state_forms, web_url
 from core.text import html_to_text
 
@@ -326,13 +327,19 @@ def portal_hop(session, careers_url, html, text, log):
         return None
     import sources as S
     for u in portal_candidates(html, careers_url):
-        hit = S.detect(u, session)
-        if hit:
-            name, board = hit
-            target = board.get("url") or u
-            log(f"  careers page hands off to {target} ({name})")
-            return target, name
-        ok, ptext, phtml = _page(session, u)
+        try:
+            hit = S.detect(u, session)
+            if hit:
+                name, board = hit
+                target = board.get("url") or u
+                log(f"  careers page hands off to {target} ({name})")
+                return target, name
+            ok, ptext, phtml = _page(session, u)
+        except browser.Cancelled:
+            raise
+        except Exception as e:  # noqa: BLE001  (a dead host, an odd URL): this candidate only
+            log(f"  ! portal candidate {u} skipped: {e.__class__.__name__}: {str(e)[:120]}")
+            continue
         if ok and _evidence(ptext, phtml, u):
             log(f"  careers page hands off to {u} (portal)")
             return u, "portal"
