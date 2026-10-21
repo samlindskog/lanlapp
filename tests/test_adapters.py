@@ -344,10 +344,17 @@ def check_firecrawl(mod):
     s.firecrawl = lambda url, op="scrape", **o: (s.calls.append((op, url, o)) or ((200, {**front, "links": ["https://www.example.org/about"]}) if op == "scrape" else (0, {})))
     assert mod.list_jobs(s, board, since_days=None) == [] and [c[0] for c in s.calls] == ["scrape", "extract"], s.calls
     assert s.calls[-1][2]["limit"] == mod.EXTRACT_PAGES                        # the page budget caps max_pages
-    # the pattern Firecrawl explores: the board URL's directory, never the whole site by accident
-    assert mod._wildcard("https://www.example.org/careers/") == "https://www.example.org/careers/*"
-    assert mod._wildcard("https://www.example.org/about/jobs.html?x=1#top") == "https://www.example.org/about/*"
-    assert mod._wildcard("https://www.example.org") == "https://www.example.org/*"
+    # the patterns Firecrawl explores: the board URL's directory; a board at the site root gets the
+    # usual careers paths, never a site-wide wildcard that would spend the budget on About pages
+    assert mod._patterns("https://www.example.org/careers/") == ["https://www.example.org/careers/*"]
+    assert mod._patterns("https://www.example.org/about/jobs.html?x=1#top") == ["https://www.example.org/about/*"]
+    for root in ("https://www.example.org", "https://www.example.org/", "https://www.example.org/?lang=en"):
+        assert mod._patterns(root) == ["https://www.example.org/careers/*", "https://www.example.org/jobs/*",
+                                       "https://www.example.org/employment/*", "https://www.example.org/join-us/*"], root
+    s.calls.clear()
+    s.firecrawl = lambda url, op="scrape", **o: (s.calls.append((op, url, o)) or ((200, {**front, "links": []}) if op == "scrape" else (0, {})))
+    mod.list_jobs(s, {**board, "url": "https://www.example.org/"}, since_days=None)
+    assert s.calls[-1][2]["urls"] == ["https://www.example.org/", *mod._patterns("https://www.example.org/")] and len(s.calls[-1][2]["urls"]) <= 10
 
 
 def check_detection():

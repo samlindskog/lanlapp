@@ -1118,6 +1118,7 @@ class Session:
             raise RuntimeError("FIRECRAWL_URL is not set: the firecrawl adapter needs a self-hosted Firecrawl "
                                "(e.g. http://firecrawl-api:3002) that routes through this service's relay")
         if op == "extract":
+            self.check()                   # a cancelled run gets Cancelled, not a refusal, for a bad URL too
             refused = self._refused(options.get("urls") or [url])
             if refused is not None:
                 return refused

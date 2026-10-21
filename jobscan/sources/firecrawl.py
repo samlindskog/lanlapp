@@ -42,6 +42,7 @@ EXTRACT_PROMPT = ("Extract only the concrete job openings this employer lists on
                   "applicant-tracking or search pages they lead to, " + OPENING_FIELDS + " Give every opening's own URL "
                   "and location whenever shown. If no concrete openings are listed, return an empty list.")
 EXTRACT_PAGES = 20                    # the extraction's page budget: every page it reads costs LLM tokens
+ROOT_PATHS = ("/careers", "/jobs", "/employment", "/join-us")   # where a site-root board's openings would hang
 LIST_FORMATS = ["markdown", "links", "json"]
 # What the extraction still returns now and then: a link to the list, not an opening on it.
 JUNK_TITLE_RE = re.compile(r"^(view|see|search|browse|explore|all)\b.*\bjobs?\b|^(jobs?|careers?|openings?|positions?)$", re.I)
@@ -108,14 +109,17 @@ def _crawl(session, board, link, max_pages):
     return [(p, _page_url(p, link)) for p in (job.get("data") or [])] if status == 200 else []
 
 
-def _wildcard(url):
-    """The board URL's directory as a Firecrawl URL pattern (…/careers/*): the pages an
-    employer's careers section hangs under, not the whole site."""
+def _patterns(url):
+    """The Firecrawl URL patterns the extraction may explore for a board: the board URL's
+    directory (…/careers/*), the pages an employer's careers section hangs under. A board at the
+    site root would make that the whole site and spend the page budget on About and Products, so
+    it gets the usual careers paths instead (a pattern matching nothing costs nothing)."""
     u = split_url(url)
     path = u.path.rstrip("/")
     if "." in path.rsplit("/", 1)[-1]:   # a file (jobs.html): its folder
         path = path.rsplit("/", 1)[0]
-    return f"{u.scheme}://{u.netloc}{path}/*"
+    base = f"{u.scheme}://{u.netloc}"
+    return [f"{base}{p}/*" for p in ([path] if path else ROOT_PATHS)]
 
 
 def _extract(session, board, after, max_pages):
@@ -123,9 +127,9 @@ def _extract(session, board, after, max_pages):
     reads them with its LLM, which reaches openings behind a widget, a search form or scattered
     sub-pages. Costs tokens per page, so bounded by limit and kept to the host; shaped like a
     scraped page so the cards come out the same way: [(page, URL)]."""
-    pattern = _wildcard(board["url"])
-    log(f"  {board['name']}: no openings from the {after}; extracting {pattern}")
-    status, data = session.firecrawl(board["url"], "extract", urls=[board["url"], pattern], prompt=EXTRACT_PROMPT,
+    patterns = _patterns(board["url"])
+    log(f"  {board['name']}: no openings from the {after}; extracting {' '.join(patterns)}")
+    status, data = session.firecrawl(board["url"], "extract", urls=[board["url"], *patterns], prompt=EXTRACT_PROMPT,
                                      schema=SCHEMA, limit=min(max_pages, EXTRACT_PAGES), enableWebSearch=False,
                                      includeSubdomains=False, allowExternalLinks=False, ignoreInvalidURLs=True)
     return [({"json": data}, board["url"])] if status == 200 else []

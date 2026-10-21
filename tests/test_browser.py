@@ -421,7 +421,17 @@ def check_firecrawl():
             pass
         else:
             raise AssertionError("cancel did not propagate")
-        assert not s._jobs and seen["deleted"] == ["job1", "job2"] and seen["xpolls"]["ex3"] == 2   # polling just stops
+        assert not s._jobs and seen["deleted"] == ["job1", "job2"] and seen["xpolls"]["ex3"] == 1   # polling just stops
+
+    def cancelled():
+        raise B.Cancelled()
+    with B.Session(lambda m: None, cfg, check=cancelled) as s:                         # cancel beats the URL guard
+        try:
+            s.firecrawl("https://fine.example.com/", op="extract", urls=["http://10.0.0.5/*"])
+        except B.Cancelled:
+            pass
+        else:
+            raise AssertionError("a cancelled run got a refusal instead of Cancelled")
     with B.Session(lambda m: None, B.Config({"JOBSCAN_BROWSER": "0"})) as s:
         try:
             s.firecrawl("https://fine.example.com/")
