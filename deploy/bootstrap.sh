@@ -633,9 +633,9 @@ if [ "$CRAWL" = 1 ]; then
   else
     # A bind-mounted file follows the inode: the running container keeps the old content until recreated,
     # and `up -d` does not notice content changes, so force it.
-    install -m 640 -o root -g 977 "$RENDERED" "$SEARXNG_SETTINGS"
     SEARXNG_RECREATE=(--force-recreate); echo "searxng settings rendered -> $SEARXNG_SETTINGS (searxng will be recreated)"
   fi
+  install -m 640 -o root -g 977 "$RENDERED" "$SEARXNG_SETTINGS"   # always: owner and mode are part of the contract
   rm -f "$RENDERED"
   if grep -q '^SEARXNG_SETTINGS=' "$APP/.env"; then sed -i "s|^SEARXNG_SETTINGS=.*|SEARXNG_SETTINGS=$SEARXNG_SETTINGS|" "$APP/.env"
   else echo "SEARXNG_SETTINGS=$SEARXNG_SETTINGS" >> "$APP/.env"; fi
