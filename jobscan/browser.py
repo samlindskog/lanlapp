@@ -64,7 +64,7 @@ import urllib.parse
 
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) jobscan/2.0"
 BLOCK_STATUSES = (403, 429, 503)
-MAX_FAILURES = 2             # Chrome start/crash failures per session before plain HTTP takes over
+MAX_FAILURES = 2             # consecutive Chrome start/crash failures before plain HTTP takes over for the session
 PAGE_TIMEOUT = 60
 CHALLENGE_WAIT = 30          # seconds to sit on a Cloudflare "Just a moment" page
 CHALLENGE_RE = re.compile(r"just a moment|attention required|access denied|checking your browser|"
@@ -861,8 +861,10 @@ class Chrome:
         return self._drv
 
     def _failed(self, why):
-        """A start failure or crash. After MAX_FAILURES the browser stays off for this session and
-        the plain-HTTP transport takes over, instead of restarting Chrome over and over."""
+        """A start failure or crash. After MAX_FAILURES in a row (a successful page resets the count:
+        a crash and a hang hours apart in a long run are not a broken Chrome) the browser stays off
+        for this session and the plain-HTTP transport takes over, instead of restarting Chrome over
+        and over."""
         self._failures += 1
         self.log(f"  ! browser: {why} ({self._failures}/{MAX_FAILURES})")
         self.close()
@@ -963,9 +965,9 @@ class Chrome:
             for attempt in range(2):
                 try:
                     drv = self._driver()
-                    if xhr:
-                        return self._xhr(drv, url, method, data, headers, accept)
-                    return self._page(drv, url)
+                    out = self._xhr(drv, url, method, data, headers, accept) if xhr else self._page(drv, url)
+                    self._failures = 0                 # the breaker counts consecutive failures: a page that
+                    return out                         # loads proves Chrome is fine again
                 except Exception as e:  # noqa: BLE001
                     code = tunnel_error(e)
                     if code and self.relay is not None and self.relay.alive():

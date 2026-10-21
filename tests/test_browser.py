@@ -467,6 +467,17 @@ class _StubDriver:
         pass
 
 
+class _OkDriver(_StubDriver):
+    """A driver whose page loads: get() succeeds and the document is complete at once."""
+    page_source, title = "<html><body>fine</body></html>", "Fine"
+
+    def get(self, url):
+        pass
+
+    def execute_script(self, js):
+        return "complete" if "readyState" in js else "fine"
+
+
 def check_relay_down():
     """A tunnel error while the relay is up is a route decision (0, net::ERR_...), not a browser
     failure; the same error once the relay's listening socket is gone counts as a failure, so the
@@ -516,6 +527,10 @@ def check_relay_down():
         assert s.chrome._failures == 0 and s.chrome._drv is not None  # no breaker tick, no restart
         assert s.chrome.request("https://broken.example.com/") == (0, "net::ERR_SSL_PROTOCOL_ERROR")
         assert s.chrome._failures == 0
+        s.chrome._failures = 1                                     # one earlier crash...
+        s.chrome._drv = _OkDriver()
+        assert s.chrome.request("https://fine.example.com/")[0] == 200
+        assert s.chrome._failures == 0                             # ...is forgotten once a page loads
     with B.Session(lambda m: None, B.Config(env)) as s:            # the accept loop survives a bad connection
         c = socket.create_connection(("127.0.0.1", s.relay.port))
         c.close()
