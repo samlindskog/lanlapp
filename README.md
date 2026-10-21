@@ -218,7 +218,9 @@ and copy the coordinates; `@lat,lng`, `?q=lat,lng` and `!3dlat!4dlng` links all 
 (`jobscan/finders/`, today OpenStreetMap through Overpass, one query per category of the registry in
 `core/geo.py`, plus any raw OSM tag lines and a name keyword filter), deduplicated by normalised name
 within 150 m or by website host, and kept in the `places` table across runs. A place without a website
-is looked up through the web search when `SEARXNG_URL` is set (directory hosts such as Yelp or Facebook
+is looked up through the web search when `SEARXNG_URL` is set (one query per 2 s; when the engines
+are throttled and answer nothing, the place stays `unresolved` for the next run, the run pauses 60 s
+after three such answers in a row and skips the remaining lookups after three more; directory hosts such as Yelp or Facebook
 are skipped; the result's domain must be built from the name, or its title must name the place's
 city or state together with a distinctive word of the name), else marked `no_site`. Each website is fetched through
 the run's browser Session and searched for a careers page: a careers/jobs/employment link on the
