@@ -13,7 +13,7 @@ from core.boards import get_board
 from core.careers import discover_careers, pick_website
 from core.db import now
 from core.geo import DEFAULT_CATEGORIES, dedup, location_regex
-from core.places import register_place_board, set_fields, upsert_place
+from core.places import board_url_for, register_place_board, set_fields, upsert_place
 from core.scan import Progress, scan_boards
 
 THROTTLE_STREAK, THROTTLE_PAUSE = 3, 60      # throttled lookups in a row that pause the run, and for how long
@@ -140,15 +140,15 @@ def geo_scan(conn, params, session, log=print, progress=None, check=None, run_id
         # URL), or stale: look again. A recent 'none' waits for recheck_days.
         if (not url and row.get("careers_kind") != "none") or stale(row):
             check()
-            url, text, how = discover_careers(session, row["website"], log, firecrawl)
-            set_fields(conn, row, careers_url=url, careers_text=text, last_checked=now(),
-                 careers_kind=row.get("careers_kind") if url else how)
+            url, text, how, hop = discover_careers(session, row["website"], log, firecrawl)
+            set_fields(conn, row, careers_url=url, portal_url=hop[0] if hop else None, careers_text=text,
+                       last_checked=now(), careers_kind=row.get("careers_kind") if url else how)
             if not url:
                 log(f"{row['name']}: no careers page ({how})")
                 continue
             rechecked = True
             p.add(with_careers=1)
-            log(f"{row['name']}: careers page {url} (via {how})")
+            log(f"{row['name']}: careers page {url} (via {how})" + (f" -> {hop[0]} ({hop[1]})" if hop else ""))
         if not url:                                        # a recent 'none'
             continue
         if row.get("board_id") and not rediscover:
@@ -157,7 +157,7 @@ def geo_scan(conn, params, session, log=print, progress=None, check=None, run_id
                 boards[b["id"]] = b
             continue
         check()
-        b = register_place_board(conn, row, url, session, log)
+        b = register_place_board(conn, row, board_url_for(row), session, log)
         if not b:
             continue
         if b["id"] > max_board and b["id"] not in boards:
