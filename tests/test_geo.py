@@ -190,6 +190,26 @@ def check_portal_hop():
     # a candidate whose page is thin and says nothing of openings is not a portal
     pages["https://portal1.example.net/x"] = "<html><body><p>Hello.</p></body></html>"
     assert careers.portal_hop(s, base, no_iframes, LONG, lines.append) is None
+    # has_listing counts distinct detail paths: two tracking variants of one link, or a fragment, are one
+    two_queries = "<html><body><a href='/careers/apply?utm=hero'>Apply</a><a href='/careers/apply?utm=footer'>Apply</a><a href='/jobs/1'>A</a><a href='/jobs/1#top'>A</a></body></html>"
+    assert not careers.has_listing(two_queries, base)
+    assert careers.has_listing(two_queries + "<a href='/jobs/2'>B</a>", base)
+    # size is never evidence: a long scheduling widget and a long sign-in wall are not portals
+    calendly = f"<html><body><p>{LONG}</p><iframe src='https://calendly.example.com/acme/intro'></iframe></body></html>"
+    pages["https://calendly.example.com/acme/intro"] = f"<html><body><h1>Schedule a meeting</h1><p>{LONG}{LONG}{LONG}</p></body></html>"
+    assert careers.portal_candidates(calendly, base) == ["https://calendly.example.com/acme/intro"]      # last resort, tried only on evidence
+    assert careers.portal_hop(s, base, calendly, "short", lines.append) is None
+    walled = f"<html><body><p>{LONG}</p><a href='https://ats.example.net/login'>Apply online</a></body></html>"
+    pages["https://ats.example.net/login"] = f"<html><body><h1>Sign in to continue</h1><p>Username. Password.</p><p>{LONG}{LONG}{LONG}</p></body></html>"
+    assert careers.portal_hop(s, base, walled, "short", lines.append) is None
+    # an iframe on an ATS host, whose page lists openings, is accepted (and ranks first)
+    ats = f"<html><body><p>{LONG}</p><iframe src='https://calendly.example.com/acme/intro'></iframe><iframe src='https://acme.applytojob.example.net/apply/'></iframe></body></html>"
+    pages["https://acme.applytojob.example.net/apply/"] = f"<html><body><h1>Current openings</h1><a href='/apply/job/1'>Clerk</a><p>{LONG}</p></body></html>"
+    assert careers.portal_candidates(ats, base) == ["https://acme.applytojob.example.net/apply/", "https://calendly.example.com/acme/intro"]
+    assert careers.portal_hop(s, base, ats, LONG, lines.append) == ("https://acme.applytojob.example.net/apply/", "portal")
+    # evidence may also be the target's own job-detail links, without listing words
+    pages["https://acme.applytojob.example.net/apply/"] = f"<html><body><p>{LONG}</p><a href='/apply/job/1'>Clerk</a><a href='/apply/job/2'>Cook</a></body></html>"
+    assert careers.portal_hop(s, base, ats, LONG, lines.append) == ("https://acme.applytojob.example.net/apply/", "portal")
 
 
 def check_card_filter():

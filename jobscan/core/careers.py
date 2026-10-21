@@ -215,22 +215,33 @@ MAX_HOPS = 3
 
 
 def has_listing(html, base_url):
-    """Does the careers page list postings itself: at least two distinct links to job detail pages."""
-    hits = {u for u, _ in anchors(html, base_url)
-            if JOB_DETAIL_RE.search(urllib.parse.urlsplit(u).path + "?" + urllib.parse.urlsplit(u).query)}
-    return len(hits) >= 2
+    """Does the page list postings itself: links to at least two job detail pages that differ in
+    path (the same /careers/apply with two tracking queries is one link, not two postings)."""
+    paths = set()
+    for u, _ in anchors(html, base_url):
+        s = urllib.parse.urlsplit(u)
+        if JOB_DETAIL_RE.search(s.path + "?" + s.query):
+            paths.add((s.netloc.lower(), s.path.rstrip("/")))
+    return len(paths) >= 2
+
+
+def _evidence(text, html, url):
+    """Does a page show openings: listing words in its text, or links to job detail pages. Size
+    alone never counts (a sign-in wall or a scheduling widget can be long)."""
+    return bool(LISTING_TEXT_RE.search(text or "")) or has_listing(html or "", url)
 
 
 def portal_candidates(html, careers_url):
-    """Where a careers page may hand off, best first: its iframes, then the site's own portal
-    paths, then portal hosts elsewhere (an anchor on another host, or one matching PORTAL_RE,
-    whose text or path speaks of openings). Directory hosts and the page itself are dropped; at
-    most MAX_HOPS."""
-    page_host, tiers = host_of(careers_url), ([], [], [])
+    """Where a careers page may hand off, best first: its iframes on a portal host or path, then
+    the site's own portal paths, then portal hosts elsewhere (an anchor on another host, or one
+    matching PORTAL_RE, whose text or path speaks of openings), and last its other iframes (a
+    calendar or chat widget as often as a job list; portal_hop accepts one only on evidence).
+    Directory hosts and the page itself are dropped; at most MAX_HOPS."""
+    page_host, tiers = host_of(careers_url), ([], [], [], [])
     for m in _IFRAME_RE.finditer(html or ""):
         u = web_url(urllib.parse.urljoin(careers_url, html_lib.unescape(m[1] or m[2] or m[3] or "")))
         if u and not is_aggregator(u):
-            tiers[0].append(u)
+            tiers[0 if PORTAL_RE.search((host_of(u) or "") + urllib.parse.urlsplit(u).path) else 3].append(u)
     for u, text in anchors(html, careers_url):
         if u == careers_url.split("#")[0]:
             continue
@@ -241,7 +252,7 @@ def portal_candidates(html, careers_url):
             continue
         tiers[2 if external else 1].append(u)
     out, seen = [], set()
-    for u in tiers[0] + tiers[1] + tiers[2]:
+    for u in tiers[0] + tiers[1] + tiers[2] + tiers[3]:
         if u not in seen:
             seen.add(u)
             out.append(u)
@@ -252,8 +263,8 @@ def portal_hop(session, careers_url, html, text, log):
     """(portal_url, kind) when the careers page hands its openings off to a portal, else None.
     Only when the page lists nothing itself. Each candidate in order: an adapter that recognises
     it (sources.detect) wins outright, kind = the adapter's name; otherwise the first whose page
-    has more text than the careers page or reads like a listing, kind 'portal' (a board on the
-    fallback adapter)."""
+    shows openings (_evidence: listing words or job-detail links; never size alone), kind 'portal'
+    (a board on the fallback adapter)."""
     if has_listing(html, careers_url):
         return None
     import sources as S
@@ -264,8 +275,8 @@ def portal_hop(session, careers_url, html, text, log):
             target = board.get("url") or u
             log(f"  careers page hands off to {target} ({name})")
             return target, name
-        ok, ptext, _ = _page(session, u)
-        if ok and (len(ptext) > len(text or "") or LISTING_TEXT_RE.search(ptext)):
+        ok, ptext, phtml = _page(session, u)
+        if ok and _evidence(ptext, phtml, u):
             log(f"  careers page hands off to {u} (portal)")
             return u, "portal"
     return None
