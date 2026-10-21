@@ -33,8 +33,26 @@ def _grade_str(j):
     return grade_str(j)
 
 
+MAX_INPUT_CHARS = 20000      # ~5k tokens of English; dense text (tables, codes) runs nearer 3 chars a token
+
+
 def embed_texts(texts, model=EMBED_MODEL):
-    """OpenAI embeddings via plain HTTPS (no SDK). Returns list of vectors."""
+    """OpenAI embeddings via plain HTTPS (no SDK). Returns list of vectors. An input the model
+    still finds too long (the 8192-token limit counts tokens, not characters) is halved and the
+    batch retried, a few times, rather than failing the whole batch."""
+    texts = [t[:MAX_INPUT_CHARS] for t in texts]
+    for _ in range(4):
+        try:
+            return _embed_once(texts, model)
+        except RuntimeError as e:
+            if "maximum input length" not in str(e):
+                raise
+            longest = max(range(len(texts)), key=lambda i: len(texts[i]))
+            texts[longest] = texts[longest][: len(texts[longest]) // 2]
+    return _embed_once(texts, model)
+
+
+def _embed_once(texts, model):
     key = os.environ.get("OPENAI_API_KEY")
     if not key:
         raise RuntimeError("OPENAI_API_KEY is not set")
@@ -71,7 +89,7 @@ def embedding_text(conn, job):
         body = "\n\n".join(picked) if picked else (d["text"] or "")
         parts.append(body)
     text = "\n".join(p for p in parts if p).strip()
-    return text[:24000]  # ~6k tokens, under the model's 8k limit
+    return text[:MAX_INPUT_CHARS]   # embed_texts halves a text the model still rejects
 
 def _vec(v):
     return "[" + ",".join(f"{x:.7f}" for x in v) + "]"
