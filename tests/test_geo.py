@@ -103,7 +103,9 @@ def check_websites():
                "title": "Monica Valdez - State Farm Insurance Agent | WeLoans", "snippet": "Compare loans and insurance agents."},
               {"url": "https://www.statefarm.com/agent/us/nm/albuquerque/monica-valdez-x1", "title": "Monica Valdez - State Farm Insurance Agent in Albuquerque, NM"}]
     assert careers.pick_website("State Farm - Monica Valdez", valdez[:1], "Albuquerque", "NM") is None
-    assert careers.pick_website("State Farm - Monica Valdez", valdez, "Albuquerque", "NM") == valdez[1]["url"]   # rule 2
+    assert careers.pick_website("State Farm - Monica Valdez", valdez, "Albuquerque", "NM") is None   # an agent profile deep in statefarm.com: not shallow
+    agent_home = [{"url": "https://www.monicavaldezinsurance.example.net/", "title": "Monica Valdez - State Farm Insurance Agent in Albuquerque, NM"}]
+    assert careers.pick_website("State Farm - Monica Valdez", agent_home, "Albuquerque", "NM") == agent_home[0]["url"]   # rule 2: a home page
     aragon = [{"url": "https://www.enqa.eu/membership-database/acpua-aragon-agency-for-quality-assurance-and-accreditation-acpua/",
                "title": "ACPUA - Aragon Agency for Quality Assurance and Accreditation | ENQA", "snippet": "Member since 2012."}]
     assert careers.pick_website("The Aragon Agency", aragon, "Albuquerque", "NM") is None
@@ -122,6 +124,48 @@ def check_websites():
     assert not careers.title_names("Foot & Ankle Specialist", "Foot Locker Santa Fe | Shoes")
     local = [{"url": "https://santafepodiatry.example.net/", "title": "Foot & Ankle Specialist of Santa Fe, NM"}]
     assert careers.pick_website("Foot & Ankle Specialist", local, "Santa Fe", "NM") == local[0]["url"]  # rule 2, as intended
+    # rule 2 needs the place in the title itself, and a shallow page
+    assert careers.shallow("https://a.example.com/") and careers.shallow("https://a.example.com/about/") and not careers.shallow("https://a.example.com/doctor/x")
+    deep = [{"url": "https://santafepodiatry.example.net/providers/dr-x", "title": "Foot & Ankle Specialist of Santa Fe, NM"}]
+    assert careers.pick_website("Foot & Ankle Specialist", deep, "Santa Fe", "NM") is None
+    only_snippet = [{"url": "https://santafepodiatry.example.net/", "title": "Foot & Ankle Specialist", "snippet": "Serving Santa Fe, NM"}]
+    assert careers.pick_website("Foot & Ankle Specialist", only_snippet, "Santa Fe", "NM") is None
+    assert careers.place_words("Santa Fe", "NM") == {"santa", "new", "mexico"} and careers.place_words(None, None) == set()
+    assert not careers.title_names("Santa Fe Health Services", "Santa Fe Health Services | ABQ Health Services", "Santa Fe", "NM")   # named after its town
+    # rule 1 needs a distinctive word of five letters, or two; a lone word must be a brand, not a dictionary word
+    for name, url in (("Quest", "https://www.quest.com/"), ("Oculus", "https://www.oculus.com/casting"),
+                      ("Chief Tom K. Broome II Fire Department Training Facility", "https://www.chiefs.com/"),
+                      ("Chiefs Bar", "https://www.chief.com/"), ("Zia Co", "https://www.zia.com/")):
+        assert not careers.domain_matches(name, url), (name, url)
+    assert not careers.domain_matches("Zia Dental Studio", "https://www.ziadental.com/")      # a 3-letter word plus a generic one: too little (the known cost of the rule)
+    assert careers.domain_matches("Oculus Eye Care", "https://www.oculuseyecare.com/")         # oculus is one of two distinctive words
+    # facilities are not businesses: no lookup at all
+    for fac in ("Villagra Building", "Arthur G. Sanchez Building", "United States Post Office", "Santa Fe Fire Station #3",
+                "Chief Tom K. Broome II Fire Department Training Facility", "District Court Jury Services", "Office of the State Engineer",
+                "Santa Fe County Public Works Division", "PNM Substation", "Bataan Memorial Building Annex"):
+        assert careers.looks_like_facility(fac), fac
+    for biz in ("Rio Grande Credit Union", "Santa Fe Public Library", "Building Blocks Daycare", "Station Grill", "Complexions Spa"):
+        assert not careers.looks_like_facility(biz), biz
+    assert careers.pick_website("Villagra Building", [{"url": "https://www.villagra.example.com/", "title": "Villagra Building Santa Fe, NM"}], "Santa Fe", "NM") is None
+    # run 22's false positives, all None
+    run22 = [
+        ("La Familia Northside", "https://www.agoda.com/en-in/hotels-near-la-familia-northside/attractions/santa-fe-nm-us.html", "Hotels near La Familia Northside, Santa Fe, NM"),
+        ("Infinite Health", "https://www.carecredit.com/doctor-locator/santa-fe-nm/infinite-health-center-qhr934/", "Infinite Health Center - Santa Fe, NM | CareCredit"),
+        ("Skurla, DO", "https://care.healthline.com/find-care/provider/dr-richard-skurla-1831374693", "Dr. Richard Skurla, DO - Santa Fe, NM | Healthline"),
+        ("Heart of Matter Healing Arts", "https://www.vagaro.com/heartofmatterhealingartsllc", "Heart of Matter Healing Arts LLC - Santa Fe, NM | Vagaro"),
+        ("Santa Fe Health Services", "https://www.abqhealthservices.com/santa-fe-health-services", "Santa Fe Health Services | ABQ Health Services"),
+        ("Chief Tom K. Broome II Fire Department Training Facility", "https://www.chiefs.com/", "Kansas City Chiefs | Official Site"),
+        ("Villagra Building", "https://www.parrettwindows.com/projects/villagra-building", "Villagra Building, Santa Fe NM - Parrett Windows"),
+        ("District Court Jury Services", "https://www.clarkcountycourts.us/general/jury-services/", "Jury Services - District Court"),
+        ("United States Post Office", "https://www.hippostcard.com/listing/santa-fe-nm-post-office", "Santa Fe NM Post Office postcard"),
+        ("United States Post Office", "https://www.santafeplacemall.com/directory/united-states-post-office", "United States Post Office at Santa Fe Place Mall"),
+        ("Arthur G. Sanchez Building", "https://www.storagecafe.com/santa-fe-nm/arthur-g-sanchez-building", "Arthur G. Sanchez Building - Santa Fe, NM"),
+        ("Los Alamos National Laboratory - Santa Fe", "https://www.sfreporter.com/news/2024/lanl-santa-fe-office", "LANL opens Santa Fe office - Santa Fe Reporter"),
+        ("Oculus", "https://www.oculus.com/casting", "Oculus Casting | Santa Fe, NM"),
+        ("Quest", "https://www.quest.com/", "Quest | Santa Fe, NM"),
+    ]
+    for name, url, title in run22:
+        assert careers.pick_website(name, [{"url": url, "title": title, "snippet": "Santa Fe, NM"}], "Santa Fe", "NM") is None, (name, url)
     # the three real cases from the Santa Fe rediscovery run: all None
     assert careers.pick_website("Foot & Ankle Specialist", [{"url": "https://www.footlocker.ca/", "title": "Foot Locker Canada | Santa Fe"}], "Santa Fe", "NM") is None
     assert careers.pick_website("Edward Ned Siegel, Elliot H Rapoport Clinical Psychology",
