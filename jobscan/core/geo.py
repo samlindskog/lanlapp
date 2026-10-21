@@ -128,6 +128,18 @@ def origin_of(url):
     return f"{u.scheme}://{u.netloc}"
 
 
+def same_site(a, b):
+    """Are two URLs the same page for our purposes: scheme, a leading www., the host's case, a
+    trailing slash and the fragment do not count (a tag of https://santafe.edu/x and a stored
+    https://www.santafe.edu/x/ are one site, not a change). Two empty values are the same."""
+    def key(u):
+        if not u:
+            return ""
+        s = urllib.parse.urlsplit(u.strip() if "://" in u else "https://" + u.strip())
+        return f"{host_of(u) or ''}{s.path.rstrip('/')}" + (f"?{s.query}" if s.query else "")
+    return key(a) == key(b)
+
+
 def web_url(text):
     """A URL fit to store and link to: http(s) with a hostname, fragment dropped; anything else
     (javascript:, mailto:, a bare path, garbage) is None. Websites and careers pages come from

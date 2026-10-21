@@ -12,7 +12,7 @@ from core import websearch
 from core.boards import get_board, update_board
 from core.careers import discover_careers, looks_like_facility, pick_website
 from core.db import now
-from core.geo import DEFAULT_CATEGORIES, dedup, location_regex
+from core.geo import DEFAULT_CATEGORIES, dedup, location_regex, same_site
 from core.places import board_url_for, register_place_board, set_fields, upsert_place
 from core.scan import Progress, scan_boards
 
@@ -25,6 +25,61 @@ def _pause(seconds, check):
     for _ in range(int(seconds)):
         check()
         _sleep(1)
+
+
+class _Searcher:
+    """One run's web searches for places' websites (pick_website over websearch.search), with
+    the run's throttle policy in one place: three throttled answers in a row pause the run once
+    for THROTTLE_PAUSE s, three more after that skip every later search of the run, so 300
+    places never hammer the engines. lookup(row) -> (site, throttled); a skipped search counts
+    as throttled. The website step and the careers step (a dead tag) share one instance."""
+
+    def __init__(self, log, check):
+        self.log, self.check = log, check
+        self.streak, self.paused, self.skipping = 0, False, False
+
+    def lookup(self, row):
+        if not websearch.configured() or self.skipping:
+            return None, self.skipping
+        q = websearch.query_for(row["name"], row.get("city"), row.get("state"))
+        try:
+            site = pick_website(row["name"], websearch.search(q), city=row.get("city"), state=row.get("state"))
+            self.streak = 0
+            return site, False
+        except websearch.SearchUnavailable as e:
+            self.streak += 1
+            self.log(f"{row['name']}: web search unavailable ({e})")
+            if self.streak >= THROTTLE_STREAK and not self.paused:
+                self.paused, self.streak = True, 0
+                self.log(f"web search throttled {THROTTLE_STREAK} times in a row; pausing {THROTTLE_PAUSE} s")
+                _pause(THROTTLE_PAUSE, self.check)
+            elif self.streak >= THROTTLE_STREAK:
+                self.skipping = True
+                self.log(f"web search still throttled {THROTTLE_STREAK} times after the pause; skipping the remaining "
+                         "website lookups of this run (those places stay unresolved and are retried next run)")
+            return None, True
+        except Exception as e:  # noqa: BLE001
+            self.log(f"  ! web search failed for {row['name']}: {e}")
+            return None, False
+
+
+def _discover(conn, session, row, firecrawl, log):
+    """discover_careers for the place's website, recorded on the row: (careers_url, how). A
+    failure is logged and leaves the place 'unresolved' (how 'failed'); one place must never
+    end the run."""
+    try:
+        url, text, how, hop = discover_careers(session, row["website"], log, firecrawl)
+    except browser.Cancelled:
+        raise
+    except Exception as e:  # noqa: BLE001
+        log(f"  ! {row['name']}: discovery failed: {e.__class__.__name__}: {str(e)[:120]}")
+        set_fields(conn, row, last_checked=now(), careers_kind="unresolved")
+        return None, "failed"
+    set_fields(conn, row, careers_url=url, portal_url=hop[0] if hop else None, careers_text=text,
+               last_checked=now(), careers_kind=row.get("careers_kind") if url else how)
+    if url:
+        log(f"{row['name']}: careers page {url} (via {how})" + (f" -> {hop[0]} ({hop[1]})" if hop else ""))
+    return url, how
 
 
 def _forget_site(conn, row, site, log):
@@ -117,7 +172,7 @@ def geo_scan(conn, params, session, log=print, progress=None, check=None, run_id
     # the narrowed facility rule no longer matches becomes a normal place; a changed website resets
     # the careers page and board (a board no place points at any more is disabled).
     p.update(phase="resolving", search_unavailable=0, relookups=0, websites_changed=0, facilities_cleared=0)
-    streak, paused, skipping = 0, False, False
+    searcher = _Searcher(log, check)
     for i, row in enumerate(rows):
         p.update(place_index=i + 1, place_name=row["name"])
         if row["status"] != "active":
@@ -135,38 +190,26 @@ def geo_scan(conn, params, session, log=print, progress=None, check=None, run_id
             set_fields(conn, row, careers_kind=None)
             p.add(facilities_cleared=1)
         had, tag = row.get("website"), row.get("finder_website")
-        if tag:                                         # the tag is the website; a search never replaces it
-            if had != tag:
+        if tag:                                         # the tag is the website; a search never replaces it...
+            if had and not same_site(had, tag):         # ...unless the tag is dead: then the searched site stays
+                check()
+                st, html = session.fetch(tag)
+                if not html:
+                    log(f"{row['name']}: tag {tag} still unreachable; keeping {had}")
+                    continue
+            if not same_site(had, tag):
                 log(f"{row['name']}: website {had or 'none'} -> {tag} (the finder's tag)")
                 _forget_site(conn, row, tag, log)
                 p.add(websites_changed=1)
             continue
         if had:
             p.add(relookups=1)
-        site, throttled = None, skipping
         check()                                         # also while skipped places are only marked
-        if websearch.configured() and not skipping:
-            q = websearch.query_for(row["name"], row.get("city"), row.get("state"))
-            try:
-                site = pick_website(row["name"], websearch.search(q), city=row.get("city"), state=row.get("state"))
-                streak = 0
-            except websearch.SearchUnavailable as e:
-                throttled, streak = True, streak + 1
-                log(f"{row['name']}: web search unavailable ({e})")
-                if streak >= THROTTLE_STREAK and not paused:
-                    paused, streak = True, 0
-                    log(f"web search throttled {THROTTLE_STREAK} times in a row; pausing {THROTTLE_PAUSE} s")
-                    _pause(THROTTLE_PAUSE, check)
-                elif streak >= THROTTLE_STREAK:
-                    skipping = True
-                    log(f"web search still throttled {THROTTLE_STREAK} times after the pause; skipping the remaining "
-                        "website lookups of this run (those places stay unresolved and are retried next run)")
-            except Exception as e:  # noqa: BLE001
-                log(f"  ! web search failed for {row['name']}: {e}")
+        site, throttled = searcher.lookup(row)
         if had:                                         # a relookup: compare, never downgrade on a throttled answer
             if throttled:
                 p.add(search_unavailable=1)
-            elif site != had:
+            elif not same_site(site, had):
                 log(f"{row['name']}: website {had} -> {site or 'none'}")
                 _forget_site(conn, row, site, log)
                 p.add(websites_changed=1)
@@ -197,22 +240,28 @@ def geo_scan(conn, params, session, log=print, progress=None, check=None, run_id
         # URL), or stale: look again. A recent 'none' waits for recheck_days.
         if (not url and row.get("careers_kind") != "none") or stale(row):
             check()
-            try:
-                url, text, how, hop = discover_careers(session, row["website"], log, firecrawl)
-            except browser.Cancelled:
-                raise
-            except Exception as e:  # noqa: BLE001  one place must never end the run
-                log(f"  ! {row['name']}: discovery failed: {e.__class__.__name__}: {str(e)[:120]}")
-                set_fields(conn, row, last_checked=now(), careers_kind="unresolved")
-                continue
-            set_fields(conn, row, careers_url=url, portal_url=hop[0] if hop else None, careers_text=text,
-                       last_checked=now(), careers_kind=row.get("careers_kind") if url else how)
+            url, how = _discover(conn, session, row, firecrawl, log)
+            tag = row.get("finder_website")
+            if not url and how == "unresolved" and tag and same_site(row["website"], tag) and not looks_like_facility(row["name"]):
+                # A dead tag must not strand the place: it is searched like a tag-less one, and a
+                # site the search finds replaces the tag (the next relookup keeps it while the tag
+                # stays dead) and is discovered now, so its board comes back in this run.
+                check()
+                site, throttled = searcher.lookup(row)
+                if throttled:
+                    p.add(search_unavailable=1)
+                elif site and not same_site(site, row["website"]):
+                    log(f"{row['name']}: tag {tag} unreachable; website {site} from the search")
+                    _forget_site(conn, row, site, log)
+                    p.add(websites_changed=1)
+                    check()
+                    url, how = _discover(conn, session, row, firecrawl, log)
             if not url:
-                log(f"{row['name']}: no careers page ({how})")
+                if how != "failed":
+                    log(f"{row['name']}: no careers page ({how})")
                 continue
             rechecked = True
             p.add(with_careers=1)
-            log(f"{row['name']}: careers page {url} (via {how})" + (f" -> {hop[0]} ({hop[1]})" if hop else ""))
         if not url:                                        # a recent 'none'
             continue
         if row.get("board_id") and not rediscover:

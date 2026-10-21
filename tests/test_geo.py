@@ -63,6 +63,10 @@ def check_websites():
     assert not careers.is_aggregator("https://bbb.example.org/")       # a label is not a domain
     assert geo.web_url("https://Acme.example.com/jobs?x=1#top") == "https://Acme.example.com/jobs?x=1"
     assert geo.web_url(" http://a.example.com ") == "http://a.example.com"
+    assert J.same_site("https://www.santafe.edu/research/resources/library", "https://santafe.edu/research/resources/library/")
+    assert J.same_site("http://A.example.com/", "https://a.example.com") and J.same_site("https://a.example.com/x#top", "https://a.example.com/x")
+    assert not J.same_site("https://a.example.com/x", "https://a.example.com/y") and not J.same_site("https://a.example.com/x?p=1", "https://a.example.com/x")
+    assert not J.same_site(None, "https://a.example.com/") and J.same_site(None, "") and J.same_site(None, None)
     for bad in ("javascript:alert(1)", "mailto:hr@acme.example.com", "www.acme.example.com", "/careers", "ftp://x.example.com/", "", None, "https://"):
         assert geo.web_url(bad) is None, bad
     assert careers.registrable_domain("https://www.riograndecu.org/careers") == "riograndecu"
@@ -533,6 +537,62 @@ def _geo_fakes(places, search):
     return FakeConn(), [], sleeps, restore
 
 
+def check_dead_tag():
+    """A tagged place whose tag does not answer is searched like a tag-less one: the searched
+    site replaces the tag, is discovered in the same run and its board comes back; a later
+    relookup keeps the searched site while the tag stays dead and restores the tag once it
+    answers. A www./no-www pair is the same site: nothing changes."""
+    PED, PED2 = "https://www.ped.example.gov/", "https://web.ped.example.gov/"
+    SFI = "https://santafe.example.edu/research/resources/library"
+    pages = {PED2: _page("PED") + '<a href="/careers">Careers</a>', PED2 + "careers": _page("PED careers"),
+             SFI: _page("SFI Library") + '<a href="/research/resources/library/jobs">Jobs</a>',
+             "https://santafe.example.edu/research/resources/library/jobs": _page("Library jobs")}
+    towns = [{"name": "Public Education Department", "lat": 35.0, "lon": -106.0, "website": PED, "city": "Santa Fe", "state": "NM", "category": "government", "finder_id": "n/1"},
+             {"name": "Santa Fe Institute Library", "lat": 35.1, "lon": -106.0, "website": SFI, "city": "Santa Fe", "state": "NM", "category": "education", "finder_id": "n/2"}]
+    answers = {"Public Education Department Santa Fe NM": [{"url": PED2, "title": "Public Education Department - Santa Fe, NM"}]}
+    asked = []
+    conn, lines, sleeps, restore = _geo_fakes(towns, lambda q, n=5: asked.append(q) or answers.get(q, []))
+    s = FakeSession(lambda u, **k: (200, pages[u]) if u in pages else (0, "") if u.startswith(PED) else (404, ""))
+    params = {"lat": 35.0, "lon": -106.0, "radius_km": 5, "categories": ["government"], "finders": None, "days": 7}
+    try:
+        sm = J.geo_scan(conn, params, s, log=lines.append, progress=J.Progress(), check=lambda: None, run_id=1)
+        rows = {r["name"]: r for r in conn.places.values()}
+        ped, sfi = rows["Public Education Department"], rows["Santa Fe Institute Library"]
+        # the tag is dead (HTTP 0): searched, moved to the search's site, discovered, board registered, all in run 1
+        assert asked == ["Public Education Department Santa Fe NM"] and sm["websites_changed"] == 1 and sm["with_careers"] == 2, sm
+        assert ped["website"] == PED2 and ped["careers_url"] == PED2 + "careers" and ped["board_id"] == 1 and conn.boards[1]["enabled"] == 1, ped
+        assert any(ln == f"Public Education Department: tag {PED} unreachable; website {PED2} from the search" for ln in lines), lines
+        assert sfi["board_id"] == 2
+        # a relookup while the tag is still dead keeps the searched site (no flip-flop); a www. variant of the
+        # library's tag is the same site and changes nothing
+        sfi.update(website="https://www.santafe.example.edu/research/resources/library/")
+        asked.clear()
+        sm2 = J.geo_scan(conn, {**params, "relookup": True}, s, log=lines.append, progress=J.Progress(), check=lambda: None, run_id=2)
+        assert not asked and sm2["websites_changed"] == 0 and sm2["relookups"] == 0, (asked, sm2)
+        assert ped["website"] == PED2 and ped["board_id"] == 1 and conn.boards[1]["enabled"] == 1
+        assert any(ln == f"Public Education Department: tag {PED} still unreachable; keeping {PED2}" for ln in lines), lines[-8:]
+        assert sfi["website"] == "https://www.santafe.example.edu/research/resources/library/" and sfi["board_id"] == 2 and conn.boards[2]["enabled"] == 1
+        assert not any("disabled" in ln for ln in lines)
+        # the tag answers again: the next relookup gives it back
+        pages[PED] = _page("PED home") + '<a href="/jobs">Jobs</a>'
+        pages[PED + "jobs"] = _page("PED jobs")
+        sm3 = J.geo_scan(conn, {**params, "relookup": True}, s, log=lines.append, progress=J.Progress(), check=lambda: None, run_id=3)
+        assert sm3["websites_changed"] == 1 and ped["website"] == PED and ped["careers_url"] == PED + "jobs" and ped["board_id"] == 3, (sm3, ped)
+        assert conn.boards[1]["enabled"] == 0 and any(ln == f"Public Education Department: website {PED2} -> {PED} (the finder's tag)" for ln in lines)
+        # a dead tag whose search finds nothing, or is throttled, leaves the place unresolved
+        del pages[PED]; del pages[PED + "jobs"]; answers.clear()
+        ped.update(website=PED, careers_url=None, portal_url=None, careers_kind=None, board_id=None)
+        sm4 = J.geo_scan(conn, params, s, log=lines.append, progress=J.Progress(), check=lambda: None, run_id=4)
+        assert ped["careers_kind"] == "unresolved" and ped["website"] == PED and sm4["websites_changed"] == 0
+        from core import websearch as W
+        geoscan.websearch.search = lambda q, n=5: (_ for _ in ()).throw(W.SearchUnavailable(["brave: too many requests"]))
+        ped.update(careers_kind=None)
+        sm5 = J.geo_scan(conn, params, s, log=lines.append, progress=J.Progress(), check=lambda: None, run_id=5)
+        assert ped["careers_kind"] == "unresolved" and sm5["search_unavailable"] == 1 and sm5["websites_changed"] == 0, sm5
+    finally:
+        restore()
+
+
 def check_relookup():
     """relookup sees every place again: a tag-less place is searched again (unchanged -> nothing;
     changed or gone -> careers fields cleared, the old board disabled only once no place points
@@ -856,6 +916,8 @@ def main():
     check_throttled_search()
     print("throttled lookups: unresolved not no_site, pause after 3, skip after 3 more, counters, recovery: ok")
     check_relookup()
+    check_dead_tag()
+    print("dead tag: searched like a tag-less place, board back in the same run; no flip-flop; www. is the same site: ok")
     print("relookup: unchanged untouched, changed/gone reset, orphaned board disabled, facility loses its site: ok")
     check_pipeline()
     print("pipeline over fakes: discover -> places -> websites -> careers -> boards (origin geo, firecrawl fallback) -> scan; repeat; rediscover; cancel; edits: ok")
