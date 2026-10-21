@@ -1,5 +1,6 @@
 """Scans and refreshes: walk boards through one Session, store documents, carry verdicts, embed."""
 import copy
+import datetime as dt
 
 import browser
 from core.adapters import load_source
@@ -29,6 +30,22 @@ class Progress:
         self.publish(self.state)
 
 
+DROPPED_TTL_DAYS = 60      # a remembered out-of-area posting not listed for this long is forgotten
+
+
+def _dropped_memory(params):
+    """The board's memory of postings the location rule dropped after fetch, as
+    {source_id: last_listed_iso_date}, pruned of ids not listed for DROPPED_TTL_DAYS and
+    discarded whole when it was built under another location regex (params["dropped"] is
+    {"location": regex, "ids": {...}}); None or a foreign shape is an empty memory."""
+    mem = params.get("dropped") or {}
+    if not isinstance(mem, dict) or (mem.get("location") or "") != (params.get("location") or ""):
+        return {}
+    cutoff = (dt.date.today() - dt.timedelta(days=DROPPED_TTL_DAYS)).isoformat()
+    ids = mem.get("ids") or {}
+    return {sid: seen for sid, seen in ids.items() if isinstance(seen, str) and seen >= cutoff}
+
+
 def scan_board(conn, board, session, days=7, all_=False, limit=None, refetch=False,
                max_pages=100, log=print, embed=True, progress=None, run_id=None):
     """Fetch new postings from one board through the run's Session. Incremental: known
@@ -41,7 +58,13 @@ def scan_board(conn, board, session, days=7, all_=False, limit=None, refetch=Fal
     persisted run this scan belongs to, recorded on every job it stores first (jobs.run_id).
     Adapter memory: an adapter may record state in board["params"] under its own name (the
     firecrawl adapter: when its costly extract tier last ran and what it found); a change made
-    by list_jobs is persisted, and refetch, a forced full re-read, forgets it first."""
+    by list_jobs is persisted, and refetch, a forced full re-read, forgets it first. The scan
+    keeps a memory of its own the same way, params["dropped"]: the ids of cards the location
+    rule let through unknown ("3 Locations") whose posting page then named only out-of-area
+    places. Such a card is skipped before any fetch on later scans (dropped_remembered) for as
+    long as it is listed; an id not listed for DROPPED_TTL_DAYS is forgotten, the memory is
+    keyed by the location regex it was built under (a changed regex discards it), and refetch
+    forgets it too."""
     p = progress or Progress()
     src = load_source(board["adapter"])
     conn.execute("""INSERT INTO sources VALUES (%s,%s,%s)
@@ -52,17 +75,25 @@ def scan_board(conn, board, session, days=7, all_=False, limit=None, refetch=Fal
     before = copy.deepcopy(params)
     if refetch:
         params[board["adapter"]] = None    # None drops the key when persisted (update_board)
+        if "dropped" in params:
+            params["dropped"] = None
     cards = src.list_jobs(session, board, since_days=None if all_ else days, max_pages=max_pages)
     if params != before:
         update_board(conn, board["id"], params=params)
+        before = copy.deepcopy(params)
     title_ok, loc_ok = _title_filter(board), _location_filter(board)
     by_title = sum(1 for c in cards if not title_ok(c.get("title")))
     by_location = sum(1 for c in cards if title_ok(c.get("title")) and not loc_ok(c.get("location")))
     keep = _card_filter(board)
     cards = [c for c in cards if keep(c)]
+    remembered, today = _dropped_memory(params), dt.date.today().isoformat()
+    listed = [c["source_id"] for c in cards if c["source_id"] in remembered]
+    remembered.update(dict.fromkeys(listed, today))     # still listed: the memory stays fresh
+    by_memory = len(listed)
     log(f"{board['name']} ({board['adapter']}): {len(cards)} cards"
         + (f", {by_title} dropped by title filter" if by_title else "")
-        + (f", {by_location} dropped by location filter" if by_location else ""))
+        + (f", {by_location} dropped by location filter" if by_location else "")
+        + (f", {by_memory} remembered out of area" if by_memory else ""))
     p.update(phase="fetching", cards=len(cards), job_index=0, job_title=None)
     p.add(cards_total=len(cards))
     new = updated = carried = 0
@@ -72,6 +103,9 @@ def scan_board(conn, board, session, days=7, all_=False, limit=None, refetch=Fal
             break
         session.check()
         p.update(job_index=i + 1, job_title=card.get("title"))
+        if card["source_id"] in remembered:            # its posting page was out of area last time
+            p.add(dropped_remembered=1)
+            continue
         row = conn.execute("SELECT id FROM jobs WHERE source=%s AND board_id=%s AND source_id=%s",
                            (board["adapter"], board["id"], card["source_id"])).fetchone()
         if row and not refetch:
@@ -94,6 +128,7 @@ def scan_board(conn, board, session, days=7, all_=False, limit=None, refetch=Fal
         # names the real places, so the rule is applied again here before anything is stored.
         if not row and not loc_ok(fields.get("location") or card.get("location")):
             log(f"  dropped by location filter after fetch: {fields.get('location')}")
+            remembered[card["source_id"]] = today
             p.add(dropped_after_fetch=1)
             continue
         if row:
@@ -133,6 +168,12 @@ def scan_board(conn, board, session, days=7, all_=False, limit=None, refetch=Fal
         touched.append(job_id)
         conn.commit()
         p.add(fetched=1, **({"new": 1} if not row else {"refetched": 1}))
+    if remembered:
+        params["dropped"] = {"location": params.get("location") or "", "ids": remembered}
+    elif "dropped" in params:
+        params["dropped"] = None
+    if params != before:
+        update_board(conn, board["id"], params=params)
     log(f"{board['name']}: {new} new, {updated} already known, {carried} verdicts carried over")
     p.update(phase="embedding", job_title=None)
     embedded = embed_if_possible(conn, touched, log)["embedded"] if embed else 0
@@ -151,7 +192,8 @@ def scan_boards(conn, boards, days=7, all_=False, limit=None, refetch=False, max
     two Sessions cannot be up at once (one relay port, one browser slot)."""
     p = progress or Progress()
     p.update(boards_total=len(boards), boards_done=0, boards_failed=0, cards_total=0,
-             fetched=0, new=0, refetched=0, known=0, skipped=0, dropped_after_fetch=0, carried=0, embedded=0)
+             fetched=0, new=0, refetched=0, known=0, skipped=0, dropped_after_fetch=0, dropped_remembered=0,
+             carried=0, embedded=0)
     results, failed = [], []
 
     def walk(s):

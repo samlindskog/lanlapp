@@ -317,6 +317,97 @@ def check_card_filter():
     assert loc_ok("Albuquerque, NM") and loc_ok("3 Locations") and not loc_ok("Denver, CO")
 
 
+def check_dropped_memory():
+    """A card the location rule let through unknown ("2 Locations") whose posting page names only
+    out-of-area places is dropped after fetch and remembered in the board's params ("dropped",
+    keyed by the location regex, ids only); the next scan skips it before any fetch and counts it
+    (progress dropped_remembered, the listing line's "remembered out of area"); an id not listed
+    for DROPPED_TTL_DAYS is forgotten; a changed regex discards the memory; refetch forgets it."""
+    import copy
+    import datetime as dt
+    import types
+    from core import scan
+    saved, lines, fetched, real = [], [], [], (scan.update_board, scan.load_source)
+    today = dt.date.today()
+    rx, rx2 = r"\b(Albuquerque|NM)\b", r"\b(Santa Fe|NM)\b"
+    cards = [{"source_id": "a1", "title": "Analyst", "location": "2 Locations", "board_url": "https://x/a1", "age_days": 1},
+             {"source_id": "a2", "title": "Analyst", "location": "2 Locations", "board_url": "https://x/a2", "age_days": 1},
+             {"source_id": "a3", "title": "Analyst", "location": "Minneapolis, MN", "board_url": "https://x/a3", "age_days": 1}]
+    pages = {"a1": "Work From Home NJ, Work From Home MA", "a2": "Albuquerque, NM", "a3": "Minneapolis, MN"}
+    stub = types.SimpleNamespace(
+        DISPLAY_NAME="Stub",
+        list_jobs=lambda session, board, since_days, max_pages: [dict(c) for c in cards],
+        fetch_job=lambda session, board, card: fetched.append(card["source_id"]) or [{"kind": "posting", "url": card["board_url"], "raw_html": "<p>x</p>", "text": "x"}],
+        parse_fields=lambda board, card, docs: {"title": card["title"], "location": pages[card["source_id"]], "board_url": card["board_url"]})
+
+    class Conn:                          # jobs table: a set of inserted source_ids, enough for the loop
+        def __init__(self):
+            self.rows, self.hit = set(), None
+
+        def execute(self, sql, args=()):
+            self.hit = None
+            if sql.startswith("SELECT id FROM jobs") and args[2] in self.rows:
+                self.hit = {"id": 1}
+            elif sql.lstrip().startswith("INSERT INTO jobs"):
+                self.rows.add(args[1]); self.hit = {"id": 1}
+            return self
+
+        def fetchone(self):
+            return self.hit
+
+        def commit(self):
+            pass
+    conn = Conn()
+    scan.update_board = lambda c, board_id, params=None, **k: saved.append((board_id, copy.deepcopy(params)))   # as written, not as later mutated
+    scan.load_source = lambda name: stub
+    board = {"id": 7, "adapter": "stub", "key": "stub:x", "name": "usbank", "url": "https://x/", "params": {"location": rx}, "enabled": True}
+    run = lambda **k: scan.scan_board(conn, board, FakeSession(lambda *a, **kw: (404, "")), days=7, embed=False, log=lines.append,
+                                      progress=scan.Progress(), **k)
+    try:
+        p = scan.Progress()
+        r = scan.scan_board(conn, board, FakeSession(lambda *a, **kw: (404, "")), days=7, embed=False, log=lines.append, progress=p)
+        assert fetched == ["a1", "a2"] and r["new"] == 1 and p.state["dropped_after_fetch"] == 1 and "dropped_remembered" not in p.state, (fetched, r, p.state)
+        memory = {"location": rx, "ids": {"a1": today.isoformat()}}
+        assert saved == [(7, {"location": rx, "dropped": memory})] and board["params"]["dropped"] == memory, (saved, board)
+        assert lines[0] == "usbank (stub): 2 cards, 1 dropped by location filter", lines
+        # second scan: a1 is skipped before any fetch, a2 is known; the memory is unchanged, so no write
+        fetched.clear(); lines.clear()
+        p = scan.Progress()
+        r = scan.scan_board(conn, board, FakeSession(lambda *a, **kw: (404, "")), days=7, embed=False, log=lines.append, progress=p)
+        assert fetched == [] and r["known"] == 1 and p.state["dropped_remembered"] == 1 and len(saved) == 1, (fetched, r, p.state, saved)
+        assert lines[0] == "usbank (stub): 2 cards, 1 dropped by location filter, 1 remembered out of area", lines
+        # a listed id's date is refreshed, an unlisted one younger than the TTL kept, an older one forgotten
+        old = (today - dt.timedelta(days=scan.DROPPED_TTL_DAYS + 1)).isoformat()
+        recent = (today - dt.timedelta(days=10)).isoformat()
+        board["params"]["dropped"] = {"location": rx, "ids": {"a1": recent, "gone": old, "zz": recent}}
+        fetched.clear()
+        run()
+        assert fetched == [] and saved[-1] == (7, {"location": rx, "dropped": {"location": rx, "ids": {"a1": today.isoformat(), "zz": recent}}}), (fetched, saved[-1])
+        # a1 itself aged out of the memory: fetched again, dropped again, remembered again
+        board["params"]["dropped"] = {"location": rx, "ids": {"a1": old}}
+        fetched.clear()
+        run()
+        assert fetched == ["a1"] and saved[-1] == (7, {"location": rx, "dropped": memory}), (fetched, saved[-1])
+        # a changed location regex discards the memory (the page may now be in area)
+        board["params"]["location"] = rx2
+        fetched.clear()
+        run()
+        assert fetched == ["a1"] and saved[-1] == (7, {"location": rx2, "dropped": {"location": rx2, "ids": {"a1": today.isoformat()}}}), (fetched, saved[-1])
+        # refetch forgets the memory first (persisted as None, which update_board drops), then rebuilds it
+        fetched.clear(); n = len(saved)
+        run(refetch=True)
+        assert fetched == ["a1", "a2"], fetched
+        assert saved[n] == (7, {"location": rx2, "stub": None, "dropped": None}), saved[n]
+        assert saved[-1] == (7, {"location": rx2, "stub": None, "dropped": {"location": rx2, "ids": {"a1": today.isoformat()}}}) and len(saved) == n + 2, saved[n:]
+        # no location rule: every unknown card is fetched, nothing is dropped after fetch, nothing is written
+        board["params"] = {}
+        fetched.clear(); n = len(saved)
+        run()
+        assert fetched == ["a1", "a3"] and len(saved) == n and "dropped" not in board["params"], (fetched, saved[n:], board["params"])
+    finally:
+        scan.update_board, scan.load_source = real
+
+
 def check_location_regex():
     from core import geocode
     assert J.state_forms("NM") == ("NM", "New Mexico") and J.state_forms("new mexico") == ("NM", "New Mexico")
@@ -907,6 +998,8 @@ def main():
     print("portal hop: external applicant portal, iframe (adapter wins), nothing, Workday anchor, ranking + cap, aggregator skip, own listing: ok")
     check_card_filter()
     print("card filter: title include/exclude + location, unknown locations kept: ok")
+    check_dropped_memory()
+    print("dropped memory: out-of-area posting remembered, skipped before fetch, aged out, regex change and refetch forget: ok")
     check_location_regex()
     print("location_regex + state forms + Nominatim reverse parsing: ok")
     check_registry_and_osm()

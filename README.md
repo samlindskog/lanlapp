@@ -242,7 +242,9 @@ postings), so only cards whose location matches a regex are fetched, by default
 `\b(<the places' cities>|<the centre's city>|<state name>|<abbreviation>)\b` from the places' addresses and
 one Nominatim reverse lookup of the centre (kept in the stored request, so a repeat is offline);
 `location` overrides it. Cards with no location, or only a count ("3 Locations"), pass: the posting
-page decides later. Any board can carry such a `location` filter (`add_boards`, `update_board`).
+page decides later, and a posting it rules out is remembered in the board's params (`dropped`: ids and
+the date last listed, keyed by the regex) so later scans skip it without a fetch; an id unlisted for 60
+days, a changed regex or `refetch` forgets it. Any board can carry such a `location` filter (`add_boards`, `update_board`).
 The run is persisted like a scan (kind `geo`, repeatable and editable from the Scans page). A place's careers page is
 re-checked after `recheck_days` (30) or on `rediscover`; `max_places` (300) caps a run. `GET /api/places`
 lists what was found (with `careers_kind`: `adapter:<name>`, `none`, `no_site`, `unresolved`), and
