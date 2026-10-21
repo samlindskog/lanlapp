@@ -307,4 +307,7 @@ harmless either way.
 ssh -t sldesktoplocal 'touch /home/sam/jobboard-bootstrap/dump && sudo bash /home/sam/jobboard-bootstrap/bootstrap.sh' && scp sldesktoplocal:/home/sam/jobboard-bootstrap/jobscan-dump.sql.gz ~/Desktop/jobscan-backup-$(date +%F).sql.gz
 # nginx / deploy-script / crawl changes: stage and re-run the bootstrap (idempotent); app changes: push to master
 # firewall / tunnel state: show-firewall mode; watchdog: journalctl -u jobboard-wg-watch -n 20
+# SearXNG: engines throttled by volume show as `unresponsive_engines` in its JSON replies (suspended 1-5 min now);
+#   the proxy list in JOBSCAN_PROXY spreads the load: the bootstrap renders it into /etc/jobboard/searxng-settings.yml
+#   (deploy/crawl/README.md "SearXNG under load"); changing JOBSCAN_PROXY or the template = a bootstrap re-run
 ```

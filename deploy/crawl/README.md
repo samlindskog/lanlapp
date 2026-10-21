@@ -17,7 +17,8 @@ network crawl (external, fixed subnet, created once: docker network create --sub
   redis             cache + rate limits (no persistence)
   rabbitmq          Firecrawl's job queue transport
   nuq-postgres      Firecrawl's NuQ queue backend (volume nuq-pgdata)
-  searxng           searxng/searxng, settings in ./searxng/settings.yml (formats html+json, limiter off)
+  searxng           searxng/searxng, settings from ./searxng/settings.yml (formats html+json, limiter off, six web
+                      engines, short suspensions), rendered by the bootstrap with the app's proxy list (see below)
 ```
 
 No service publishes a port. The only clients are containers on `crawl`: the app calls Firecrawl and
@@ -37,6 +38,25 @@ desktop firewall (nothing on the LAN side is filtered, but nothing is published 
 
 Concurrency is deliberately low (2 workers, 2 jobs, 3 pages) and every service has a `mem_limit`
 (about 5.3 GB in all on top of the app's 3 GB); raise `FIRECRAWL_*` in `.env` if the desktop has room.
+
+## SearXNG under load
+
+Search engines throttle a single exit address after a few hundred queries (brave and google answer "too
+many requests", duckduckgo serves a CAPTCHA), and SearXNG then suspends the engine; in a JSON reply this
+shows as `unresponsive_engines`. `searxng/settings.yml` is tuned for that: six web engines queried in
+parallel (duckduckgo, bing, brave, qwant, startpage, mojeek; google's scraper off), the encyclopaedia and
+utility engines off, 6 s per engine, and suspensions of 1 to 5 minutes instead of hours or days.
+
+Optionally the queries are spread over several exit addresses: `outgoing.proxies` takes a list that SearXNG
+uses round robin. Because settings.yml cannot read environment variables, the bootstrap renders the template
+(`render-settings.py`) with the app's `JOBSCAN_PROXY` / `JOBSCAN_PROXY_COUNTRIES` from `.env`, using the
+app's own parser (`jobscan/browser.py parse_proxies`: Decodo's `host:port:user:pass` list, `http://` URLs,
+or one `{session}` gateway URL, which becomes 8 entries with distinct session ids), writes the result to
+`/etc/jobboard/searxng-settings.yml` (0600, owned by the container's uid 977: it holds the proxy password)
+and records `SEARXNG_SETTINGS=/etc/jobboard/searxng-settings.yml` in `.env`, which compose substitutes into
+the volume line. A changed file means a forced recreate of the searxng container (a bind-mounted file keeps
+its old inode otherwise). With `JOBSCAN_PROXY` empty the placeholder line is dropped and SearXNG goes direct.
+Dev (`dev.sh up-fc`) mounts the template unchanged.
 
 ## Operations
 

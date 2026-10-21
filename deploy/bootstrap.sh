@@ -618,8 +618,29 @@ echo "                mcp $WG_IP:$MCP_PORT -> 127.0.0.1:8091 (Bearer only), home
 
 if [ "$CRAWL" = 1 ]; then
   log "crawl stack (Firecrawl + SearXNG, project crawl, network crawl, no published ports)"
+  # SearXNG settings: settings.yml cannot read env, so the template is rendered here with the app's proxy
+  # list (JOBSCAN_PROXY, same parser as the app) and the result mounted instead (compose var SEARXNG_SETTINGS,
+  # persisted in .env so a hand-run `docker compose -p crawl` uses it too). It holds the proxy password:
+  # owned by the container's uid (977, the image's searxng user), 0600.
+  SEARXNG_SETTINGS=/etc/jobboard/searxng-settings.yml
+  install -d -m 755 /etc/jobboard
+  RENDERED=$(mktemp)
+  python3 "$APP/deploy/crawl/searxng/render-settings.py" "$APP/deploy/crawl/searxng/settings.yml" "$APP/.env" "$APP/jobscan" > "$RENDERED"
+  SEARXNG_RECREATE=()
+  if [ -f "$SEARXNG_SETTINGS" ] && cmp -s "$SEARXNG_SETTINGS" "$RENDERED"; then
+    echo "searxng settings unchanged ($SEARXNG_SETTINGS)"
+  else
+    # A bind-mounted file follows the inode: the running container keeps the old content until recreated,
+    # and `up -d` does not notice content changes, so force it.
+    install -m 600 -o 977 -g 977 "$RENDERED" "$SEARXNG_SETTINGS"
+    SEARXNG_RECREATE=(--force-recreate); echo "searxng settings rendered -> $SEARXNG_SETTINGS (searxng will be recreated)"
+  fi
+  rm -f "$RENDERED"
+  if grep -q '^SEARXNG_SETTINGS=' "$APP/.env"; then sed -i "s|^SEARXNG_SETTINGS=.*|SEARXNG_SETTINGS=$SEARXNG_SETTINGS|" "$APP/.env"
+  else echo "SEARXNG_SETTINGS=$SEARXNG_SETTINGS" >> "$APP/.env"; fi
   # Ships through the bootstrap, not through a push: a deploy only rebuilds the app.
   (cd "$APP" && docker compose -f deploy/crawl/compose.yaml --env-file .env -p crawl up -d --remove-orphans)
+  [ ${#SEARXNG_RECREATE[@]} -eq 0 ] || (cd "$APP" && docker compose -f deploy/crawl/compose.yaml --env-file .env -p crawl up -d "${SEARXNG_RECREATE[@]}" searxng)
   docker compose -p crawl ps --format 'table {{.Name}}\t{{.Status}}'
 fi
 
