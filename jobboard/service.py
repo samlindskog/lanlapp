@@ -582,7 +582,7 @@ OPERATIONS = {
                     days={"type": "integer", "default": 7, "description": "postings within the last N days on the boards scanned"}) | {"required": ["center"]}),
     "geo_categories": (geo_categories, "The category registry for geographic scans (key, label, default) and the finders, with what is configured here (web search for websites, Firecrawl for careers pages).", _S()),
     "resolve_center": (resolve_center, "Resolve a geographic scan centre: 'lat, lng' or a Google Maps link are parsed, anything else geocoded -> lat, lon, label.", {"type": "object", "properties": {"center": _str}, "required": ["center"]}),
-    "places": (places, "Places found by geographic scans (newest first): name, address, website, careers_url, careers_kind (adapter:<name> | none | no_site | unresolved), status, board. Filters: run, status, careers_kind ('adapter' = any board), bbox, q, limit, before.",
+    "places": (places, "Places found by geographic scans (newest first): name, address, website, careers_url, careers_kind (adapter:<name> | none | no_site | facility | unresolved), status, board. Filters: run, status, careers_kind ('adapter' = any board), bbox, q, limit, before.",
                _S(run=_intt, status={"type": "string", "enum": ["active", "ignored"]}, careers_kind=_str,
                   bbox={"type": "string", "description": "south,west,north,east"}, q=_str, limit={"type": "integer", "default": 100},
                   before={"type": "integer", "description": "id cursor: places with a smaller id"})),

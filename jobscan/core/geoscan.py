@@ -10,7 +10,7 @@ import browser
 import finders as F
 from core import websearch
 from core.boards import get_board
-from core.careers import discover_careers, pick_website
+from core.careers import discover_careers, looks_like_facility, pick_website
 from core.db import now
 from core.geo import DEFAULT_CATEGORIES, dedup, location_regex
 from core.places import board_url_for, register_place_board, set_fields, upsert_place
@@ -35,7 +35,8 @@ def geo_scan(conn, params, session, log=print, progress=None, check=None, run_id
     keywords, tags, finders (None = all configured), include, exclude, location (a card-location
     regex; None = built from the places' and the centre's city/state, center_place), max_places,
     recheck_days, rediscover, days. progress fields: phase (discovering | resolving | careers | scanning |
-    done), place_index/place_name, the counters discovered, new_places, resolved, no_site,
+    done), place_index/place_name, the counters discovered, new_places, resolved, no_site, facilities (buildings
+    and stations: no lookup, the agency hires),
     search_unavailable (lookups the throttled search could not answer; those places stay
     unresolved), with_careers, boards_new, then scan_boards' own. check() runs before every
     network call."""
@@ -49,7 +50,7 @@ def geo_scan(conn, params, session, log=print, progress=None, check=None, run_id
     include, exclude, days = params.get("include") or None, params.get("exclude") or None, int(params.get("days") or 7)
     firecrawl = bool(browser.Config().firecrawl)
     p.update(phase="discovering", place_index=0, place_name=None, discovered=0, new_places=0, resolved=0,
-             no_site=0, with_careers=0, boards_new=0)
+             no_site=0, facilities=0, with_careers=0, boards_new=0)
 
     # 1. discover
     found = []
@@ -94,7 +95,11 @@ def geo_scan(conn, params, session, log=print, progress=None, check=None, run_id
     streak, paused, skipping = 0, False, False
     for i, row in enumerate(rows):
         p.update(place_index=i + 1, place_name=row["name"])
-        if row["status"] != "active" or row.get("website") or (row.get("careers_kind") == "no_site" and not stale(row)):
+        if row["status"] != "active" or row.get("website") or (row.get("careers_kind") in ("no_site", "facility") and not stale(row)):
+            continue
+        if looks_like_facility(row["name"]):          # a building or station: its employer is the agency
+            set_fields(conn, row, careers_kind="facility", last_checked=now())
+            p.add(facilities=1)
             continue
         site, throttled = None, skipping
         check()                                         # also while skipped places are only marked
@@ -190,5 +195,5 @@ def geo_scan(conn, params, session, log=print, progress=None, check=None, run_id
         log("no boards to scan")
         sm = {"cards": 0, "new": 0, "known": 0, "carried": 0, "embedded": 0, "boards": [], "failed": [], "need_judgment": []}
     p.update(phase="done", place_name=None, board=None, job_title=None)
-    return {k: p.state.get(k, 0) for k in ("discovered", "new_places", "resolved", "no_site", "search_unavailable", "with_careers", "boards_new")} \
+    return {k: p.state.get(k, 0) for k in ("discovered", "new_places", "resolved", "no_site", "facilities", "search_unavailable", "with_careers", "boards_new")} \
         | {"boards_scanned": len(sel), "location": location} | sm
