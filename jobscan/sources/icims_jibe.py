@@ -2,7 +2,8 @@
 
     GET {origin}/api/jobs?page=N&limit=100&sortBy=posted_date&descending=true
 Each job's data carries the full description, so no detail fetch is needed; apply_url
-points at the iCIMS portal. The URL alone does not reveal Jibe, so probe() checks /api/jobs.
+points at the iCIMS portal. The URL alone does not reveal Jibe, so probe() checks /api/jobs, but only on a page that mentions Jibe
+(its scripts come from jibecdn): every other careers page is spared the fetch.
 """
 from sources._util import (base_fields, days_since, iso_date, origin, split_url, doc, paginate, json_body,
                            posting_document, generic_sections)
@@ -36,6 +37,8 @@ def _page(session, board, page):
 
 
 def probe(url, html, session):
+    if "jibe" not in (html or "").lower():     # a Jibe front-end loads its scripts from jibecdn; nothing else gets the API fetch
+        return None
     b = _board(url)
     status, d = _page(session, b, 1)
     if d is None or not all(isinstance(j.get("data"), dict) for j in d["jobs"][:3]):
