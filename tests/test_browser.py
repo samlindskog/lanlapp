@@ -288,10 +288,12 @@ def check_relay():
 
 def _firecrawl_server():
     """A fake Firecrawl v1 API on loopback: scrape (a 'blocked' target answers 403 once, then 200),
-    crawl (two polls of 'scraping', then completed; a 'forever' target never completes), delete."""
+    crawl (two polls of 'scraping', then completed; a 'forever' target never completes), delete,
+    extract (two polls of 'processing', then completed; a 'failing' target fails, 'forever' never
+    completes; no delete, as in the real API)."""
     import json
     from http.server import BaseHTTPRequestHandler
-    seen = {"scrape": [], "crawl": [], "polls": 0, "pages": 0, "deleted": []}
+    seen = {"scrape": [], "crawl": [], "polls": 0, "pages": 0, "deleted": [], "extract": [], "xpolls": {}}
 
     class H(BaseHTTPRequestHandler):
         def _send(self, code, obj):
@@ -317,9 +319,21 @@ def _firecrawl_server():
             if self.path == "/v1/crawl":
                 seen["crawl"].append(req)
                 return self._send(200, {"success": True, "id": f"job{len(seen['crawl'])}"})
+            if self.path == "/v1/extract":
+                seen["extract"].append(req)
+                return self._send(200, {"success": True, "id": f"ex{len(seen['extract'])}"})
             self._send(404, {"success": False, "error": "no such op"})
 
         def do_GET(self):
+            if self.path.startswith("/v1/extract/"):
+                eid = self.path.rsplit("/", 1)[1]
+                n = seen["xpolls"][eid] = seen["xpolls"].get(eid, 0) + 1
+                urls = " ".join(seen["extract"][int(eid[2:]) - 1]["urls"])
+                if "failing" in urls:
+                    return self._send(200, {"success": False, "status": "failed", "error": "no LLM key", "data": []})
+                if n < 3 or "forever" in urls:
+                    return self._send(200, {"success": True, "status": "processing", "data": []})
+                return self._send(200, {"success": True, "status": "completed", "data": {"openings": [{"title": "Cook"}]}})
             if "skip=2" in self.path:                                   # the second page: fails once
                 seen["pages"] += 1
                 if seen["pages"] == 1:
@@ -345,8 +359,10 @@ def _firecrawl_server():
 def check_firecrawl():
     """Session.firecrawl against a fake Firecrawl: a scrape returns the target's status and data,
     a blocked scrape escalates the host and retries, Firecrawl errors retry, a crawl is polled to
-    completion, a cancel mid-poll deletes the job, a private target never reaches Firecrawl, and
-    without FIRECRAWL_URL the call fails loudly."""
+    completion, a cancel mid-poll deletes the job, a private target never reaches Firecrawl, an
+    extract is polled to its object (failed: (0, {}); a private or blocked URL in its list is
+    refused before any request; a cancel mid-poll just stops), and without FIRECRAWL_URL the call
+    fails loudly."""
     import browser as B
     _fake_dns()
     srv, port, seen = _firecrawl_server()
@@ -365,11 +381,24 @@ def check_firecrawl():
         status, data = s.firecrawl("https://fine.example.com/", op="crawl", poll=0.01, limit=3)
         assert status == 200 and data["status"] == "completed" and [p["markdown"] for p in data["data"]] == ["p1", "p2", "p3"]
         assert seen["polls"] == 3 and seen["pages"] == 2 and seen["crawl"][-1]["limit"] == 3 and len(seen["crawl"]) == 1
-        assert seen["deleted"] == ["job1"] and not s._crawls                                # one job, read then deleted
+        assert seen["deleted"] == ["job1"] and not s._jobs                                  # one job, read then deleted
         assert s.firecrawl("http://127.0.0.1:1/") == (0, {}) and s.firecrawl("http://localhost/") == (0, {})
         s.access.blocked.add("gone.example.com")
         assert s.firecrawl("https://gone.example.com/") == (403, {})
         assert len(seen["scrape"]) == 5                                                  # none of those reached Firecrawl
+        urls = ["https://fine.example.com/careers", "https://fine.example.com/careers/*"]
+        status, data = s.firecrawl(urls[0], op="extract", poll=0.01, urls=urls, prompt="openings", schema={"type": "object"}, limit=5)
+        assert status == 200 and data == {"openings": [{"title": "Cook"}]}, (status, data)
+        req = seen["extract"][-1]
+        assert "url" not in req and req["urls"] == urls and req["prompt"] == "openings" and req["limit"] == 5, req
+        assert seen["xpolls"] == {"ex1": 3} and not s._jobs and seen["deleted"] == ["job1"]  # polled; nothing to delete
+        assert s.firecrawl("https://failing.example.com/", op="extract", poll=0.01, urls=["https://failing.example.com/*"]) == (0, {})
+        assert seen["xpolls"]["ex2"] == 1 and not s._jobs
+        # one private or blocked URL in the list refuses the whole call before any request
+        assert s.firecrawl(urls[0], op="extract", urls=[urls[0], "http://10.0.0.5/*"]) == (0, {})
+        assert s.firecrawl(urls[0], op="extract", urls=[urls[0], "http://localhost/jobs"]) == (0, {})
+        assert s.firecrawl(urls[0], op="extract", urls=["https://gone.example.com/*"]) == (403, {})
+        assert len(seen["extract"]) == 2
     calls = []
 
     def check():
@@ -383,7 +412,16 @@ def check_firecrawl():
             pass
         else:
             raise AssertionError("cancel did not propagate")
-        assert seen["deleted"] == ["job1", "job2"] and not s._crawls
+        assert seen["deleted"] == ["job1", "job2"] and not s._jobs
+    calls.clear()
+    with B.Session(lambda m: None, cfg, check=check) as s:                               # the same, for an extract
+        try:
+            s.firecrawl("https://forever.example.com/", op="extract", poll=0.01, urls=["https://forever.example.com/*"])
+        except B.Cancelled:
+            pass
+        else:
+            raise AssertionError("cancel did not propagate")
+        assert not s._jobs and seen["deleted"] == ["job1", "job2"] and seen["xpolls"]["ex3"] == 2   # polling just stops
     with B.Session(lambda m: None, B.Config({"JOBSCAN_BROWSER": "0"})) as s:
         try:
             s.firecrawl("https://fine.example.com/")
