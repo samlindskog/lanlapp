@@ -34,6 +34,10 @@ AGGREGATORS = {"yelp.com", "yelp.ca", "facebook.com", "fb.com", "instagram.com",
                "superpages.com", "hotfrog.com", "cylex.us", "cylex-usa.com", "niche.com", "greatschools.org",
                "usnews.com", "ziprecruiter.com", "simplyhired.com", "bing.com", "apple.com", "waze.com",
                "doordash.com", "grubhub.com", "ubereats.com",
+               # booking, listing and locator sites: a page "near <business>" names it and the city
+               "agoda.com", "booking.com", "expedia.com", "hotels.com", "carecredit.com", "healthline.com",
+               "vagaro.com", "mapcarta.com", "hippostcard.com", "storagecafe.com", "apartments.com", "realtor.com",
+               "redfin.com",
                # profile and directory hosts: a doctor's WebMD page names the practice and the city,
                # and its careers link is WebMD's own
                "webmd.com", "vitals.com", "doximity.com", "psychologytoday.com", "sharecare.com", "caredash.com",
@@ -115,7 +119,33 @@ def domain_matches(name, url):
         return False
     whole, acr = spelled
     distinct = {i for i, w in enumerate(words) if len(w) >= 3 and w not in GENERIC and w not in _STOP}
-    return not distinct or bool((whole | (acr or frozenset())) & distinct and whole & distinct)
+    if not distinct:
+        return True                                        # a name of generic words only: the whole name was spelled
+    used = {words[i] for i in whole & distinct}
+    if not used:
+        return False
+    # A short word carries little: quest.com is not "Quest", chiefs.com not a fire chief's facility.
+    # One distinctive word of five letters or more, or two distinctive words; a lone word (the whole
+    # name) must be long enough to be a brand rather than a dictionary word.
+    if len(used) >= 2:
+        return True
+    word = next(iter(used))
+    return len(word) >= (LONE_WORD_LETTERS if len(words) == 1 else 5)
+
+
+LONE_WORD_LETTERS = 7           # "walmart", "walgreens", "concentra" pass; "quest", "oculus" do not
+
+# Government buildings and generic facilities are not businesses with a website of their own; their
+# employer is the agency, which OSM usually lists under its own name too. No web lookup for them.
+FACILITY_RE = re.compile(r"\bbuilding\s*$|\b(fire station|post office|station #?\d+|division|office of|headquarters|complex|"
+                         r"courthouse|warehouse|training facility|annex|substation|jury services|detention center|"
+                         r"maintenance yard|pump station|water treatment|transfer station|parking (garage|structure))\b", re.I)
+
+
+def looks_like_facility(name):
+    """A government building or facility named for a person, a function or a number ("Villagra
+    Building", "United States Post Office", "Santa Fe Fire Station #3", "... Training Facility")."""
+    return bool(FACILITY_RE.search(name or ""))
 
 
 def mentions_place(text, city=None, state=None):
@@ -128,12 +158,30 @@ def mentions_place(text, city=None, state=None):
                 or (abbr and re.search(r"\b" + abbr + r"\b", t)))
 
 
-def title_names(name, title):
+def place_words(city=None, state=None):
+    """The words of the place's own name ("santa", "mexico"): no evidence that a title means
+    this business when the business is named after its town (Santa Fe Health Services)."""
+    abbr, sname = state_forms(state) if state else (None, None)
+    return set(name_tokens(f"{city or ''} {sname or ''}"))
+
+
+def shallow(url):
+    """At most one path segment: a home page or a single page, never a directory's profile
+    (/doctor/..., /find-care/provider/..., /hotels-near-.../attractions/...)."""
+    return len([s for s in urllib.parse.urlsplit(url).path.split("/") if s]) <= 1
+
+
+def title_names(name, title, city=None, state=None):
     """Does a result's title carry the business's distinctive words in order: at least 70% of
     them as one contiguous run ("Monica Valdez - State Farm agent" for State Farm - Monica
-    Valdez; "Best credit unions in New Mexico" does not name Rio Grande Credit Union)."""
-    keys, words = key_tokens(name), name_tokens(title)        # both without stop words and initials
+    Valdez; "Best credit unions in New Mexico" does not name Rio Grande Credit Union). Words of
+    the place's own name do not count, so a title must say more than the town."""
+    skip = place_words(city, state)
+    keys = [k for k in key_tokens(name) if k not in skip]
+    words = name_tokens(title)                                # like keys: no stop words, no initials
     if not keys or not words:
+        return False
+    if len(keys) == 1 and len(keys[0]) < LONE_WORD_LETTERS:   # "Oculus Casting | Santa Fe" is not the Oculus on the map
         return False
     need = max(1, math.ceil(0.7 * len(keys)))
     for i in range(len(keys)):
@@ -145,17 +193,19 @@ def title_names(name, title):
 
 
 def pick_website(name, results, city=None, state=None):
-    """The business's own site among search results, or None. Never a directory host. Rule 1
-    (preferred): the domain is spelled from the name (domain_matches). Rule 2: the title names
-    the business (title_names) and the title or snippet names the place's city or state (a local
-    listing on a site named otherwise)."""
-    hits = [(web_url(r.get("url")), r.get("title") or "", r.get("snippet") or "") for r in results or []]
-    hits = [(u, t, s) for u, t, s in hits if u and not is_aggregator(u)]
-    for u, _, _ in hits:
+    """The business's own site among search results, or None. Never a directory host, never for
+    a facility (looks_like_facility). Rule 1 (preferred): the domain is spelled from the name
+    (domain_matches). Rule 2: a shallow page whose title names the business (title_names) and
+    the place's city or state (a local listing on a site named otherwise)."""
+    if looks_like_facility(name):
+        return None
+    hits = [(web_url(r.get("url")), r.get("title") or "") for r in results or []]
+    hits = [(u, t) for u, t in hits if u and not is_aggregator(u)]
+    for u, _ in hits:
         if domain_matches(name, u):
             return u
-    for u, title, snippet in hits:
-        if title_names(name, title) and mentions_place(f"{title} {snippet}", city, state):
+    for u, title in hits:
+        if shallow(u) and title_names(name, title, city, state) and mentions_place(title, city, state):
             return u
     return None
 
