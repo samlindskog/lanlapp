@@ -36,7 +36,8 @@ Agent API  : JSON over HTTP, documented at GET /api  (also in .claude/skills/job
   POST /api/jobs/<id>/action      {action: applied|drafted, date?, resume_dir?, note?}
   POST /api/jobs/<id>/refresh     re-fetch the posting now (synchronous)
   POST /api/scan                  {boards?:[id..], source?, days?:7, all?:false, refetch?:false} -> {run_id}
-                                  (boards = ids; source = every board of one adapter; neither = all enabled)
+                                  (boards = ids; source = every board of one adapter; neither = every enabled board
+                                   registered by URL; geographic boards are scanned by their geographic runs)
   POST /api/refresh               {ids?:[..]} or {filter:"open-qualifying"}       -> {run_id}
   POST /api/geo/scan              {center, radius_km?:10, categories?, keywords?, tags?, finders?, include?, exclude?,
                                    location?, max_places?:300, recheck_days?:30, rediscover?:false, days?:7} -> {run_id, center}

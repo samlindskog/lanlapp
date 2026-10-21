@@ -257,7 +257,8 @@ def set_status(args):
 
 # ------------------------------------------------------------------ fetching
 def scan(args):
-    """boards: ids; source: every enabled board of one adapter; neither: all enabled boards.
+    """boards: ids; source: every enabled board of one adapter; neither: every enabled board
+    registered by URL (origin manual; geographic boards belong to their geographic runs).
     The run stores the request as given (repeat_run replays it) and stamps new jobs with its id."""
     ids, source = _ints(args.get("boards")), args.get("source") or None
     with db() as conn:
@@ -271,8 +272,8 @@ def scan(args):
             sel = J.list_boards(conn, adapter=source, enabled_only=True)
             if not sel and getattr(J.load_source(source), "BOARD_URL", None):
                 sel = [J.add_board(conn, J.load_source(source).BOARD_URL)]
-        else:
-            sel = J.list_boards(conn, enabled_only=True)
+        else:                                      # geographic boards are scanned by their geographic runs
+            sel = J.list_boards(conn, enabled_only=True, origin="manual")
     if not sel:
         raise ValueError("no boards to scan; register one with add_boards first")
     capacity.check()
@@ -565,7 +566,7 @@ OPERATIONS = {
     "sections": (sections, None, _S()),
     "search": (search, "Search stored postings. mode=keyword (AND terms, quotes for phrases, snippets) or mode=semantic (embedding similarity).",
                {"type": "object", "properties": {"q": _str, "mode": {"type": "string", "enum": ["keyword", "semantic"], "default": "keyword"}, "limit": {"type": "integer", "default": 20}}, "required": ["q"]}),
-    "scan": (scan, "Start a background scan: boards = list of board ids, or source = every board of one adapter, or neither = every enabled board. New/changed postings are embedded automatically. Returns a run id to poll with run_status.",
+    "scan": (scan, "Start a background scan: boards = list of board ids, or source = every board of one adapter, or neither = every enabled board registered by URL (geographic boards are scanned by their geographic runs). New/changed postings are embedded automatically. Returns a run id to poll with run_status.",
              _S(boards={"type": "array", "items": _intt}, source=_str, days={"type": "integer", "default": 7},
                 all={"type": "boolean", "default": False}, refetch={"type": "boolean", "default": False})),
     "geo_scan": (geo_scan, "Start a geographic scan (background run of kind 'geo'): businesses around a point are discovered from OpenStreetMap, their websites and careers pages found, each careers page registered as a board (origin geo) and scanned for postings in the area (location filter). center: 'lat, lng', a Google Maps link, or an address (geocoded). Returns a run id to poll with run_status; places lists what was found.",
