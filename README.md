@@ -176,7 +176,11 @@ links to its Workday board). Family adapters cover a hosting platform for any em
 adapter (USACE on Yello) covers one board. A URL no adapter recognises is registered as a generic
 `firecrawl` board when `FIRECRAWL_URL` points at a self-hosted Firecrawl (an item's `adapter:
 "firecrawl"` forces it): the page's openings are extracted with a JSON schema, so dates are
-best-effort and the days window is advisory there. Each board can carry `include` / `exclude` regexes on
+best-effort and the days window is advisory there. When neither that page nor a bounded crawl of its
+listing sub-page yields an opening (a careers page whose jobs sit behind an applicant-tracking widget,
+a search form or scattered sub-pages), the board goes to Firecrawl's LLM-driven extraction over the
+page and its directory (`/v1/extract`), which needs the LLM key (`OPENAI_API_KEY`) in Firecrawl's
+environment. Each board can carry `include` / `exclude` regexes on
 posting titles so a 4,000-job Workday tenant only yields the analyst roles. A scan walks any set of
 boards in one run; the web page's Scan dialog lists them with checkboxes and an add-by-URL box.
 

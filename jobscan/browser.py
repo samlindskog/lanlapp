@@ -19,10 +19,11 @@ Layers (each testable on its own):
   HttpPool      plain HTTP with keep-alive: curl_cffi impersonating Chrome's TLS fingerprint when
                 installed, else http.client tunnels (uses the per-level proxy itself, no relay)
   Session       fetch(): the escalation loop over the transports; firecrawl(): the same loop for
-                a self-hosted Firecrawl (scrape, map, crawl with polling), whose own traffic comes
-                back in through the relay; close(): tear everything down. Nothing outlives the
-                session: the next operation starts direct with new sessions, a fresh relay and no
-                crawl jobs left running.
+                a self-hosted Firecrawl (scrape, map, and the polled jobs: crawl, and extract, its
+                LLM-driven reading of a set of pages), whose own traffic comes back in through the
+                relay; close(): tear everything down. Nothing outlives the session: the next
+                operation starts direct with new sessions, a fresh relay and no crawl jobs left
+                running (an extract job has no DELETE; it is left to finish on its own).
 
 Env (Config):
   JOBSCAN_BROWSER=0        plain HTTP only (CI, offline tests)
@@ -989,7 +990,7 @@ class Session:
     def __init__(self, log=None, cfg=None, check=None, dest_check=check_dest):
         self.cfg = cfg or Config()
         self.log = log or _stderr
-        self._crawls = set()                     # live Firecrawl crawl ids, deleted on close/cancel
+        self._jobs = set()                       # live Firecrawl (kind, id) jobs, dropped on close/cancel
         self.check = check or (lambda: None)     # raises Cancelled to stop the operation; run before every fetch
         self.dest_check = dest_check             # the relay's destination guard; tests swap it to allow loopback
         self.pool = ProxyPool(self.cfg.proxy, self.cfg.proxy_tries, self.cfg.countries)
@@ -1016,8 +1017,8 @@ class Session:
         """Tear everything down: Chrome and its process tree, live crawls, the relay, pooled
         connections, escalation state."""
         self.chrome.close()
-        for cid in list(self._crawls):
-            self._crawl_delete(cid)
+        for kind, jid in list(self._jobs):
+            self._forget(kind, jid)
         if self.relay is not None:
             self.relay.close()
             self.relay = None
@@ -1102,19 +1103,34 @@ class Session:
         blocked site shows as an empty or short link list, not as an escalation. Firecrawl's own
         base URL is an internal service and is not subject to check_url; only the target is.
         Firecrawl 5xx, timeouts and connection errors retry with backoff like fetch; a 4xx from
-        Firecrawl is final."""
+        Firecrawl is final.
+
+        op "extract" is Firecrawl's LLM-driven extraction over a set of pages: the body is
+        {"urls": [...], "prompt": ..., "schema": ..., **options} (no "url"; a URL ending in /*
+        lets Firecrawl explore the pages under it), and url names the site for the escalation
+        state and the log. It is a polled job like a crawl: (200, the extracted object) once
+        completed, (0, {}) when it failed, was cancelled, or is still running after wait seconds.
+        Every URL in urls passes check_url (without its trailing /*) and the blocked-host check
+        before the request. The API has no DELETE for extract jobs, so a cancel or close just
+        stops polling and the job finishes or expires on Firecrawl's side. Like a scrape's json
+        format it needs the LLM key in Firecrawl's environment (OPENAI_API_KEY)."""
         if not self.cfg.firecrawl:
             raise RuntimeError("FIRECRAWL_URL is not set: the firecrawl adapter needs a self-hosted Firecrawl "
                                "(e.g. http://firecrawl-api:3002) that routes through this service's relay")
+        if op == "extract":
+            refused = self._refused(options.get("urls") or [url])
+            if refused is not None:
+                return refused
 
         def once():
-            code, reply = self._api("POST", f"/v1/{op}", {"url": url, **options}, timeout=wait)
+            body = options if op == "extract" else {"url": url, **options}
+            code, reply = self._api("POST", f"/v1/{op}", body, timeout=wait)
             if code >= 500:
                 return "retry", f"firecrawl HTTP {code}: {str(reply.get('error') or reply)[:160]}"
             if code >= 400 or not reply.get("success", True):
                 self.log(f"  ! firecrawl {op} refused {url}: HTTP {code} {str(reply.get('error') or '')[:160]}")
                 return "done", (0, {})
-            if op != "scrape":                 # map: the links; crawl: the new job's id
+            if op != "scrape":                 # map: the links; crawl, extract: the new job's id
                 return "done", (200, reply)
             data = reply.get("data") or {}
             status, content = self._target_status(data)
@@ -1127,7 +1143,23 @@ class Session:
         status, data = self._attempts(url, once, {}, retries, f"firecrawl {op}")
         if op == "crawl" and status == 200:    # the job exists: from here on nothing re-creates it
             return self._crawl_wait(data.get("id"), wait, poll)
+        if op == "extract" and status == 200:
+            return self._extract_wait(data.get("id"), wait, poll)
         return status, data
+
+    def _refused(self, urls):
+        """The guards _attempts applies to its one URL, over an extract's list: (0, {}) for a URL
+        the service must never fetch, (403, {}) for a host blocked this operation, None when all
+        pass. A wildcard (/*) is checked as the page it hangs under."""
+        for u in urls:
+            try:
+                check_url(u[:-2] if u.endswith("/*") else u)
+            except UnsafeURL as e:
+                self.log(f"  ! {e}")
+                return 0, {}
+            if self.access.host(u) in self.access.blocked:
+                return 403, {}
+        return None
 
     @staticmethod
     def _target_status(data):
@@ -1177,33 +1209,59 @@ class Session:
             time.sleep(1.5 * (i + 1))
         return 0, {"error": str(last)}
 
-    def _crawl_wait(self, cid, wait, poll):
-        """Poll a crawl job to completion and read its pages; the finished job is then deleted
-        (Firecrawl keeps results otherwise). Cancel (check raising), the time cap or a job that
-        failed deletes it too. Nothing here raises except Cancelled, so the job is never re-created."""
-        if not cid:
+    def _poll(self, kind, jid, wait, poll):
+        """Poll a crawl or extract job: (200, the job) once completed, else (0, {}) (failed,
+        cancelled, gone, or still running after wait seconds). The job is registered while it
+        runs so a cancel (check raising), the time cap or close() drop it; a completed one stays
+        registered until the caller has read its results (_forget). Nothing here raises except
+        Cancelled, so the job is never re-created."""
+        if not jid:
             return 0, {}
-        self._crawls.add(cid)
+        self._jobs.add((kind, jid))
+        done = False
         end = time.time() + wait
         try:
             while True:
                 self.check()
-                code, job = self._api_retry("GET", f"/v1/crawl/{cid}")
+                code, job = self._api_retry("GET", f"/v1/{kind}/{jid}")
                 state = job.get("status")
                 if code == 200 and state == "completed":
-                    pages = self._crawl_pages(job)
-                    self._crawl_delete(cid)
-                    return 200, dict(job, data=pages, next=None)
+                    done = True
+                    return 200, job
                 if code in (0, 404) or state in ("failed", "cancelled"):
-                    self.log(f"  ! firecrawl crawl {cid}: {state or job.get('error') or f'HTTP {code}'}")
+                    self.log(f"  ! firecrawl {kind} {jid}: {state or job.get('error') or f'HTTP {code}'}")
                     return 0, {}
                 if time.time() > end:
-                    self.log(f"  ! firecrawl crawl {cid}: still {state} after {wait}s; cancelled")
+                    self.log(f"  ! firecrawl {kind} {jid}: still {state} after {wait}s; abandoned")
                     return 0, {}
                 time.sleep(poll)
         finally:
-            if cid in self._crawls:            # cancelled, timed out or failed: stop Firecrawl's work
-                self._crawl_delete(cid)
+            if not done:
+                self._forget(kind, jid)
+
+    def _crawl_wait(self, cid, wait, poll):
+        """A crawl job polled to completion and its pages read; the finished job is then deleted
+        (Firecrawl keeps results otherwise)."""
+        code, job = self._poll("crawl", cid, wait, poll)
+        if code != 200:
+            return code, job
+        try:
+            pages = self._crawl_pages(job)
+        finally:
+            self._forget("crawl", cid)
+        return 200, dict(job, data=pages, next=None)
+
+    def _extract_wait(self, eid, wait, poll):
+        """An extract job polled to completion: (200, the extracted object). A job reports [] as
+        data while it runs, so a list is read defensively; there is nothing to delete."""
+        code, job = self._poll("extract", eid, wait, poll)
+        self._forget("extract", eid)
+        if code != 200:
+            return code, job
+        data = job.get("data")
+        if isinstance(data, list):
+            data = data[0] if data and isinstance(data[0], dict) else {}
+        return 200, data if isinstance(data, dict) else {}
 
     def _crawl_pages(self, job):
         """Every page of a finished crawl: Firecrawl pages large results ("next"). A page that
@@ -1222,9 +1280,14 @@ class Session:
             nxt = more.get("next")
         return pages
 
-    def _crawl_delete(self, cid):
-        self._crawls.discard(cid)
+    def _forget(self, kind, jid):
+        """Drop a job from the live set. A crawl is deleted on Firecrawl's side too (a running one
+        keeps scraping otherwise, a finished one keeps its results); the API has no DELETE for
+        extract jobs, so once nobody polls one it finishes or expires on its own."""
+        self._jobs.discard((kind, jid))
+        if kind != "crawl":
+            return
         try:
-            self._api("DELETE", f"/v1/crawl/{cid}", timeout=10)
+            self._api("DELETE", f"/v1/crawl/{jid}", timeout=10)
         except Exception as e:  # noqa: BLE001
-            self.log(f"  ! firecrawl crawl {cid}: delete failed: {e}")
+            self.log(f"  ! firecrawl crawl {jid}: delete failed: {e}")

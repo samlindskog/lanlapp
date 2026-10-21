@@ -213,7 +213,7 @@ class FirecrawlSession(FakeSession):
 
     def firecrawl(self, url, op="scrape", **options):
         self.calls.append((op, url, options))
-        if op == "crawl":
+        if op in ("crawl", "extract"):
             return 0, {}
         if url == self.BOARD and "json" in options.get("formats", []):
             return 200, {"markdown": self.PAGE_MD, "links": [self.BOARD, self.POST, "https://www.example.org/about"],
@@ -268,6 +268,7 @@ def check_firecrawl(mod):
     cards = mod.list_jobs(s, board, since_days=None, max_pages=5)
     assert [c["title"] for c in cards] == ["Budget Analyst", "Cook"], cards
     assert s.calls[-1][0] == "scrape" and s.calls[-1][2]["formats"] == ["markdown", "links", "json"], s.calls[-1]
+    assert [c[0] for c in s.calls if c[0] != "scrape"] == []                  # tier one succeeded: no crawl, no extract
     a, b = cards
     assert a["url"] == a["board_url"] == s.POST and a["location"] == "Santa Fe, NM" and a["snippet"] == "Runs the budget."
     assert a["age_days"] == 10 and a["open_date"] == "2026-10-10" and a["close_date"] == "2026-10-30", a
@@ -320,6 +321,33 @@ def check_firecrawl(mod):
     cards = mod.list_jobs(s, board, since_days=None, max_pages=3)
     assert [c["title"] for c in cards] == ["Branch Manager"] and [c[0] for c in s.calls] == ["scrape", "crawl"], (cards, s.calls)
     assert "concrete job openings" in mod.JSON_OPTIONS["prompt"] and "View all jobs" in mod.JSON_OPTIONS["prompt"]
+    # the third tier: when the crawl of the listing sub-page finds nothing either, Firecrawl's LLM
+    # extraction over the board page and its directory; its openings become cards like the scrape's
+    # (same ids: the link, else the board page + text), junk dropped the same way
+    s.calls.clear()
+    extracted = {"openings": [{"title": "View all jobs"}, {"title": "Teller", "url": "/careers/teller-7", "location": "Santa Fe, NM"},
+                              {"title": "Cook", "location": "Taos, NM", "snippet": "Lunch."}, {"title": "  "}]}
+    empty_crawl = {"status": "completed", "data": [{"json": {"openings": []}, "metadata": {"sourceURL": "https://www.example.org/jobs/"}}]}
+    s.firecrawl = lambda url, op="scrape", **o: (s.calls.append((op, url, o)) or (200, {"scrape": front, "crawl": empty_crawl, "extract": extracted}[op]))
+    cards = mod.list_jobs(s, board, since_days=None, max_pages=3)
+    assert [c["title"] for c in cards] == ["Teller", "Cook"] and [c[0] for c in s.calls] == ["scrape", "crawl", "extract"], (cards, s.calls)
+    teller, cook = cards
+    assert teller["url"] == teller["board_url"] == "https://www.example.org/careers/teller-7" and teller["location"] == "Santa Fe, NM"
+    assert cook["url"] is None and cook["board_url"] == s.BOARD and cook["snippet"] == "Lunch." and len(cook["source_id"]) == 40
+    assert mod.list_jobs(s, board, since_days=None, max_pages=3)[1]["source_id"] == cook["source_id"]   # stable across scans
+    op, url, o = s.calls[-1]
+    assert url == s.BOARD and o["urls"] == [s.BOARD, s.BOARD + "/*"] and o["schema"] == mod.SCHEMA and o["limit"] == 3, o
+    assert o["enableWebSearch"] is False and o["includeSubdomains"] is False and o["allowExternalLinks"] is False, o
+    assert "concrete job openings" in o["prompt"] and "URL" in o["prompt"] and "location" in o["prompt"] and "View all jobs" in o["prompt"]
+    # no listing link at all: straight from the scrape to the extraction; a failed extraction is no cards
+    s.calls.clear()
+    s.firecrawl = lambda url, op="scrape", **o: (s.calls.append((op, url, o)) or ((200, {**front, "links": ["https://www.example.org/about"]}) if op == "scrape" else (0, {})))
+    assert mod.list_jobs(s, board, since_days=None) == [] and [c[0] for c in s.calls] == ["scrape", "extract"], s.calls
+    assert s.calls[-1][2]["limit"] == mod.EXTRACT_PAGES                        # the page budget caps max_pages
+    # the pattern Firecrawl explores: the board URL's directory, never the whole site by accident
+    assert mod._wildcard("https://www.example.org/careers/") == "https://www.example.org/careers/*"
+    assert mod._wildcard("https://www.example.org/about/jobs.html?x=1#top") == "https://www.example.org/about/*"
+    assert mod._wildcard("https://www.example.org") == "https://www.example.org/*"
 
 
 def check_detection():
