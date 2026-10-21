@@ -55,7 +55,7 @@ def search(query, n=5):
                                timeout=15)
     except OSError as e:
         raise SearchUnavailable([f"searxng: {e.__class__.__name__}: {str(e)[:80]}"]) from None
-    if status != 200 or not isinstance(data, dict):
+    if status != 200 or not isinstance(data, dict) or "results" not in data:   # an error page is not an empty answer
         raise SearchUnavailable([f"searxng: HTTP {status}"])
     out = []
     for r in data.get("results") or []:

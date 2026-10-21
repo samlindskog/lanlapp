@@ -97,8 +97,8 @@ def geo_scan(conn, params, session, log=print, progress=None, check=None, run_id
         if row["status"] != "active" or row.get("website") or (row.get("careers_kind") == "no_site" and not stale(row)):
             continue
         site, throttled = None, skipping
+        check()                                         # also while skipped places are only marked
         if websearch.configured() and not skipping:
-            check()
             q = websearch.query_for(row["name"], row.get("city"), row.get("state"))
             try:
                 site = pick_website(row["name"], websearch.search(q), city=row.get("city"), state=row.get("state"))
