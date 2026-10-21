@@ -1,7 +1,16 @@
-# SearXNG for the crawl stack (deploy/crawl/compose.yaml), mounted read-only and selected with
-# SEARXNG_SETTINGS_PATH. Internal only: the instance is reachable on the `crawl` docker network alone, so the
-# bot limiter and public-instance features are off. `json` in formats is what Firecrawl (SEARXNG_ENDPOINT)
-# and the app (SEARXNG_URL, /search?format=json) need; the default settings allow html only.
+# SearXNG for the crawl stack (deploy/crawl/compose.yaml), mounted read-only at /etc/searxng/settings.yml.
+# Internal only: the instance is reachable on the `crawl` docker network alone, so the bot limiter and
+# public-instance features are off. `json` in formats is what Firecrawl (SEARXNG_ENDPOINT) and the app
+# (SEARXNG_URL, /search?format=json) need; the default settings allow html only.
+#
+# Tuned for programmatic volume (hundreds of queries per run from one exit address), not for a person:
+# several web engines queried in parallel, no encyclopaedia/utility engines, short timeouts, short
+# suspensions, and optionally a rotating proxy list.
+#
+# TEMPLATE: the line `# @OUTGOING_PROXIES@` is replaced by deploy/bootstrap.sh (render-settings.py) with an
+# `outgoing.proxies` list built from the app's JOBSCAN_PROXY, and the result is mounted instead of this file
+# (compose variable SEARXNG_SETTINGS). Dev mounts this file as is: the placeholder is a comment, so it is
+# valid YAML and SearXNG goes direct.
 use_default_settings: true
 
 general:
@@ -24,12 +33,49 @@ search:
   safe_search: 0
   autocomplete: ""
   default_lang: "en-US"
+  # How long an engine stays suspended after it refuses us. The defaults are 180 s for too-many-requests but
+  # an hour for a CAPTCHA and days for Cloudflare/reCAPTCHA pages: one bad minute took an engine out for the
+  # rest of a run. With a proxy list rotating the exit address a retry a minute later usually works, and
+  # without one a suspended engine only costs a quick failed request, so keep every suspension short.
+  suspended_times:
+    SearxEngineAccessDenied: 60
+    SearxEngineCaptcha: 120
+    SearxEngineTooManyRequests: 60
+    cf_SearxEngineCaptcha: 300
+    cf_SearxEngineAccessDenied: 300
+    recaptcha_SearxEngineCaptcha: 300
+
+# Engines merge by name into the defaults. SearXNG asks every enabled engine of the `general` category in
+# parallel and merges the answers, so a throttled engine costs nothing while the others answer; the more web
+# engines, the better one query survives one engine's "too many requests".
+engines:
+  - name: duckduckgo        # on by default
+    disabled: false
+  - name: bing              # off by default: on
+    disabled: false
+  - name: brave             # on by default
+    disabled: false
+  - name: qwant             # off by default: on
+    disabled: false
+  - name: startpage         # on by default
+    disabled: false
+  - name: mojeek            # on by default; its own index, independent of the others
+    disabled: false
+  - name: google            # the HTML scraper answers volume with CAPTCHAs and is off by default upstream: keep it off
+    disabled: true
+  - name: wikipedia         # the default `general` engines that are not web search: off, they only add latency to every query
+    disabled: true
+  - name: wikidata
+    disabled: true
+  - name: currency
+    disabled: true
 
 ui:
   static_use_hash: true
 
 outgoing:
-  request_timeout: 6.0
-  max_request_timeout: 15.0
-  pool_connections: 50
+  request_timeout: 6.0          # per engine; the slowest engine bounds a query, so a stuck one costs 6 s, not the default 3 s cut short
+  max_request_timeout: 10.0     # hard cap a client may raise to (?timeout_limit=)
+  pool_connections: 20          # a handful of concurrent queries from one client: modest pools
   pool_maxsize: 10
+  # @OUTGOING_PROXIES@
