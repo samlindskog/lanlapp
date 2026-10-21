@@ -1,6 +1,7 @@
 """Offline checks for every board adapter: module contract, URL detection, and a stubbed board
 walk + posting fetch + field parse (fixtures captured from the live sites) so missing constants
 or broken regexes fail CI, not production. Runs with JOBSCAN_BROWSER=0 (no Chrome needed)."""
+import datetime as _datetime
 import json
 import os
 import sys
@@ -271,7 +272,7 @@ def check_firecrawl(mod):
     assert [c[0] for c in s.calls if c[0] != "scrape"] == []                  # tier one succeeded: no crawl, no extract
     a, b = cards
     assert a["url"] == a["board_url"] == s.POST and a["location"] == "Santa Fe, NM" and a["snippet"] == "Runs the budget."
-    assert a["age_days"] == 10 and a["open_date"] == "2026-10-10" and a["close_date"] == "2026-10-30", a
+    assert a["age_days"] == (_datetime.date.today() - _datetime.date(2026, 10, 10)).days and a["open_date"] == "2026-10-10" and a["close_date"] == "2026-10-30", a
     assert b["url"] is None and b["board_url"] == s.BOARD and b["age_days"] is None, b
     assert len({a["source_id"], b["source_id"]}) == 2 and len(a["source_id"]) == 40
     assert mod.list_jobs(s, board, since_days=5)[0]["title"] == "Cook"       # dated card outside the window dropped
