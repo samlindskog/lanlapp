@@ -4,14 +4,18 @@ The explicit fallback. match() never wins by URL, so detect() never picks this a
 uses it for a URL no other adapter recognises when a Firecrawl is configured (FIRECRAWL_URL, see
 service.add_boards), or when the caller forces adapter "firecrawl".
 
-    scrape  the board URL, markdown + links + JSON extraction: the openings listed on the page
-    crawl   a same-host listing sub-page (…/careers, /jobs, /openings, /positions) when the page
-            itself lists none, bounded by max_pages and two levels deep
-    scrape  one posting, markdown + html: the stored document
+    scrape   the board URL, markdown + links + JSON extraction: the openings listed on the page
+    crawl    a same-host listing sub-page (…/careers, /jobs, /openings, /positions) when the page
+             itself lists none, bounded by max_pages and two levels deep
+    extract  when both found none: Firecrawl's LLM-driven extraction over the board page and the
+             pages under its directory (…/careers/*), for openings behind an applicant-tracking
+             widget, a search form or scattered sub-pages; bounded by EXTRACT_PAGES
+    scrape   one posting, markdown + html: the stored document
 
-since_days is advisory only: a generic page rarely dates its postings, so an opening without a
-readable date is kept (within() keeps unknown ages) and every scan re-lists the whole page.
-Registration (verify) asks for markdown alone so it spends no LLM tokens.
+The tiers run cheap-first and the log names the one that produced the cards. since_days is
+advisory only: a generic page rarely dates its postings, so an opening without a readable date is
+kept (within() keeps unknown ages) and every scan re-lists the whole page. Registration (verify)
+asks for markdown alone so it spends no LLM tokens.
 """
 import hashlib
 import re
@@ -28,11 +32,16 @@ KEY_SECTION = None
 FIELDS = ("title", "url", "location", "posted", "closes", "snippet")
 SCHEMA = {"type": "object", "properties": {"openings": {"type": "array", "items": {
     "type": "object", "properties": {k: {"type": "string"} for k in FIELDS}, "required": ["title"]}}}}
-JSON_OPTIONS = {"schema": SCHEMA, "prompt": "Extract only the concrete job openings listed on this page, each with "
-               "a specific job title (e.g. 'Branch Manager', 'Budget Analyst'): the title, the link to the posting "
-               "(absolute URL), location, posted and closing dates as written, and a one-sentence snippet. Never "
-               "include navigation, search, category or location links such as 'View all jobs', 'Search jobs', "
-               "'Careers' or a city name. If the page lists no concrete openings, return an empty list."}
+OPENING_FIELDS = ("each with a specific job title (e.g. 'Branch Manager', 'Budget Analyst'): the title, the link to the "
+                  "posting (absolute URL), location, posted and closing dates as written, and a one-sentence snippet. "
+                  "Never include navigation, search, category or location links such as 'View all jobs', 'Search jobs', "
+                  "'Careers' or a city name.")
+JSON_OPTIONS = {"schema": SCHEMA, "prompt": "Extract only the concrete job openings listed on this page, " + OPENING_FIELDS
+               + " If the page lists no concrete openings, return an empty list."}
+EXTRACT_PROMPT = ("Extract only the concrete job openings this employer lists on these pages and on the listing, "
+                  "applicant-tracking or search pages they lead to, " + OPENING_FIELDS + " Give every opening's own URL "
+                  "and location whenever shown. If no concrete openings are listed, return an empty list.")
+EXTRACT_PAGES = 20                    # the extraction's page budget: every page it reads costs LLM tokens
 LIST_FORMATS = ["markdown", "links", "json"]
 # What the extraction still returns now and then: a link to the list, not an opening on it.
 JUNK_TITLE_RE = re.compile(r"^(view|see|search|browse|explore|all)\b.*\bjobs?\b|^(jobs?|careers?|openings?|positions?)$", re.I)
@@ -99,18 +108,43 @@ def _crawl(session, board, link, max_pages):
     return [(p, _page_url(p, link)) for p in (job.get("data") or [])] if status == 200 else []
 
 
+def _wildcard(url):
+    """The board URL's directory as a Firecrawl URL pattern (…/careers/*): the pages an
+    employer's careers section hangs under, not the whole site."""
+    u = split_url(url)
+    path = u.path.rstrip("/")
+    if "." in path.rsplit("/", 1)[-1]:   # a file (jobs.html): its folder
+        path = path.rsplit("/", 1)[0]
+    return f"{u.scheme}://{u.netloc}{path}/*"
+
+
+def _extract(session, board, after, max_pages):
+    """The third tier: Firecrawl explores the board page and the pages under its directory and
+    reads them with its LLM, which reaches openings behind a widget, a search form or scattered
+    sub-pages. Costs tokens per page, so bounded by limit and kept to the host; shaped like a
+    scraped page so the cards come out the same way: [(page, URL)]."""
+    pattern = _wildcard(board["url"])
+    log(f"  {board['name']}: no openings from the {after}; extracting {pattern}")
+    status, data = session.firecrawl(board["url"], "extract", urls=[board["url"], pattern], prompt=EXTRACT_PROMPT,
+                                     schema=SCHEMA, limit=min(max_pages, EXTRACT_PAGES), enableWebSearch=False,
+                                     includeSubdomains=False, allowExternalLinks=False, ignoreInvalidURLs=True)
+    return [({"json": data}, board["url"])] if status == 200 else []
+
+
 def list_jobs(session, board, since_days=None, max_pages=100):
     status, page = session.firecrawl(board["url"], "scrape", formats=LIST_FORMATS, jsonOptions=JSON_OPTIONS)
     if status != 200:
         log(f"  ! firecrawl: no page for {board['name']} (HTTP {status})")
         return []
-    pages = [(page, board["url"])]
+    tier, pages = "scrape", [(page, board["url"])]
     if not _openings(page):
         link = _listing_link(board, page)
         if link:                      # the page is a front door; the list is one level in
-            pages = _crawl(session, board, link, max_pages)
+            tier, pages = "crawl", _crawl(session, board, link, max_pages)
+        if not any(_openings(p) for p, _ in pages):
+            tier, pages = "extract", _extract(session, board, tier, max_pages)
     cards = dedupe([_card(board, o, u) for p, u in pages for o in _openings(p)])
-    log(f"  {board['name']}: {len(cards)} cards")
+    log(f"  {board['name']}: {len(cards)} cards ({tier})")
     return within(cards, since_days)
 
 
