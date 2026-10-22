@@ -11,7 +11,8 @@
 # Installs:
 #   /etc/nftables.d/jobboard-hub.nft        table inet jobboard_hub (declare/flush/define: `nft -f` is idempotent)
 #     sets cloudflare_v4/v6                 elements from /etc/nftables.d/jobboard-cloudflare-elements.nft
-#     input  (policy accept)                443 accepted from Cloudflare only, any other 443 dropped
+#     input  (policy drop)                  this host's own input policy: lo, established, icmp, ssh 22,
+#                                           WireGuard udp, 443 from Cloudflare only, anything from wg0
 #     prerouting nat                        [flag] eth0 443 from Cloudflare -> 10.88.0.2:443; 2222 -> 10.88.0.2:1025
 #                                           only if no other table already has that DNAT (it predates this script)
 #     forward (policy accept)               MSS clamp; established; eth0->wg0 to the desktop {443,1025};
@@ -47,6 +48,8 @@ DESKTOP_IP=10.88.0.2
 LAPTOP_IP=10.88.0.3
 HTTPS_PORT=443
 SSH_FWD_PORT=2222                          # public ssh port forwarded to the desktop (pre-existing DNAT)
+HUB_SSH_PORT=22                            # this host's own sshd
+WG_PORT=51820                              # wg0 listen port (udp)
 DESKTOP_SSH_PORT=1025
 MCP_PORT=8090
 NFT_MAIN=/etc/nftables.conf
@@ -238,10 +241,20 @@ table inet jobboard_hub {
 	}
 
 	chain input {
-		type filter hook input priority filter; policy accept;
+		# This host's own input policy (the old app's table inet jobboard held it until retire-app):
+		# nothing but ssh, WireGuard, 443 from Cloudflare and the tunnel peers reaches the hub itself.
+		type filter hook input priority filter; policy drop;
+		iif "lo" accept
+		ct state established,related accept
+		ct state invalid drop
+		ip protocol icmp accept
+		ip6 nexthdr icmpv6 accept
+		tcp dport $HUB_SSH_PORT accept comment "hub sshd"
+		udp dport $WG_PORT accept comment "wireguard"
 		tcp dport $HTTPS_PORT ip saddr @cloudflare_v4 accept
 		tcp dport $HTTPS_PORT ip6 saddr @cloudflare_v6 accept
 		tcp dport $HTTPS_PORT counter drop comment "443 only via Cloudflare"
+		iifname "$WG_IF" accept comment "tunnel peers (desktop, laptop)"
 	}
 
 	chain prerouting {
