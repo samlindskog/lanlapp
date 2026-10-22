@@ -48,7 +48,7 @@ jobs:
           printf '%s\n' "$KNOWN" > ~/.ssh/known_hosts
           # The desktop runs production behind the WireGuard hub: DEPLOY_HOST is the hub's public address and
           # DEPLOY_PORT (2222) its DNAT to the desktop's sshd (1025) over wg0, so DEPLOY_KNOWN_HOSTS must hold
-          # the DESKTOP's host key as seen through that port (ssh-keyscan -p 2222 <hub>). The deploy key is
-          # pinned to a forced command there (jobboard-deploy); whatever is sent is only read as the ref to
-          # deploy. The deploy user has no docker access and no shell.
-          ssh -i ~/.ssh/deploy -o IdentitiesOnly=yes -p "${PORT:-22}" "deploy@$HOST" "jobboard-deploy origin/master"
+          # the DESKTOP's host key as seen through that port (ssh-keyscan -p 2222 <hub>). The hub forwards 2222
+          # from GitHub Actions runner ranges only; on the desktop the deploy user is pinned to a forced command
+          # (jobboard-deploy) that ignores whatever is sent and deploys origin/master. No docker access, no tty.
+          ssh -i ~/.ssh/deploy -o IdentitiesOnly=yes -p "${PORT:-22}" "deploy@$HOST" jobboard-deploy

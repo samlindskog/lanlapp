@@ -141,12 +141,17 @@ gunzip -c jobscan-backup.sql.gz | docker compose -f jobboard/compose.yaml exec -
   certificates to `/etc/nginx/jobboard/certs/`. All installed by the bootstrap, so an nginx change needs a
   bootstrap run, not a push.
 - Deploy: push to master -> GitHub Actions tests, then ssh as `deploy` through the hub's 2222 forward (secrets
-  DEPLOY_HOST, DEPLOY_PORT=2222, DEPLOY_KNOWN_HOSTS = the desktop's host key). The deploy keys are pinned to a
-  forced command (`/usr/local/bin/jobboard-deploy`, root-owned copy of `deploy/deploy.sh`): a key holder can
-  only deploy a ref. `deploy` has no docker access; the container work runs through the sudoers-whitelisted
-  root helper `/usr/local/sbin/jobboard-compose-up` (`deploy/compose-up.sh`). Both copies are installed by
-  the bootstrap, so changing deploy logic needs a bootstrap run, not a push.
-  Manual: `ssh -i ~/.ssh/jobboard_deploy -p 2222 deploy@72.14.178.40 jobboard-deploy [ref]`.
+  DEPLOY_HOST, DEPLOY_PORT=2222, DEPLOY_KNOWN_HOSTS = the desktop's host key). The hub forwards 2222 only from
+  GitHub Actions runner ranges (`api.github.com/meta`, refreshed daily with the Cloudflare ranges); from anywhere
+  else it is dropped, so the desktop is reached by hand over the LAN or the tunnel (`sldesktopwg`), never via 2222.
+  On the desktop the deploy user is pinned twice to the forced command `/usr/local/bin/jobboard-deploy`
+  (root-owned copy of `deploy/deploy.sh`): by sshd's `Match User deploy` (keys only, no forwarding, no tty) and
+  by every key in authorized_keys. Over ssh the command ignores its arguments and deploys origin/master; with
+  `/etc/jobboard/allowed_signers` installed (bootstrap staging file `allowed_signers`) it deploys only commits
+  carrying an SSH signature by a listed key. `deploy` has no docker access; the container work runs through the
+  sudoers-whitelisted root helper `/usr/local/sbin/jobboard-compose-up` (`deploy/compose-up.sh`). Both copies
+  are installed by the bootstrap, so changing deploy logic needs a bootstrap run, not a push.
+  Manual deploy of another ref: on the desktop, `sudo -u deploy /usr/local/bin/jobboard-deploy <ref>`.
 - Tokens: `POST /api/auth/token {name, password}` once; then `Authorization: Bearer <token>` for API and MCP.
 - Only the login paths (`/login`, `/login.html`, `POST /api/auth/login`, `POST /api/auth/token`) are reachable
   without a credential. nginx refuses every other request that carries neither a session cookie nor a Bearer

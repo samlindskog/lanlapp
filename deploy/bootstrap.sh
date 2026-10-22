@@ -11,6 +11,8 @@
 #   jobscan-dump.sql.gz            optional: restored into an EMPTY database on the full run (dump mode on the old host)
 #   deploy-ref                     optional: one line, the ref to check out and deploy instead of origin/master
 #                                  (origin/next before cutover); delete it once that branch has merged
+#   allowed_signers                optional: ssh allowed-signers file ("<principal> <type> <key>" per line);
+#                                  once installed, jobboard-deploy deploys only commits signed by one of them
 # Idempotent where practical.
 #
 # Does: require docker; create `deploy` user; clone the repo to /opt/jobboard at DEPLOY_REF; write or adopt
@@ -447,7 +449,49 @@ if [ "$SSHD_CHANGED" = 1 ]; then sshd -t && systemctl reload ssh && echo "sshd: 
 # Unlock the account for key-based login (useradd leaves '!' in the shadow field; some PAM/sshd
 # setups treat that as locked) and show what sshd will do for deploy.
 usermod -p '*' deploy 2>/dev/null || true
-echo "sshd for deploy: $(sshd -T -C user=deploy,host=x,addr=203.0.113.1 2>/dev/null | grep -E '^(port|allowusers|pubkeyauthentication|strictmodes|authorizedkeysfile)' | tr '\n' ' ')"
+# sshd pins the deploy user down on its own, independently of the authorized_keys options: the forced
+# command, keys only, no forwarding, no tty. Verified with `sshd -T` for deploy AND for root, because a Match
+# block in an included file must not leak onto every other user (Debian includes sshd_config.d at the top).
+SSHD_DEPLOY=/etc/ssh/sshd_config.d/jobboard-deploy.conf
+cat > "$SSHD_DEPLOY.new" <<'EOF'
+# jobboard (deploy/bootstrap.sh): the deploy user can only run the deploy command, with a key, nothing else.
+Match User deploy
+    ForceCommand /usr/local/bin/jobboard-deploy
+    AuthenticationMethods publickey
+    PasswordAuthentication no
+    KbdInteractiveAuthentication no
+    AllowTcpForwarding no
+    AllowAgentForwarding no
+    AllowStreamLocalForwarding no
+    X11Forwarding no
+    PermitTunnel no
+    PermitTTY no
+    PermitUserRC no
+EOF
+if ! cmp -s "$SSHD_DEPLOY.new" "$SSHD_DEPLOY" 2>/dev/null; then
+  [ -f "$SSHD_DEPLOY" ] && cp -a "$SSHD_DEPLOY" "$SSHD_DEPLOY.prev"
+  install -m 644 -o root -g root "$SSHD_DEPLOY.new" "$SSHD_DEPLOY"
+  if sshd -t 2>/dev/null \
+     && sshd -T -C user=deploy,host=x,addr=203.0.113.1 2>/dev/null | grep -qx 'forcecommand /usr/local/bin/jobboard-deploy' \
+     && sshd -T -C user=root,host=x,addr=203.0.113.1 2>/dev/null | grep -qx 'forcecommand none'; then
+    systemctl reload ssh && echo "sshd: $SSHD_DEPLOY installed (Match User deploy: forced command, publickey only, no forwarding/tty)"
+    rm -f "$SSHD_DEPLOY.prev"
+  else
+    if [ -f "$SSHD_DEPLOY.prev" ]; then mv "$SSHD_DEPLOY.prev" "$SSHD_DEPLOY"; else rm -f "$SSHD_DEPLOY"; fi
+    echo "WARNING: $SSHD_DEPLOY rejected by sshd -t or it leaked onto other users; previous state kept"
+  fi
+fi
+rm -f "$SSHD_DEPLOY.new"
+# Optional: the signing keys that commits must carry before they deploy (see deploy/deploy.sh).
+if [ -f "$HERE/allowed_signers" ]; then
+  install -m 644 -o root -g root "$HERE/allowed_signers" /etc/jobboard/allowed_signers && rm -f "$HERE/allowed_signers"
+  echo "signed commits required: /etc/jobboard/allowed_signers ($(grep -c . /etc/jobboard/allowed_signers) key(s))"
+elif [ -f /etc/jobboard/allowed_signers ]; then
+  echo "signed commits required: /etc/jobboard/allowed_signers ($(grep -c . /etc/jobboard/allowed_signers) key(s))"
+else
+  echo "signed commits NOT required (stage allowed_signers to turn it on)"
+fi
+echo "sshd for deploy: $(sshd -T -C user=deploy,host=x,addr=203.0.113.1 2>/dev/null | grep -E '^(port|allowusers|pubkeyauthentication|forcecommand|permittty|allowtcpforwarding|authenticationmethods)' | tr '\n' ' ')"
 echo "authorized_keys: $(ssh-keygen -lf /home/deploy/.ssh/authorized_keys 2>&1)"
 echo "shadow: $(getent shadow deploy | cut -d: -f2 | cut -c1-2)…  home: $(stat -c '%A %U' /home/deploy) .ssh: $(stat -c '%A %U' /home/deploy/.ssh)"
 

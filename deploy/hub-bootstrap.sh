@@ -11,6 +11,8 @@
 # Installs:
 #   /etc/nftables.d/jobboard-hub.nft        table inet jobboard_hub (declare/flush/define: `nft -f` is idempotent)
 #     sets cloudflare_v4/v6                 elements from /etc/nftables.d/jobboard-cloudflare-elements.nft
+#     set github_actions_v4                 GitHub Actions runner ranges (api.github.com/meta .actions), same file:
+#                                           the 2222 ssh forward to the desktop accepts these sources only
 #     input  (policy drop)                  this host's own input policy: lo, established, icmp, ssh 22,
 #                                           WireGuard udp, 443 from Cloudflare only, anything from wg0
 #     prerouting nat                        [flag] eth0 443 from Cloudflare -> 10.88.0.2:443; 2222 -> 10.88.0.2:1025
@@ -26,7 +28,8 @@
 #                                           /etc/nftables.conf (Docker's iptables-nft FORWARD), re-inserted after
 #                                           docker.service at boot, because a boot-time `insert rule` into a chain
 #                                           that does not exist yet would fail the whole nftables.service load
-#   /usr/local/sbin/jobboard-cloudflare-ips + .service/.timer (weekly): fetch ips-v4/ips-v6, nft -c, reload.
+#   /usr/local/sbin/jobboard-cloudflare-ips + .service/.timer (daily): fetch Cloudflare ips-v4/ips-v6 and the
+#                                           GitHub Actions ranges, nft -c, reload.
 #                                           apply and --check fetch the ranges FIRST (into a temp file; apply
 #                                           installs it before any other change and aborts if the fetch fails),
 #                                           so the table never goes live with empty sets while 443 is production
@@ -194,7 +197,8 @@ printf '      %s\n' "${CHAINS[@]:-(none)}"
 
 FWD_RULES=(
   'ct state established,related accept'
-  "iifname \"$WAN_IF\" oifname \"$WG_IF\" ip daddr $DESKTOP_IP tcp dport { $HTTPS_PORT, $DESKTOP_SSH_PORT } accept"
+  "iifname \"$WAN_IF\" oifname \"$WG_IF\" ip daddr $DESKTOP_IP tcp dport $HTTPS_PORT accept"
+  "iifname \"$WAN_IF\" oifname \"$WG_IF\" ip daddr $DESKTOP_IP tcp dport $DESKTOP_SSH_PORT ip saddr @github_actions_v4 accept"
   "iifname \"$WG_IF\" oifname \"$WG_IF\" ip saddr $LAPTOP_IP ip daddr $DESKTOP_IP tcp dport { $DESKTOP_SSH_PORT, $MCP_PORT } accept"
   "iifname \"$WG_IF\" oifname \"$WG_IF\" ip saddr { $DESKTOP_IP, $LAPTOP_IP } icmp type echo-request accept"
   "iifname \"$WG_IF\" oifname \"$WAN_IF\" ip saddr $DESKTOP_IP accept"
@@ -239,6 +243,11 @@ table inet jobboard_hub {
 		flags interval
 		comment "https://www.cloudflare.com/ips-v6, refreshed weekly by jobboard-cloudflare-ips.timer"
 	}
+	set github_actions_v4 {
+		type ipv4_addr
+		flags interval
+		comment "api.github.com/meta .actions (v4), refreshed daily: the only sources allowed through the 2222 ssh forward"
+	}
 
 	chain input {
 		# This host's own input policy (the old app's table inet jobboard held it until retire-app):
@@ -260,14 +269,16 @@ table inet jobboard_hub {
 	chain prerouting {
 		type nat hook prerouting priority dstnat; policy accept;
 $([ "$DNAT_ON" = 1 ] && printf '\t\tiifname "%s" tcp dport %s ip saddr @cloudflare_v4 dnat ip to %s:%s comment "jobs.slindskog.net -> desktop (flag %s)"\n' "$WAN_IF" "$HTTPS_PORT" "$DESKTOP_IP" "$HTTPS_PORT" "$DNAT_FLAG" || printf '\t\t# 443 DNAT disabled: no %s (hub-bootstrap.sh enable-dnat)\n' "$DNAT_FLAG")
-$([ "$SSH_DNAT_OURS" = 1 ] && printf '\t\tiifname "%s" tcp dport %s dnat ip to %s:%s comment "public ssh -> desktop sshd"\n' "$WAN_IF" "$SSH_FWD_PORT" "$DESKTOP_IP" "$DESKTOP_SSH_PORT" || printf '\t\t# ssh %s -> %s:%s DNAT exists in another table (%s); not duplicated\n' "$SSH_FWD_PORT" "$DESKTOP_IP" "$DESKTOP_SSH_PORT" "$SSH_DNAT_WHERE")
+$([ "$SSH_DNAT_OURS" = 1 ] && printf '\t\tiifname "%s" tcp dport %s ip saddr @github_actions_v4 dnat ip to %s:%s comment "GitHub Actions ssh -> desktop sshd"\n' "$WAN_IF" "$SSH_FWD_PORT" "$DESKTOP_IP" "$DESKTOP_SSH_PORT" || printf '\t\t# ssh %s -> %s:%s DNAT exists in another table (%s); not duplicated (the forward chain limits it to GitHub Actions)\n' "$SSH_FWD_PORT" "$DESKTOP_IP" "$DESKTOP_SSH_PORT" "$SSH_DNAT_WHERE")
 	}
 
 	chain forward {
 		type filter hook forward priority filter; policy accept;
 		tcp flags syn tcp option maxseg size set rt mtu comment "MSS clamp: $WG_IF mtu 1420"
 		ct state established,related accept
-		iifname "$WAN_IF" oifname "$WG_IF" ip daddr $DESKTOP_IP tcp dport { $HTTPS_PORT, $DESKTOP_SSH_PORT } accept comment "DNAT'd public flows -> desktop"
+		iifname "$WAN_IF" oifname "$WG_IF" ip daddr $DESKTOP_IP tcp dport $HTTPS_PORT accept comment "DNAT'd 443 -> desktop"
+		iifname "$WAN_IF" oifname "$WG_IF" ip daddr $DESKTOP_IP tcp dport $DESKTOP_SSH_PORT ip saddr @github_actions_v4 accept comment "DNAT'd 2222 -> desktop sshd: GitHub Actions only"
+		iifname "$WAN_IF" oifname "$WG_IF" ip daddr $DESKTOP_IP tcp dport $DESKTOP_SSH_PORT counter drop comment "2222 from anywhere else (a drop here is authoritative whatever other tables accept)"
 		iifname "$WG_IF" oifname "$WG_IF" ip saddr $LAPTOP_IP ip daddr $DESKTOP_IP tcp dport { $DESKTOP_SSH_PORT, $MCP_PORT } accept comment "laptop -> desktop: ssh, MCP (routed, no NAT)"
 		iifname "$WG_IF" oifname "$WG_IF" ip saddr { $DESKTOP_IP, $LAPTOP_IP } icmp type echo-request accept comment "peer ping"
 		iifname "$WG_IF" oifname "$WAN_IF" ip saddr $DESKTOP_IP accept comment "desktop egress"
@@ -318,9 +329,10 @@ EOF
 gen_cfips() {
   cat <<EOF
 #!/usr/bin/env bash
-# GENERATED by deploy/hub-bootstrap.sh ($TS). Refresh the Cloudflare ranges in table inet jobboard_hub:
-# fetch ips-v4 and ips-v6, validate, \`nft -c\`, apply live, then persist to $ELEM (included by $HUB_NFT at boot).
-# On any failure the previous elements file (and the live sets) stay as they are. Weekly via the timer.
+# GENERATED by deploy/hub-bootstrap.sh ($TS). Refresh the edge ranges in table inet jobboard_hub: the
+# Cloudflare ips-v4/ips-v6 lists and the GitHub Actions runner ranges (api.github.com/meta, "actions", v4),
+# validated, \`nft -c\`, applied live, then persisted to $ELEM (included by $HUB_NFT at boot).
+# On any failure the previous elements file (and the live sets) stay as they are. Daily via the timer.
 #   --fetch-only <out>   fetch + validate and write the elements file to <out> only (no nft, no install):
 #                        the bootstrap uses this BEFORE it touches the host, so the sets are never empty live.
 set -euo pipefail
@@ -328,26 +340,35 @@ ELEM=$ELEM
 tmp=\$(mktemp); trap 'rm -f "\$tmp"' EXIT
 v4=\$(curl -fsS --max-time 20 https://www.cloudflare.com/ips-v4 | tr -d '\r' | grep -v '^\$' || true)
 v6=\$(curl -fsS --max-time 20 https://www.cloudflare.com/ips-v6 | tr -d '\r' | grep -v '^\$' || true)
+# GitHub publishes several thousand (Azure) prefixes; v6 entries are dropped (the 2222 forward is IPv4).
+gh4=\$(curl -fsS --max-time 30 -H 'Accept: application/vnd.github+json' -H 'User-Agent: jobboard-hub' https://api.github.com/meta \\
+  | python3 -c 'import json,sys; [print(x) for x in json.load(sys.stdin)["actions"] if ":" not in x]' 2>/dev/null || true)
 n4=\$(printf '%s\n' "\$v4" | grep -cE '^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}\$' || true)
 n6=\$(printf '%s\n' "\$v6" | grep -cE '^[0-9a-fA-F:]+/[0-9]{1,3}\$' || true)
+g4=\$(printf '%s\n' "\$gh4" | grep -cE '^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}\$' || true)
 if [ "\$n4" -lt 5 ] || [ "\$n6" -lt 3 ] || [ "\$n4" -ne "\$(printf '%s\n' "\$v4" | wc -l)" ] || [ "\$n6" -ne "\$(printf '%s\n' "\$v6" | wc -l)" ]; then
   echo "cloudflare ip fetch failed or looked wrong (v4=\$n4 v6=\$n6 valid lines); keeping \$ELEM"; exit 1
 fi
+if [ "\$g4" -lt 100 ] || [ "\$g4" -ne "\$(printf '%s\n' "\$gh4" | wc -l)" ]; then
+  echo "github actions range fetch failed or looked wrong (\$g4 valid v4 lines); keeping \$ELEM"; exit 1
+fi
 {
-  echo "# Cloudflare ranges, GENERATED by $CFIPS_BIN on \$(date -u +%FT%TZ); included from $HUB_NFT"
+  echo "# Cloudflare + GitHub Actions ranges, GENERATED by $CFIPS_BIN on \$(date -u +%FT%TZ); included from $HUB_NFT"
   echo "flush set inet jobboard_hub cloudflare_v4"
   echo "add element inet jobboard_hub cloudflare_v4 { \$(printf '%s\n' "\$v4" | tr '\n' ',' | sed 's/,\$//; s/,/, /g') }"
   echo "flush set inet jobboard_hub cloudflare_v6"
   echo "add element inet jobboard_hub cloudflare_v6 { \$(printf '%s\n' "\$v6" | tr '\n' ',' | sed 's/,\$//; s/,/, /g') }"
+  echo "flush set inet jobboard_hub github_actions_v4"
+  echo "add element inet jobboard_hub github_actions_v4 { \$(printf '%s\n' "\$gh4" | tr '\n' ',' | sed 's/,\$//; s/,/, /g') }"
 } > "\$tmp"
 if [ "\${1:-}" = --fetch-only ]; then
   install -m 644 "\$tmp" "\${2:?--fetch-only needs an output path}"
-  echo "cloudflare ranges fetched: \$n4 v4 + \$n6 v6 -> \$2"; exit 0
+  echo "ranges fetched: cloudflare \$n4 v4 + \$n6 v6, github actions \$g4 v4 -> \$2"; exit 0
 fi
 nft -c -f "\$tmp" || { echo "nft -c rejected the new elements; keeping \$ELEM"; exit 1; }
 nft -f "\$tmp"
 install -m 644 -o root -g root "\$tmp" "\$ELEM"
-echo "cloudflare sets refreshed: \$n4 v4 + \$n6 v6 ranges -> \$ELEM"
+echo "sets refreshed: cloudflare \$n4 v4 + \$n6 v6, github actions \$g4 v4 ranges -> \$ELEM"
 EOF
 }
 
@@ -414,7 +435,7 @@ gen_cfips | install_content "$CFIPS_BIN" 0755
 install_content /etc/systemd/system/jobboard-cloudflare-ips.service 0644 <<EOF
 # GENERATED by deploy/hub-bootstrap.sh: see $CFIPS_BIN
 [Unit]
-Description=jobboard-hub: refresh Cloudflare IP ranges in nftables
+Description=jobboard-hub: refresh the Cloudflare and GitHub Actions IP ranges in nftables
 After=network-online.target nftables.service
 Wants=network-online.target
 [Service]
@@ -424,9 +445,9 @@ EOF
 install_content /etc/systemd/system/jobboard-cloudflare-ips.timer 0644 <<'EOF'
 # GENERATED by deploy/hub-bootstrap.sh
 [Unit]
-Description=jobboard-hub: weekly Cloudflare IP range refresh
+Description=jobboard-hub: daily Cloudflare + GitHub Actions IP range refresh
 [Timer]
-OnCalendar=weekly
+OnCalendar=daily
 RandomizedDelaySec=1h
 Persistent=true
 [Install]
@@ -442,7 +463,7 @@ if [ "$CHECK" = 1 ]; then
   plan "order: fetch Cloudflare ranges (done above, temp file) -> backup -> write $ELEM -> other files -> live transaction"
   plan "sysctl -w net.ipv4.ip_forward=1"
   plan "nft -f <live transaction above>   # the table loads with the fetched sets in the same transaction: 443 never closes"
-  plan "systemctl daemon-reload; enable nftables (boot persistence only, NOT restarted); enable jobboard-hub-accepts; enable --now jobboard-cloudflare-ips.timer (weekly refresh)"
+  plan "systemctl daemon-reload; enable nftables (boot persistence only, NOT restarted); enable jobboard-hub-accepts; enable --now jobboard-cloudflare-ips.timer (daily refresh)"
   echo; echo "dry run complete; run without --check to apply."
   exit 0
 fi
@@ -456,7 +477,9 @@ systemctl enable -q --now jobboard-cloudflare-ips.timer
 log "state"
 echo "  table inet jobboard_hub:"; nft list table inet jobboard_hub | sed 's/^/      /'
 N4=$(nft list set inet jobboard_hub cloudflare_v4 2>/dev/null | grep -c '/' || true)
-echo "  cloudflare_v4 entries: ${N4:-0}   ip_forward: $(sysctl -n net.ipv4.ip_forward)   443 DNAT: $([ "$DNAT_ON" = 1 ] && echo ENABLED || echo disabled)"
-echo "  verify from the laptop: ssh sldesktop (2222 forward) and ssh uscentral1 still work; ping 10.88.0.2 over wg0;"
+G4=$(nft list set inet jobboard_hub github_actions_v4 2>/dev/null | grep -o '[0-9]*\.[0-9]*\.[0-9]*\.[0-9]*/[0-9]*' | wc -l || true)
+echo "  cloudflare_v4 entries: ${N4:-0}   github_actions_v4 entries: ${G4:-0}   ip_forward: $(sysctl -n net.ipv4.ip_forward)   443 DNAT: $([ "$DNAT_ON" = 1 ] && echo ENABLED || echo disabled)"
+echo "  verify from the laptop: ssh uscentral1 still works; ssh sldesktopwg (the desktop over wg0) works; ssh sldesktop (the 2222"
+echo "  forward) is now REFUSED from anywhere but GitHub Actions runners: a push to master proves the forward;"
 echo "  after enable-dnat: curl -sI https://jobs.slindskog.net/login.html  (served by the desktop: check its nginx access log)"
 echo "  rollback: $0 disable-dnat   (443 back on the hub)   |   boot config backup: $BACKUP"

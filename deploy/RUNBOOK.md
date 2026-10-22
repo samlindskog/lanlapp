@@ -193,6 +193,10 @@ gh secret set DEPLOY_PORT --body 2222
 ssh-keyscan -p 2222 72.14.178.40 2>/dev/null | gh secret set DEPLOY_KNOWN_HOSTS
 gh secret list                                                                     # DEPLOY_HOST stays 72.14.178.40; DEPLOY_SSH_KEY unchanged (same deploy key, installed on the desktop in step 3)
 ssh -i ~/.ssh/jobboard_deploy -p 2222 deploy@72.14.178.40 jobboard-deploy origin/next   # the forced command works through the forward
+# Since 2026-10-22 the hub forwards 2222 from GitHub Actions runner ranges only (set github_actions_v4, refreshed
+# daily), so this manual check no longer works from a laptop: a push to master is the test. The deploy command
+# also ignores the ref sent over ssh (always origin/master) and, once /etc/jobboard/allowed_signers is installed
+# on the desktop, deploys signed commits only.
 
 # 6g. merge next -> master: the workflow tests and deploys origin/master to the desktop
 git checkout master && git merge --ff-only next && git push origin master
