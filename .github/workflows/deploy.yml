@@ -51,4 +51,5 @@ jobs:
           # the DESKTOP's host key as seen through that port (ssh-keyscan -p 2222 <hub>). The hub forwards 2222
           # from GitHub Actions runner ranges only; on the desktop the deploy user is pinned to a forced command
           # (jobboard-deploy) that ignores whatever is sent and deploys origin/master. No docker access, no tty.
-          ssh -i ~/.ssh/deploy -o IdentitiesOnly=yes -p "${PORT:-22}" "deploy@$HOST" jobboard-deploy
+          # The ref is still sent: the deploy command installed by an older bootstrap read it, the current one ignores it.
+          ssh -i ~/.ssh/deploy -o IdentitiesOnly=yes -p "${PORT:-22}" "deploy@$HOST" "jobboard-deploy origin/master"
