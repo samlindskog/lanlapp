@@ -7,9 +7,11 @@ Layout, API and operations are in README.md. What matters when changing things:
   credential gate, cookies, tokens, MCP and a job + resume round trip. `./dev.sh up` is the plain
   live-reload stack without auth. Both use the local `pgdata` volume (a copy of production data).
 - **A push to master deploys to production** (GitHub Actions: adapter tests, the same auth stack +
-  `tests/smoke.sh`, then ssh deploy to the desktop `sldesktop` through the hub's 2222 forward). Production
-  is the system of record for the user's job search; do not point local tooling at it for experiments.
-  The hub `uscentral1` only forwards (Cloudflare 443, ssh 2222, the laptop's MCP route); nothing runs there.
+  `tests/smoke.sh`, then ssh as `deploy` through the hub's 2222 forward, which admits GitHub Actions runner
+  ranges only, to a forced command that deploys origin/master). Production is the system of record for the
+  user's job search; do not point local tooling at it for experiments. The hub `uscentral1` only forwards
+  (Cloudflare 443, GitHub's 2222, the laptop's ssh/MCP route); nothing runs there. By hand the desktop is
+  `sldesktoplocal` (LAN) or `sldesktopwg` (tunnel); the `sldesktop` alias through 2222 no longer connects.
 - **One operation, two doors.** Features live in `jobboard/service.py` as plain functions listed in
   `OPERATIONS` (with the MCP description and schema). `server.py` maps a route onto one; `mcp.py`
   serves the table as tools. Never implement logic in a route or a tool; add an operation and point
@@ -20,10 +22,12 @@ Layout, API and operations are in README.md. What matters when changing things:
 - **Everything except the login paths needs a credential**, enforced in nginx (`deploy/nginx/`) and
   again in the app (`Handler._gate`, MCP `_authorized`). Keep both layers in step when adding a path.
 - **Deploy scripts, nginx and the crawl stack are installed by the bootstrap, not by a push.** Changing
-  anything under `deploy/` (except the compose files) needs a bootstrap run with sudo: `deploy/bootstrap.sh`
-  on the desktop (stage it with `scp deploy/bootstrap.sh sldesktoplocal:/home/sam/jobboard-bootstrap/bootstrap.sh`),
-  `deploy/hub-bootstrap.sh` on the hub (`uscentral1:/home/sam/jobboard-bootstrap/`). Give the user absolute
-  remote paths (a `~` expands locally). `deploy/RUNBOOK.md` has the operator steps.
+  anything under `deploy/` (except the compose files) needs a bootstrap run with sudo, which only the user can
+  do (interactive password): stage `deploy/bootstrap.sh` with `scp deploy/bootstrap.sh
+  sldesktoplocal:/home/sam/jobboard-bootstrap/bootstrap.sh` for the desktop, `deploy/hub-bootstrap.sh` to
+  `uscentral1:/home/sam/jobboard-bootstrap/` for the hub, then give the user the `ssh -t <host> 'sudo bash
+  <absolute path> [mode]'` command (a `~` expands locally). Both scripts have a `--check`/dry-run path; the hub one
+  is a firewall, so always dry-run first. `deploy/RUNBOOK.md` has the operator steps.
 - **The image holds only `jobboard/` and `jobscan/`** (`.dockerignore` at the repo root). Anything the
   server needs at runtime must live in those two directories.
 - **Boards are registered by URL; adapters are per hosting platform** (`jobscan/sources/`, contract in

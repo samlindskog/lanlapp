@@ -116,9 +116,9 @@ gunzip -c jobscan-backup.sql.gz | docker compose -f jobboard/compose.yaml exec -
 
 - Topology: the stack runs on the desktop (Debian, WireGuard peer 10.88.0.2, sshd 1025). The hub
   (72.14.178.40, WireGuard 10.88.0.1) runs nothing but WireGuard and nftables: it forwards Cloudflare's 443 to
-  10.88.0.2:443 (DNAT, only from Cloudflare's published ranges, refreshed weekly by `jobboard-cloudflare-ips.timer`;
-  masqueraded so the desktop sees 10.88.0.1), public 2222 to the desktop's sshd, and routes the laptop
-  (10.88.0.3) to the desktop for ssh and MCP. DNS is unchanged: jobs.slindskog.net and slindskog.net point at
+  10.88.0.2:443 (DNAT, only from Cloudflare's published ranges; masqueraded so the desktop sees 10.88.0.1),
+  2222 to the desktop's sshd only from GitHub Actions runner ranges (both range sets refreshed daily by
+  `jobboard-cloudflare-ips.timer`), and routes the laptop (10.88.0.3) to the desktop for ssh and MCP. DNS is unchanged: jobs.slindskog.net and slindskog.net point at
   Cloudflare, whose origin is the hub.
 - https://jobs.slindskog.net: nginx on the desktop binds 10.88.0.2:443 only, with the Cloudflare origin cert and
   authenticated origin pulls (`deploy/nginx/jobboard-tls.conf`), trusting 10.88.0.1 for the real client address
@@ -160,7 +160,9 @@ gunzip -c jobscan-backup.sql.gz | docker compose -f jobboard/compose.yaml exec -
   container on 127.0.0.1:8091; the hub forwards 10.88.0.3 -> 10.88.0.2:8090):
   `claude mcp add --transport http jobboard http://10.88.0.2:8090/mcp --header "Authorization: Bearer <token>"`
 - Firewall: the desktop filters only what arrives on `wg0` (`table inet jobboard`: the hub to 443 and 1025, the
-  laptop to 1025 and 8090, ICMP; LAN untouched). The hub accepts 443 only from Cloudflare's ranges. A watchdog
+  laptop to 1025 and 8090, ICMP; LAN untouched). The hub's `table inet jobboard_hub` holds that host's input
+  policy (drop; ssh 22, WireGuard, 443 from Cloudflare's ranges, anything from wg0), the DNATs, and forward rules
+  whose drops are authoritative (2222 from outside the GitHub ranges never reaches the desktop). A watchdog
   (`jobboard-wg-watch.timer`) restarts the desktop's tunnel after repeated failed pings of the hub.
 - Host setup: `deploy/bootstrap.sh` on the desktop (staged by `scp deploy/bootstrap.sh
   sldesktoplocal:/home/sam/jobboard-bootstrap/bootstrap.sh`, run with sudo; re-runnable; maintenance modes by
@@ -168,9 +170,10 @@ gunzip -c jobscan-backup.sql.gz | docker compose -f jobboard/compose.yaml exec -
   `export-certs`, `show-firewall`, `reboot`) and `deploy/hub-bootstrap.sh` on the hub (`--check`, `apply`,
   `enable-dnat`, `disable-dnat`, `retire-app`). `deploy/RUNBOOK.md` is the migration runbook.
 - Claude's token lives in `~/.config/jobboard/token` on the Mac; the MCP server is registered in Claude Code as `jobboard`.
-- MCP tools: stats, list_jobs, get_job, get_section, search, sources, boards, add_boards, update_board,
-  delete_board, scan, run_status, cancel_run, repeat_run, refresh, set_verdict, set_status, add_job, upload_resume,
-  list_resumes, logs, runs, geo_scan, geo_categories, resolve_center, places, get_place, set_place.
+- MCP tools: stats, adapters, sources, boards, add_boards, update_board, delete_board, list_jobs, get_job,
+  get_section, search, scan, geo_scan, geo_categories, resolve_center, places, get_place, set_place, run_status,
+  cancel_run, repeat_run, refresh, set_verdict, set_status, add_job, upload_resume, list_resumes, logs, runs
+  (every `OPERATIONS` entry with a description; `sections`, `events` and `refresh_run` are API-only).
 
 ## Boards, adapters and the browser
 
@@ -202,10 +205,13 @@ All outbound traffic to career sites goes through one `browser.Session` per top-
 (a scan run, one `add_boards` request, one refresh batch): it owns the Chrome, the keep-alive HTTP
 pool, the proxy escalation state and the log, and is torn down with the operation, so nothing
 (blocks, proxy sessions, a wedged browser) carries over to the next one. Pages are fetched through
-a real Chrome (`jobscan/browser.py`: Selenium + undetected-chromedriver, Chromium in the image) so
-sites behind Cloudflare and JSON backends that expect a session work. JSON and POST calls run as
-`fetch()` inside a page of the same origin. One Chrome lives for the whole operation (sockets and
-proxy tunnels are reused; images and fonts are off) and restarts only when the proxy must change.
+a real Chrome (`jobscan/browser.py`: Selenium driving the image's Chromium) so sites behind
+Cloudflare and JSON backends that expect a session work. JSON and POST calls run as `fetch()` inside
+a page of the same origin. One Chrome lives for the whole operation (sockets and proxy tunnels are
+reused; images and fonts are off), always behind the Session's proxy relay, which decides the route
+per host: a proxy change drops that host's tunnels instead of restarting Chrome. A page that never
+finishes loading, or a site's TLS or connection error, is that site's failure (408 / network error
+for that URL); only two Chrome crashes in a row hand the rest of the operation to plain HTTP.
 `JOBSCAN_BROWSER=0` forces plain HTTP with a keep-alive pool (CI, tests).
 
 Proxy: every host is tried direct first. A 403/429/503 or a Cloudflare challenge that never clears
@@ -227,12 +233,21 @@ and copy the coordinates; `@lat,lng`, `?q=lat,lng` and `!3dlat!4dlng` links all 
 (geocoded through Nominatim). Businesses within the radius are discovered by the *finders*
 (`jobscan/finders/`, today OpenStreetMap through Overpass, one query per category of the registry in
 `core/geo.py`, plus any raw OSM tag lines and a name keyword filter), deduplicated by normalised name
-within 150 m or by website host, and kept in the `places` table across runs. A place without a website
-is looked up through the web search when `SEARXNG_URL` is set (one query per 2 s; when the engines
-are throttled and answer nothing, the place stays `unresolved` for the next run, the run pauses 60 s
-after three such answers in a row and skips the remaining lookups after three more; directory hosts such as Yelp or Facebook
-and profile, booking and locator hosts such as WebMD or Agoda are skipped; the result's domain must be spelled from the name's words, or a shallow page's title must name the business and the place's
-city or state; government buildings and facilities get no lookup at all), else marked `no_site`. Each website is fetched through
+within 150 m or by website host, and kept in the `places` table across runs. A place whose finder
+carries a website (the OSM `website=` tag) keeps it: the tag is authoritative and is never searched;
+only when the tag's homepage is dead does the place fall back to one search, and the searched site is
+kept while the tag stays dead. A place without a tag is looked up through the web search when
+`SEARXNG_URL` is set (one query per 2 s; when the engines are throttled and answer nothing, the place
+stays `unresolved` for the next run, the run pauses 60 s after three such answers in a row and skips
+the remaining lookups after three more; directory hosts such as Yelp or Facebook and profile, booking
+and locator hosts such as WebMD or Agoda are skipped; the result's domain must be spelled from the
+name's words, or a shallow page's title must name the business and the place's city or state), else
+marked `no_site`. Physical structures (buildings, fire stations, courthouses, warehouses, parking
+garages, treatment plants and the like, `core/careers.py` FACILITY_RE) get no lookup (`facility`): the
+agency hires, not the building. `relookup` revisits every place under the current rules (tags restored,
+former facilities re-classed, tag-less places searched again; websites compared as sites, ignoring
+scheme, `www.` and trailing slash); a changed website resets the careers page and board, a board no
+place points at any more is disabled and enabled again when a place points at it. Each website is fetched through
 the run's browser Session and searched for a careers page: a careers/jobs/employment link on the
 homepage, then the common paths (`/careers`, `/jobs`, ...), then a Firecrawl site map when
 `FIRECRAWL_URL` is set. A careers page that lists nothing itself but hands off to a portal (an
